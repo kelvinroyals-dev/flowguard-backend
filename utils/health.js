@@ -14,7 +14,7 @@ async function computeAssetHealth(assetId) {
 
   // latest reading from every Sentinel covering this asset
   const { rows: reads } = await pool.query(`
-    SELECT s.sensor_id, s.status,
+    SELECT s.sensor_id, s.status, s.last_ping,
            r.water_level_percent AS level, r.silt_depth_mm AS silt,
            r.debris_detected AS debris
       FROM sentinel_coverage sc
@@ -28,7 +28,12 @@ async function computeAssetHealth(assetId) {
 
   if (reads.length) {
     // node network: are the devices watching this asset actually alive?
-    const online = reads.filter(x => x.status === 'active').length;
+    // status alone isn't enough — it's set once at registration and never
+    // updated by ingestion, so a silent node would otherwise still score
+    // as "online" and hide the fact that the asset isn't really monitored.
+    const online = reads.filter(x =>
+      x.status === 'active' && x.last_ping && new Date(x.last_ping) > new Date(Date.now() - 6 * 60 * 60 * 1000)
+    ).length;
     components.network = Math.round((online / reads.length) * 100);
     parts.push([components.network, .15]);
 

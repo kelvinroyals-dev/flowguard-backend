@@ -26,8 +26,11 @@ router.get('/flood-risk', authenticateToken, async (req, res) => {
       return res.json({ success: true, data: { has_data: false, reason: 'no_client', sensors_total: 0 } });
     }
 
+    // "online" = active status AND telemetry within the last 6h, not status
+    // alone — status is set once at registration and never updated by ingestion.
     const sensorCount = await pool.query(
-      `SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='active') online
+      `SELECT COUNT(*) total,
+              COUNT(*) FILTER (WHERE status='active' AND last_ping > NOW() - INTERVAL '6 hours') online
          FROM sensors WHERE client_id = ANY($1)`, [ids]);
     const total = parseInt(sensorCount.rows[0].total) || 0;
     const online = parseInt(sensorCount.rows[0].online) || 0;
