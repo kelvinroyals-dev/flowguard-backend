@@ -2,7 +2,23 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { isClient, clientIdsForUser, propertyIdsForUser } = require('../utils/scope');
+const { logAction } = require('../utils/audit');
 const router = express.Router();
+
+// Shared ownership guard for the many /:propertyId/* routes below: a client
+// may only reach a property they own; ops roles may reach any property.
+// Writes `res` itself and returns null on failure so callers can
+// `const owner = await assertPropertyAccess(...); if (!owner) return;`
+async function assertPropertyAccess(req, res, pid) {
+  const { rows } = await pool.query('SELECT user_id FROM properties WHERE property_id = $1', [pid]);
+  if (!rows[0]) { res.status(404).json({ success: false, error: 'Property not found' }); return null; }
+  if (isClient(req) && rows[0].user_id !== req.user.id) {
+    res.status(403).json({ success: false, error: 'Not authorised' });
+    return null;
+  }
+  return rows[0];
+}
 
 // camelCase (frontend) -> snake_case (db) map for property submission
 const FIELD_MAP = {
@@ -23,6 +39,7 @@ const FIELD_MAP = {
 
 // GET /properties/all — every property across all clients (ops view)
 router.get('/all', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const { rows } = await pool.query(`
       SELECT p.property_id, p.property_name, p.property_type, p.city, p.state, p.country,
@@ -290,6 +307,9 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
        WHERE p.property_id = $1`,
       [req.params.propertyId]);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'Property not found' });
+    if (isClient(req) && rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Not authorised' });
+    }
     res.json({ success: true, data: rows[0] });
   } catch (err) {
     console.error('GET /properties/:id', err);
@@ -297,35 +317,17 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
   }
 });
 
-// PUT /properties/:propertyId — edit (client). Accepts snake_case + address alias.
-router.put('/:propertyId', authenticateToken, async (req, res) => {
-  try {
-    const b = req.body || {};
-    const map = {
-      property_name:'property_name', property_type:'property_type',
-      address:'address_line1', address_line1:'address_line1', address_line2:'address_line2',
-      city:'city', state:'state', postal_code:'postal_code',
-      issue_description:'issue_description', urgency_level:'urgency_level',
-      number_of_units:'number_of_units', number_of_buildings:'number_of_buildings',
-      total_area_sqm:'total_area_sqm',
-    };
-    const sets = [], vals = []; let i = 1;
-    for (const [k, col] of Object.entries(map)) if (k in b) { sets.push(`${col} = $${i++}`); vals.push(b[k]); }
-    if (!sets.length) return res.status(400).json({ success:false, error:'No valid fields' });
-    vals.push(req.params.propertyId);
-    const { rows } = await pool.query(
-      `UPDATE properties SET ${sets.join(', ')}, updated_at=NOW() WHERE property_id=$${i} RETURNING *`, vals);
-    if (!rows[0]) return res.status(404).json({ success:false, error:'Property not found' });
-    res.json({ success:true, data: rows[0] });
-  } catch (err) {
-    console.error('PUT /properties/:id', err);
-    res.status(500).json({ success:false, error:'Failed to update property' });
-  }
-});
+// NOTE: the PUT /:propertyId handler used to be duplicated here. Express only
+// ever dispatches to the FIRST matching route registration, so this earlier
+// copy silently shadowed the ownership-checked version further down in this
+// file — that second copy was dead code. Removed; see the single remaining
+// PUT /:propertyId handler below for the real (guarded) implementation.
 
 // GET /properties/:propertyId/inspection — latest inspection + assigned team/agent (client visibility)
 router.get('/:propertyId/inspection', authenticateToken, async (req, res) => {
   try {
+    const owner = await assertPropertyAccess(req, res, req.params.propertyId);
+    if (!owner) return;
     const { rows } = await pool.query(
       `SELECT i.*,
               t.team_name        AS team_name,
@@ -344,6 +346,8 @@ router.get('/:propertyId/inspection', authenticateToken, async (req, res) => {
 // GET /properties/:propertyId/invoices
 router.get('/:propertyId/invoices', authenticateToken, async (req, res) => {
   try {
+    const owner = await assertPropertyAccess(req, res, req.params.propertyId);
+    if (!owner) return;
     const { rows } = await pool.query(
       `SELECT * FROM invoices WHERE property_id=$1 ORDER BY created_at DESC`,
       [req.params.propertyId]);
@@ -354,6 +358,8 @@ router.get('/:propertyId/invoices', authenticateToken, async (req, res) => {
 // GET /properties/:propertyId/services — quote / selected packages
 router.get('/:propertyId/services', authenticateToken, async (req, res) => {
   try {
+    const owner = await assertPropertyAccess(req, res, req.params.propertyId);
+    if (!owner) return;
     const { rows } = await pool.query(
       `SELECT * FROM service_quotes WHERE property_id=$1 AND is_latest=true ORDER BY created_at DESC LIMIT 1`,
       [req.params.propertyId]);
@@ -364,6 +370,8 @@ router.get('/:propertyId/services', authenticateToken, async (req, res) => {
 // POST /properties/:propertyId/select-services  body: { packages: [...] }
 router.post('/:propertyId/select-services', authenticateToken, async (req, res) => {
   try {
+    const owner = await assertPropertyAccess(req, res, req.params.propertyId);
+    if (!owner) return;
     const { packages } = req.body || {};
     const quoteId = 'QUOTE-' + Date.now() + '-' + Math.floor(Math.random()*900+100);
     await pool.query(`UPDATE service_quotes SET is_latest=false WHERE property_id=$1`, [req.params.propertyId]);
@@ -378,6 +386,8 @@ router.post('/:propertyId/select-services', authenticateToken, async (req, res) 
 // GET /properties/:propertyId/alerts
 router.get('/:propertyId/alerts', authenticateToken, async (req, res) => {
   try {
+    const owner = await assertPropertyAccess(req, res, req.params.propertyId);
+    if (!owner) return;
     // alerts tie to client_id/sensor; for a submitted property there may be none yet
     const { rows } = await pool.query(
       `SELECT a.* FROM alerts a
@@ -391,6 +401,8 @@ router.get('/:propertyId/alerts', authenticateToken, async (req, res) => {
 // GET /properties/:propertyId/tickets — support tickets for a property
 router.get('/:propertyId/tickets', authenticateToken, async (req, res) => {
   try {
+    const owner = await assertPropertyAccess(req, res, req.params.propertyId);
+    if (!owner) return;
     const { rows } = await pool.query(
       `SELECT * FROM tickets WHERE property_id = $1 ORDER BY created_at DESC`,
       [req.params.propertyId]);
@@ -407,9 +419,11 @@ router.get('/:propertyId/tickets', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /properties/:propertyId/schedule-inspection
+// POST /properties/:propertyId/schedule-inspection — ops dispatches a field
+// team; a client submitting their own inspection date is not this endpoint.
 // body: { scheduled_date, team_id, notes, priority }
 router.post('/:propertyId/schedule-inspection', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const pid = req.params.propertyId;
     const b = req.body || {};
@@ -466,9 +480,11 @@ router.post('/:propertyId/schedule-inspection', authenticateToken, async (req, r
   }
 });
 
-// POST /properties/:propertyId/generate-invoice
+// POST /properties/:propertyId/generate-invoice — ops bills the customer;
+// a client account must never be able to create its own invoice.
 // body: { amount, description }
 router.post('/:propertyId/generate-invoice', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const pid = req.params.propertyId;
     const b = req.body || {};

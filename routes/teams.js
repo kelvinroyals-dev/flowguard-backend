@@ -2,7 +2,16 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { isClient } = require('../utils/scope');
 const router = express.Router();
+
+// This entire router manages internal field-crew assignment and live
+// location; a client-portal account has no business reading or writing it.
+router.use(authenticateToken);
+router.use((req, res, next) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  next();
+});
 
 async function membersFor(teamId) {
   const { rows } = await pool.query(

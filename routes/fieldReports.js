@@ -44,6 +44,7 @@ router.get('/', authenticateToken, async (req, res) => {
 // GET /field-reports/:id
 router.get('/:id', authenticateToken, async (req, res) => {
   try {
+    const { isClient, propertyIdsForUser } = require('../utils/scope');
     const { rows } = await pool.query(`
       SELECT ir.*, p.property_name, p.city, p.state,
              i.assigned_agent_name AS submitted_by_name, i.assigned_team AS team_name,
@@ -53,13 +54,23 @@ router.get('/:id', authenticateToken, async (req, res) => {
       LEFT JOIN inspections i ON ir.inspection_id=i.inspection_id
       WHERE ir.report_id=$1`, [req.params.id]);
     if (!rows[0]) return res.status(404).json({ success:false, error:'Report not found' });
+    if (isClient(req)) {
+      const pids = await propertyIdsForUser(req.user.id);
+      if (!pids.includes(rows[0].property_id)) {
+        return res.status(403).json({ success: false, error: 'Not authorised' });
+      }
+    }
     rows[0].status = toFe(rows[0].status);
     res.json({ success: true, data: rows[0] });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to load report' }); }
 });
 
-// PUT /field-reports/:id  (edit + status change)
+// PUT /field-reports/:id  (edit + status change) — ops only: this is the
+// inspection report an ops/field user drafts and approves, not something a
+// client edits.
 router.put('/:id', authenticateToken, async (req, res) => {
+  const { isClient } = require('../utils/scope');
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const sets = [], vals = []; let i = 1;
     if ('executive_summary' in req.body) { sets.push(`executive_summary=$${i++}`); vals.push(req.body.executive_summary); }
@@ -74,8 +85,10 @@ router.put('/:id', authenticateToken, async (req, res) => {
   } catch (err) { console.error('PUT /field-reports/:id', err); res.status(500).json({ success:false, error:'Failed to update report' }); }
 });
 
-// POST /field-reports/:id/send-to-client
+// POST /field-reports/:id/send-to-client — ops only.
 router.post('/:id/send-to-client', authenticateToken, async (req, res) => {
+  const { isClient } = require('../utils/scope');
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const { rows } = await pool.query(
       `UPDATE inspection_reports SET status='sent_to_client', sent_to_client_at=NOW(), updated_at=NOW()

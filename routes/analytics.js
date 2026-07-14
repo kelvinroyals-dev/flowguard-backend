@@ -2,7 +2,15 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { isClient } = require('../utils/scope');
 const router = express.Router();
+
+// Company-wide revenue/MRR and every client's map location — ops only.
+router.use(authenticateToken);
+router.use((req, res, next) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  next();
+});
 
 // GET /analytics/kpis
 router.get('/kpis', authenticateToken, async (req, res) => {

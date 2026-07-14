@@ -218,10 +218,9 @@ router.get('/sensor/:sensorId', authenticateToken, async (req, res) => {
 
 // GET /monitoring/sensors/all — ops-wide node fleet with latest reading (ops only)
 router.get('/sensors/all', authenticateToken, async (req, res) => {
+  const { isClient } = require('../utils/scope');
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
-    const { isClient } = require('../utils/scope');
-    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
-
     const { rows } = await pool.query(`
       SELECT s.sensor_id, s.name, s.zone, s.status, s.battery_voltage, s.signal_strength,
              s.last_ping, s.max_capacity, s.latitude, s.longitude,

@@ -2,6 +2,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { isClient } = require('../utils/scope');
 const realtime = require('../realtime/io');
 const router = express.Router();
 
@@ -46,8 +47,11 @@ router.get('/', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /alerts — create an alert (sensor ingestion / manual) + broadcast
+// POST /alerts — create an alert (sensor ingestion / manual) + broadcast.
+// Manual creation is an ops action; sensors report via /monitoring/readings
+// with a device key, not this user-facing endpoint.
 router.post('/', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const b = req.body || {};
     const alertId = 'ALT-' + Date.now() + '-' + Math.floor(Math.random()*900+100);
@@ -66,6 +70,7 @@ router.post('/', authenticateToken, async (req, res) => {
 
 // PUT /alerts/:id/assign  body: { team_id }
 router.put('/:id/assign', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const { team_id } = req.body || {};
     const { rows } = await pool.query(
@@ -80,6 +85,7 @@ router.put('/:id/assign', authenticateToken, async (req, res) => {
 
 // PUT /alerts/:id/resolve
 router.put('/:id/resolve', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const { rows } = await pool.query(
       `UPDATE alerts SET status='resolved', resolved_at=NOW()

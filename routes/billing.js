@@ -1,11 +1,13 @@
 // Billing — invoices + summary (ops center)
 const express = require('express');
 const pool = require('../config/database');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole } = require('../middleware/auth');
+const { isClient } = require('../utils/scope');
 const router = express.Router();
 
-// GET /billing/summary
+// GET /billing/summary — company-wide revenue/MRR. Ops only.
 router.get('/summary', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const mrr = await pool.query(`SELECT COALESCE(SUM(mrr),0) v FROM clients`);
     const overdue = await pool.query(
@@ -51,7 +53,7 @@ router.get('/invoices', authenticateToken, async (req, res) => {
   } catch (err) { console.error('GET /billing/invoices', err); res.status(500).json({ success:false, error:'Failed to load invoices' }); }
 });
 
-// GET /billing/invoices/:id
+// GET /billing/invoices/:id — a client may only fetch their own invoice.
 router.get('/invoices/:id', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
@@ -60,12 +62,16 @@ router.get('/invoices/:id', authenticateToken, async (req, res) => {
       LEFT JOIN properties p ON i.property_id=p.property_id
       WHERE i.invoice_id = $1`, [req.params.id]);
     if (!rows[0]) return res.status(404).json({ success:false, error:'Invoice not found' });
+    if (isClient(req) && rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Not authorised' });
+    }
     res.json({ success: true, data: rows[0] });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to load invoice' }); }
 });
 
-// POST /billing/invoices/:id/mark-paid
-router.post('/invoices/:id/mark-paid', authenticateToken, async (req, res) => {
+// POST /billing/invoices/:id/mark-paid — this waives a real balance; restrict
+// to roles that actually handle money.
+router.post('/invoices/:id/mark-paid', authenticateToken, requireRole('admin', 'super_admin', 'finance', 'operations_manager'), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE invoices SET payment_status='paid', status='paid', paid_date=CURRENT_DATE,
@@ -97,6 +103,9 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
     const prop = await pool.query('SELECT * FROM properties WHERE property_id = $1', [pid]);
     if (!prop.rows[0]) return res.status(404).json({ success: false, error: 'Property not found' });
     const property = prop.rows[0];
+    if (isClient(req) && property.user_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Not authorised' });
+    }
 
     // latest quote drives subscription pricing
     const quote = await pool.query(

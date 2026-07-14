@@ -1,9 +1,18 @@
 // Clients (activated paying sites) — ops center
 const express = require('express');
 const pool = require('../config/database');
-const { authenticateToken } = require('../middleware/auth');
+const { authenticateToken, requireRole } = require('../middleware/auth');
 const { requireIntParam } = require('../middleware/validate-id');
+const { isClient } = require('../utils/scope');
 const router = express.Router();
+
+// This is the customer directory — a client account has no business
+// browsing or editing every other customer's record.
+router.use(authenticateToken);
+router.use((req, res, next) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  next();
+});
 
 // GET /clients — client-type USERS who submitted areas (ops "Clients" tab)
 router.get('/', authenticateToken, async (req, res) => {
@@ -55,8 +64,9 @@ router.get('/:id', authenticateToken, requireIntParam('id'), async (req, res) =>
   }
 });
 
-// PUT /clients/:id — update a client user
-router.put('/:id', authenticateToken, requireIntParam('id'), async (req, res) => {
+// PUT /clients/:id — update a client user. Editing another customer's
+// account (including deactivating it) is an admin/ops-manager/finance action.
+router.put('/:id', authenticateToken, requireRole('admin', 'super_admin', 'operations_manager', 'finance'), requireIntParam('id'), async (req, res) => {
   try {
     const sets = [], vals = []; let i = 1;
     if ('full_name' in req.body) { sets.push(`full_name = $${i++}`); vals.push(req.body.full_name); }
@@ -76,8 +86,9 @@ router.put('/:id', authenticateToken, requireIntParam('id'), async (req, res) =>
   }
 });
 
-// DELETE /clients/:id — delete a client user (cascades to their properties)
-router.delete('/:id', authenticateToken, requireIntParam('id'), async (req, res) => {
+// DELETE /clients/:id — delete a client user (cascades to their properties).
+// Destructive + cascading: admin/super_admin only.
+router.delete('/:id', authenticateToken, requireRole('admin', 'super_admin'), requireIntParam('id'), async (req, res) => {
   try {
     const { rowCount } = await pool.query(
       `DELETE FROM users WHERE id = $1 AND user_type='client'`, [req.params.id]);

@@ -22,7 +22,7 @@ function init(httpServer) {
                  || socket.handshake.query?.token
                  || (socket.handshake.headers?.authorization || '').replace('Bearer ', '');
       if (token) {
-        socket.user = jwt.verify(token, process.env.JWT_SECRET);
+        socket.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
       }
     } catch (_) { /* ignore bad token; connect anyway */ }
     next();

@@ -45,7 +45,7 @@ app.use(cors({
   origin: (origin, cb) => {
     // allow non-browser tools (curl/postman) with no origin
     if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(null, true); // permissive for now; tighten after go-live
+    return cb(new Error('Not allowed by CORS')); // enforced — was previously always cb(null, true)
   },
   credentials: true,
   maxAge: 86400, // cache CORS preflight for 24h — kills repeat OPTIONS round-trips

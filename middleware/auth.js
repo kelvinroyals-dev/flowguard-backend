@@ -6,7 +6,7 @@ function authenticateToken(req, res, next) {
   const token = header && header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ success: false, error: 'No token provided' });
   try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET); // { id, email, role, user_type }
+    req.user = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] }); // { id, email, role, user_type }
     next();
   } catch (err) {
     return res.status(401).json({ success: false, error: 'Invalid or expired token' });

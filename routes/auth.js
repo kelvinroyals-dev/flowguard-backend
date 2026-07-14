@@ -2,6 +2,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const pool = require('../config/database');
 
 const router = express.Router();
@@ -11,6 +12,20 @@ function signToken(user) {
     { id: user.id, email: user.email, role: user.role, user_type: user.user_type },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+  );
+}
+
+// A dedicated, purpose-scoped, short-lived token for the email-verification
+// link. This must NOT be signToken() — that issues a full 7-day session
+// credential, and the verification link goes out over plain email (mail
+// server logs, forwarding, link-scanning proxies, browser history). Scoping
+// it to `purpose: 'email_verify'` with a short expiry means a leaked link
+// is only ever good for verifying that one email, for a few hours.
+function signVerifyToken(user) {
+  return jwt.sign(
+    { id: user.id, email: user.email, purpose: 'email_verify' },
+    process.env.JWT_SECRET,
+    { expiresIn: '24h' }
   );
 }
 
@@ -171,8 +186,8 @@ router.post('/register', async (req, res) => {
       try {
         const mailer = require('../utils/mailer');
         await mailer.sendWelcome(user.email, user.full_name);
-        // email verification link (24h token reuses reset_token columns is unsafe; use a signed token)
-        const verifyToken = signToken({ id: user.id, email: user.email });
+        // email verification link — purpose-scoped, 24h token (not a full login session)
+        const verifyToken = signVerifyToken(user);
         const verifyUrl = `https://app.flowguard.ng/verify-email.html?token=${verifyToken}`;
         await mailer.sendVerification(user.email, verifyUrl);
         await mailer.sendOpsNewSignup(user);
@@ -217,7 +232,6 @@ router.post('/forgot-password', async (req, res) => {
     const { rows } = await pool.query('SELECT id, email FROM users WHERE LOWER(email) = $1 AND is_active = true', [email]);
     if (!rows[0]) return res.json(generic);
 
-    const crypto = require('crypto');
     const token = crypto.randomBytes(32).toString('hex');
     const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
     await pool.query('UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3', [hashToken(token), expires, rows[0].id]);
@@ -279,8 +293,13 @@ router.post('/verify-email', async (req, res) => {
     if (!token) return res.status(400).json({ success: false, error: 'Verification token is required.' });
     let payload;
     try {
-      payload = jwt.verify(token, process.env.JWT_SECRET);
+      payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
     } catch (e) {
+      return res.status(400).json({ success: false, error: 'This verification link is invalid or has expired.' });
+    }
+    // Reject any other token type (e.g. a normal 7-day login token) — this
+    // link must only ever be usable for the one thing it was issued for.
+    if (payload.purpose !== 'email_verify') {
       return res.status(400).json({ success: false, error: 'This verification link is invalid or has expired.' });
     }
     const { rows } = await pool.query(

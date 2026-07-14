@@ -2,8 +2,23 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { isClient } = require('../utils/scope');
 const router = express.Router();
 const { logAction } = require('../utils/audit');
+
+// Shared ownership guard: a client may only reach their own ticket; ops may
+// reach any. Returns the ticket row, or null after writing the response.
+async function assertTicketAccess(req, res, ticketId) {
+  const { rows } = await pool.query(
+    'SELECT ticket_id, user_id, property_id, work_type, status, assigned_team, alert_id FROM tickets WHERE ticket_id = $1',
+    [ticketId]);
+  if (!rows[0]) { res.status(404).json({ success: false, error: 'Ticket not found' }); return null; }
+  if (isClient(req) && rows[0].user_id !== req.user.id) {
+    res.status(403).json({ success: false, error: 'Not authorised' });
+    return null;
+  }
+  return rows[0];
+}
 
 // shape a DB row to what the frontend renders (subject/priority aliases)
 function shape(r) {
@@ -57,6 +72,7 @@ router.post('/', authenticateToken, async (req, res) => {
 // GET /tickets/:ticketId
 router.get('/:ticketId', authenticateToken, async (req, res) => {
   try {
+    if (!(await assertTicketAccess(req, res, req.params.ticketId))) return;
     const { rows } = await pool.query('SELECT * FROM tickets WHERE ticket_id = $1', [req.params.ticketId]);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'Ticket not found' });
     let messages = [];
@@ -73,15 +89,15 @@ router.get('/:ticketId', authenticateToken, async (req, res) => {
 // POST /:ticketId/reply — add a message to the ticket thread
 router.post('/:ticketId/reply', authenticateToken, async (req, res) => {
   try {
+    const t = await assertTicketAccess(req, res, req.params.ticketId);
+    if (!t) return;
     const { message } = req.body;
     if (!message || !message.trim()) return res.status(400).json({ success: false, error: 'Message is required' });
-    const t = await pool.query('SELECT ticket_id FROM tickets WHERE ticket_id = $1', [req.params.ticketId]);
-    if (!t.rows[0]) return res.status(404).json({ success: false, error: 'Ticket not found' });
     const name = req.user.full_name || req.user.email || 'You';
     const { rows } = await pool.query(
       `INSERT INTO ticket_messages (ticket_id, author_type, author_name, message)
-       VALUES ($1, 'client', $2, $3) RETURNING author_type, author_name, message, created_at`,
-      [req.params.ticketId, name, message.trim()]);
+       VALUES ($1, $2, $3, $4) RETURNING author_type, author_name, message, created_at`,
+      [req.params.ticketId, isClient(req) ? 'client' : 'ops', name, message.trim()]);
     // reopen ticket if it was resolved/closed
     await pool.query(`UPDATE tickets SET status = CASE WHEN status IN ('resolved','closed') THEN 'in_progress' ELSE status END, updated_at = NOW() WHERE ticket_id = $1`, [req.params.ticketId]);
     res.json({ success: true, data: rows[0] });
@@ -96,6 +112,7 @@ router.post('/:ticketId/reply', authenticateToken, async (req, res) => {
 //   The field crew closes the job in field.html. THIS is where the client's
 //   outcome record is written — no separate "log an event" chore for ops.
 router.post('/:ticketId/complete', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
