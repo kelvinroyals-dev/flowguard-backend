@@ -3,6 +3,7 @@ const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { isClient } = require('../utils/scope');
+const { currentRiskByEstate } = require('../utils/riskForecast');
 const router = express.Router();
 
 // Company-wide revenue/MRR and every client's map location — ops only.
@@ -98,11 +99,33 @@ router.get('/map-data', authenticateToken, async (req, res) => {
       FROM alerts a LEFT JOIN sensors s ON a.sensor_id=s.sensor_id
       LEFT JOIN clients c ON a.client_id=c.id
       WHERE a.status='active' AND s.latitude IS NOT NULL`);
+
+    // Flood risk zones for the map layer — this used to be requested by the
+    // frontend (plotFloodRisk(md.flood_risk)) but never sent by the backend,
+    // so the layer silently rendered empty on every load. Reuses the same
+    // current-risk formula as the client portal and the AI Risk Forecast
+    // screen (utils/riskForecast.js) — one risk number, three consumers.
+    let floodRisk = [];
+    try {
+      const estates = await currentRiskByEstate();
+      floodRisk = estates
+        .filter(e => e.latitude != null && e.longitude != null)
+        .map(e => ({
+          property_id: e.property_id, name: e.name,
+          latitude: e.latitude, longitude: e.longitude,
+          risk_index: e.current_risk,
+          flood_risk_level: e.current_risk >= 70 ? 'critical' : e.current_risk >= 50 ? 'high' : e.current_risk >= 30 ? 'moderate' : 'low',
+        }));
+    } catch (err) {
+      console.error('GET /analytics/map-data flood_risk', err.message);
+    }
+
     res.json({ success: true, data: {
-      sites:   sites.rows,
-      sensors: sensors.rows,
-      areas:   areas.rows,
-      alerts:  alerts.rows,
+      sites:      sites.rows,
+      sensors:    sensors.rows,
+      areas:      areas.rows,
+      alerts:     alerts.rows,
+      flood_risk: floodRisk,
     }});
   } catch (err) {
     console.error('GET /analytics/map-data', err);

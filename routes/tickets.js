@@ -69,6 +69,82 @@ router.post('/', authenticateToken, async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════
+//  MAINTENANCE PLANNER — scheduled work, distinct from alert-triggered
+//  dispatch (routes/alerts.js .../dispatch). A ticket lands here once it
+//  has a work_type or an assigned crew, i.e. it's real field work, not a
+//  bare client support message with nothing yet to schedule.
+//  MUST be registered before GET/POST '/:ticketId' below — Express
+//  dispatches to the first matching route, and ':ticketId' would swallow
+//  a literal '/planner' segment otherwise (see the same note that used to
+//  bite properties.js).
+// ══════════════════════════════════════════════════════════════
+
+// GET /tickets/planner — ops-only, all scheduled/active/recently-completed work
+router.get('/planner', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  try {
+    const { rows } = await pool.query(`
+      SELECT t.ticket_id, t.title, t.priority, t.status, t.work_type,
+             t.scheduled_date, t.estimated_hours, t.created_at, t.completed_at,
+             t.property_id, COALESCE(p.asset_code, p.property_name) AS property_name,
+             t.assigned_team, ft.team_name, ft.members
+        FROM tickets t
+        LEFT JOIN properties p ON p.property_id = t.property_id
+        LEFT JOIN field_teams ft ON ft.team_id = t.assigned_team
+       WHERE t.work_type IS NOT NULL OR t.assigned_team IS NOT NULL OR t.scheduled_date IS NOT NULL
+       ORDER BY COALESCE(t.scheduled_date, t.created_at) ASC
+       LIMIT 300`);
+    res.json({ success: true, data: rows.map(r => ({
+      ticket_id: r.ticket_id, title: r.title, priority: r.priority || 'normal',
+      status: r.status, work_type: r.work_type,
+      scheduled_date: r.scheduled_date, estimated_hours: r.estimated_hours != null ? parseFloat(r.estimated_hours) : null,
+      created_at: r.created_at, completed_at: r.completed_at,
+      property_id: r.property_id, property_name: r.property_name,
+      assigned_team: r.assigned_team, team_name: r.team_name,
+      crew_size: Array.isArray(r.members) ? r.members.length : null,
+    })) });
+  } catch (err) {
+    console.error('GET /tickets/planner', err);
+    res.status(500).json({ success: false, error: 'Failed to load the maintenance planner' });
+  }
+});
+
+// POST /tickets/planner — schedule a new maintenance job (ops-only)
+// body: { property_id, work_type, title?, priority?, assigned_team?, scheduled_date, estimated_hours? }
+router.post('/planner', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  try {
+    const b = req.body || {};
+    if (!b.work_type) return res.status(400).json({ success: false, error: 'work_type is required' });
+    if (!b.scheduled_date) return res.status(400).json({ success: false, error: 'scheduled_date is required' });
+
+    let propertyName = null;
+    if (b.property_id) {
+      const { rows } = await pool.query(
+        `SELECT COALESCE(asset_code, property_name) AS name FROM properties WHERE property_id = $1`, [b.property_id]);
+      propertyName = rows[0] ? rows[0].name : null;
+    }
+    const title = b.title || `${String(b.work_type).replace(/_/g, ' ')}${propertyName ? ' — ' + propertyName : ''}`;
+    const ticketId = 'WO-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
+
+    const { rows } = await pool.query(`
+      INSERT INTO tickets (ticket_id, title, description, priority, work_type, property_id,
+                            assigned_team, scheduled_date, estimated_hours, status,
+                            user_id, created_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'scheduled',$10,$11) RETURNING *`,
+      [ticketId, title, b.description || null, b.priority || 'normal', b.work_type,
+       b.property_id || null, b.assigned_team || null, b.scheduled_date,
+       b.estimated_hours || null, req.user.id, req.user.email]);
+
+    logAction(req.user.id, 'scheduled a maintenance job', 'ticket', ticketId, { work_type: b.work_type, scheduled_date: b.scheduled_date });
+    res.status(201).json({ success: true, data: shape(rows[0]) });
+  } catch (err) {
+    console.error('POST /tickets/planner', err);
+    res.status(500).json({ success: false, error: 'Failed to schedule the job' });
+  }
+});
+
 // GET /tickets/:ticketId
 router.get('/:ticketId', authenticateToken, async (req, res) => {
   try {
@@ -189,6 +265,28 @@ router.post('/:ticketId/complete', authenticateToken, async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to complete work order' });
   } finally {
     client.release();
+  }
+});
+
+// PUT /tickets/:ticketId/status — move a job between planner columns
+// (Scheduled <-> In Progress). Completion has real side-effects (crew
+// release, client outcome record) so it stays on POST /:id/complete —
+// this endpoint deliberately refuses 'resolved'/'closed'.
+router.put('/:ticketId/status', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  try {
+    const VALID = ['scheduled', 'in_progress'];
+    if (!VALID.includes(req.body.status)) {
+      return res.status(400).json({ success: false, error: `status must be one of: ${VALID.join(', ')}. Use POST /tickets/:id/complete to mark work done.` });
+    }
+    const { rows } = await pool.query(
+      `UPDATE tickets SET status = $2, updated_at = NOW() WHERE ticket_id = $1 RETURNING *`,
+      [req.params.ticketId, req.body.status]);
+    if (!rows.length) return res.status(404).json({ success: false, error: 'Work order not found' });
+    res.json({ success: true, data: shape(rows[0]) });
+  } catch (err) {
+    console.error('PUT /tickets/:id/status', err);
+    res.status(500).json({ success: false, error: 'Failed to update status' });
   }
 });
 

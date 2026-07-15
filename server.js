@@ -102,6 +102,7 @@ app.use(`${API_PREFIX}/field-reports`, require('./routes/fieldReports'));
 app.use(`${API_PREFIX}/tickets`, require('./routes/tickets'));
 app.use(`${API_PREFIX}/settings`, require('./routes/settings'));
 app.use(`${API_PREFIX}/monitoring`, require('./routes/monitoring'));
+app.use(`${API_PREFIX}/forecast`, require('./routes/forecast'));
 app.use(`${API_PREFIX}`, require('./routes/account'));
 
 // ── 404 ──────────────────────────────────────────────────
