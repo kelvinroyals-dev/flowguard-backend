@@ -39,7 +39,12 @@ const pool = new Pool(
 const ARGV    = process.argv.slice(2);
 const COMMIT  = ARGV.includes('--commit');
 const INSPECT = ARGV.includes('--inspect');
+const CHECKS  = ARGV.includes('--checks');
 const WIPE    = ARGV.includes('--wipe');
+
+const TARGET_TABLES = ['clients', 'users', 'properties', 'sensors', 'sentinel_coverage', 'alerts',
+  'tickets', 'inspections', 'inspection_reports', 'service_quotes', 'invoices',
+  'field_teams', 'team_members', 'sla_tracking', 'property_events', 'reports'];
 const MARK    = 'DEMO-360';
 const IDS_FILE = path.join(__dirname, '.seed-360-ids.json');
 
@@ -89,10 +94,20 @@ async function insert(client, table, values, label) {
   return r.rows[0];
 }
 
+// Print every CHECK constraint on the target tables — the definitive
+// list of allowed enum values, so we fix them all in one pass.
+async function printChecks(client) {
+  const r = await client.query(
+    `SELECT c.conrelid::regclass::text AS tbl, pg_get_constraintdef(c.oid) AS def
+       FROM pg_constraint c
+      WHERE c.contype='c' AND c.conrelid::regclass::text = ANY($1)
+      ORDER BY 1`, [TARGET_TABLES]);
+  if (!r.rows.length) { console.log('No CHECK constraints found.'); return; }
+  for (const row of r.rows) console.log(`${row.tbl.padEnd(20)} ${row.def}`);
+}
+
 async function inspect(client) {
-  const tables = ['clients', 'users', 'properties', 'sensors', 'sentinel_coverage', 'alerts',
-    'tickets', 'inspections', 'inspection_reports', 'service_quotes', 'invoices',
-    'field_teams', 'team_members', 'sla_tracking', 'property_events', 'reports'];
+  const tables = TARGET_TABLES;
   for (const t of tables) {
     try {
       const s = await schemaOf(client, t);
@@ -171,7 +186,7 @@ async function build(client) {
     await insert(client, 'sensors', {
       sensor_id: ID.sensors[i], name: `${MARK} Sentinel O-${114 + i}`, client_id: clientId, property_id: a,
       zone: 'Lekki', sensor_type: 'water_level', status: 'active', firmware_version: 'v2.3.1',
-      device_variant: i === 0 ? 'bio_dispenser' : 'basic', link_type: 'gsm',
+      device_variant: i === 0 ? 'bio_dispenser' : 'basic', link_type: 'cellular',
       battery_voltage: 3.9 - i * 0.1, signal_strength: 88 - i * 6, max_capacity: 100,
       latitude: 6.4423 + i * 0.001, longitude: 3.4711 + i * 0.001,
       installed_date: date(daysAgo(185)), last_ping: iso(daysAgo(0)), created_at: iso(daysAgo(185)),
@@ -269,11 +284,11 @@ async function build(client) {
     created_at: iso(daysAgo(2)),
   }, 'SLA tracking');
 
-  // 16) Timeline events
+  // 16) Timeline events — event_type is a strict enum
   for (const [type, desc, ago] of [
     ['inspection', 'Estate inspection completed — score 7/10', 20],
-    ['incident', 'Blockage incident detected and resolved', 34],
-    ['payment', 'Monthly invoice paid', 38],
+    ['incident_prevented', 'Blockage detected and cleared before overflow', 34],
+    ['silt_clearing', 'Silt clearing scheduled on Main Trunk Canal', 3],
   ]) {
     await insert(client, 'property_events', {
       property_id: ID.prop, event_type: type, description: `${MARK} ${desc}`,
@@ -324,6 +339,7 @@ async function wipe(client) {
 (async () => {
   const client = await pool.connect();
   try {
+    if (CHECKS)  { await printChecks(client); return; }
     if (INSPECT) { await inspect(client); return; }
     await client.query('BEGIN');
     if (WIPE) {
