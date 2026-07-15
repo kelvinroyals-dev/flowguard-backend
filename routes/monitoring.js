@@ -234,7 +234,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
              r.water_level_percent, r.water_level_liters, r.inflow_rate, r.outflow_rate,
              r.temperature, r.debris_detected, r.silt_depth_mm, r.rainfall_mm,
              r.water_quality_ph, r.turbidity_ntu, r.time AS reading_time,
-             cov.assets
+             cov.assets, cmd.pending_commands
         FROM sensors s
         LEFT JOIN clients c ON c.id = s.client_id
         LEFT JOIN LATERAL (
@@ -257,6 +257,12 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
             JOIN properties p ON p.property_id = sc.property_id
            WHERE sc.sensor_id = s.sensor_id
         ) cov ON true
+        -- commands queued but not yet picked up on the node's next check-in
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*) AS pending_commands
+            FROM device_commands dc
+           WHERE dc.sensor_id = s.sensor_id AND dc.status = 'queued'
+        ) cmd ON true
        ORDER BY
          CASE s.status WHEN 'active' THEN 0 WHEN 'maintenance' THEN 1 ELSE 2 END,
          r.water_level_percent DESC NULLS LAST, s.name`);
@@ -293,6 +299,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
         signal_strength: x.signal_strength,
         last_ping: x.last_ping, reading_time: x.reading_time,
         latitude: x.latitude, longitude: x.longitude,
+        pending_commands: parseInt(x.pending_commands) || 0,
       };
     });
     res.json({ success: true, data });
@@ -430,8 +437,20 @@ router.post('/readings', authenticateDevice, async (req, res) => {
       WHERE sensor_id = $1`,
       [sensorId, ts, batt, signal, b.firmware_version || null]);
 
+    // hand over any commands queued for this node since its last check-in —
+    // store-and-forward: there's no open socket, so "delivery" happens here,
+    // piggybacked on the node's own reporting cadence.
+    const { rows: pending } = await client.query(
+      `UPDATE device_commands SET status = 'delivered', delivered_at = NOW()
+        WHERE sensor_id = $1 AND status = 'queued'
+        RETURNING id, command_type, payload`, [sensorId]);
+
     await client.query('COMMIT');
-    res.status(201).json({ success: true, data: { sensor_id: sensorId, recorded_at: ts } });
+    res.status(201).json({
+      success: true,
+      data: { sensor_id: sensorId, recorded_at: ts },
+      commands: pending.map(p => ({ id: p.id, type: p.command_type, payload: p.payload })),
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('POST /monitoring/readings', err);
@@ -592,6 +611,119 @@ router.post('/sensors/:sensorId/events', authenticateToken, async (req, res) => 
   } catch (err) {
     console.error('POST device event', err);
     res.status(500).json({ success: false, error: 'Failed to record device event' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  REMOTE DEVICE COMMANDS — queue OTA/reset/recalibrate for a node
+//  Store-and-forward: a command sits 'queued' until the node's next
+//  check-in (POST /monitoring/readings), which is where it's handed over.
+// ══════════════════════════════════════════════════════════════
+
+const VALID_COMMANDS = ['firmware_update', 'reset', 'recalibrate'];
+
+function validateCommandBody(body) {
+  if (!VALID_COMMANDS.includes(body.command_type)) {
+    return `command_type must be one of: ${VALID_COMMANDS.join(', ')}`;
+  }
+  if (body.command_type === 'firmware_update' && !(body.payload && body.payload.firmware_version)) {
+    return 'firmware_update requires payload.firmware_version';
+  }
+  return null;
+}
+
+// GET /monitoring/sensors/:sensorId/commands — queued + past commands for one node
+router.get('/sensors/:sensorId/commands', authenticateToken, async (req, res) => {
+  try {
+    const { isClient } = require('../utils/scope');
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const { rows } = await pool.query(`
+      SELECT dc.*, u.full_name AS requested_by_name
+        FROM device_commands dc
+        LEFT JOIN users u ON u.id = dc.requested_by
+       WHERE dc.sensor_id = $1
+       ORDER BY dc.created_at DESC LIMIT 50`, [req.params.sensorId]);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('GET device commands', err);
+    res.status(500).json({ success: false, error: 'Failed to load command history' });
+  }
+});
+
+// POST /monitoring/sensors/:sensorId/commands  { command_type, payload?, note? }
+router.post('/sensors/:sensorId/commands', authenticateToken, async (req, res) => {
+  try {
+    const { isClient } = require('../utils/scope');
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+
+    const badReq = validateCommandBody(req.body);
+    if (badReq) return res.status(400).json({ success: false, error: badReq });
+
+    const sensorCheck = await pool.query(`SELECT sensor_id FROM sensors WHERE sensor_id = $1`, [req.params.sensorId]);
+    if (!sensorCheck.rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
+
+    const { rows } = await pool.query(`
+      INSERT INTO device_commands (sensor_id, command_type, payload, requested_by, note)
+      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [req.params.sensorId, req.body.command_type,
+       req.body.payload ? JSON.stringify(req.body.payload) : null,
+       req.user.id, req.body.note || null]);
+
+    res.status(201).json({ success: true, data: rows[0] });
+  } catch (err) {
+    console.error('POST device command', err);
+    res.status(500).json({ success: false, error: 'Failed to queue command' });
+  }
+});
+
+// POST /monitoring/sensors/commands/bulk  { sensor_ids: [...], command_type, payload?, note? }
+router.post('/sensors/commands/bulk', authenticateToken, async (req, res) => {
+  try {
+    const { isClient } = require('../utils/scope');
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+
+    const badReq = validateCommandBody(req.body);
+    if (badReq) return res.status(400).json({ success: false, error: badReq });
+
+    const ids = Array.isArray(req.body.sensor_ids) ? req.body.sensor_ids.filter(Boolean) : [];
+    if (!ids.length) return res.status(400).json({ success: false, error: 'sensor_ids must be a non-empty array' });
+    if (ids.length > 200) return res.status(400).json({ success: false, error: 'Too many sensors in one bulk request (max 200)' });
+
+    const { rows: valid } = await pool.query(
+      `SELECT sensor_id FROM sensors WHERE sensor_id = ANY($1)`, [ids]);
+    const validIds = valid.map(r => r.sensor_id);
+    const skipped = ids.filter(id => !validIds.includes(id));
+    if (!validIds.length) return res.status(404).json({ success: false, error: 'None of the given sensors exist' });
+
+    const payload = req.body.payload ? JSON.stringify(req.body.payload) : null;
+    const { rows } = await pool.query(`
+      INSERT INTO device_commands (sensor_id, command_type, payload, requested_by, note)
+      SELECT s, $2, $3, $4, $5 FROM UNNEST($1::varchar[]) AS s
+      RETURNING id, sensor_id`,
+      [validIds, req.body.command_type, payload, req.user.id, req.body.note || null]);
+
+    res.status(201).json({ success: true, data: { queued: rows.length, sensor_ids: rows.map(r => r.sensor_id), skipped } });
+  } catch (err) {
+    console.error('POST bulk device commands', err);
+    res.status(500).json({ success: false, error: 'Failed to queue bulk commands' });
+  }
+});
+
+// POST /monitoring/sensors/:sensorId/commands/:commandId/cancel — pull back a queued command
+router.post('/sensors/:sensorId/commands/:commandId/cancel', authenticateToken, async (req, res) => {
+  try {
+    const { isClient } = require('../utils/scope');
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+
+    const { rows } = await pool.query(`
+      UPDATE device_commands SET status = 'cancelled', cancelled_at = NOW()
+       WHERE id = $1 AND sensor_id = $2 AND status = 'queued'
+       RETURNING *`, [req.params.commandId, req.params.sensorId]);
+    if (!rows.length) return res.status(409).json({ success: false, error: 'Command not found or already delivered' });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) {
+    console.error('POST cancel device command', err);
+    res.status(500).json({ success: false, error: 'Failed to cancel command' });
   }
 });
 
