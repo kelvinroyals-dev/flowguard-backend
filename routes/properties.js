@@ -43,7 +43,7 @@ router.get('/all', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT p.property_id, p.property_name, p.property_type, p.city, p.state, p.country,
-             p.latitude, p.longitude, p.status, p.urgency_level, p.created_at,
+             p.latitude, p.longitude, p.status, p.urgency_level, p.risk_level, p.created_at,
              p.number_of_units, p.number_of_buildings,
              u.full_name AS client_name, u.email AS client_email,
              i.status AS inspection_status, i.scheduled_date AS inspection_date
