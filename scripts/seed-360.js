@@ -141,7 +141,7 @@ async function build(client) {
 
   // 4) The estate (customer property) — asset_class default = customer_property
   await insert(client, 'properties', {
-    property_id: ID.prop, property_name: `${MARK} Lekki Gardens Estate`, property_type: 'residential',
+    property_id: ID.prop, property_name: `${MARK} Lekki Gardens Estate`, property_type: 'residential_estate',
     address_line1: '1 Admiralty Way', city: 'Lagos', state: 'Lagos', country: 'Nigeria',
     latitude: 6.4423, longitude: 3.4711, status: 'active', urgency_level: 'high', risk_level: 'high',
     user_id: ownerId, client_id: clientId, number_of_units: 24, number_of_buildings: 6,
