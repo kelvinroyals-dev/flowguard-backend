@@ -230,7 +230,7 @@ async function build(client) {
     title: `${MARK} Silt clearing — Main Trunk Canal`, subject: `${MARK} Silt clearing`,
     description: `${MARK} Scheduled silt clearing following the resolved blockage.`,
     severity: 'high', priority: 'high', category: 'maintenance', work_type: 'silt_clearing',
-    property_id: ID.prop, user_id: ownerId, status: 'scheduled',
+    property_id: ID.prop, user_id: ownerId, status: 'in_progress',
     assigned_team: ID.team, created_by: `${MARK} Fatima Sani`, created_at: iso(daysAgo(3)),
   }, 'Silt clearing work order');
 
@@ -246,7 +246,7 @@ async function build(client) {
 
   // 12) Inspection report (this is the Field Reports tab source)
   await insert(client, 'inspection_reports', {
-    report_id: ID.report, inspection_id: ID.insp, property_id: ID.prop, status: 'submitted',
+    report_id: ID.report, inspection_id: ID.insp, property_id: ID.prop, status: 'approved',
     executive_summary: `${MARK} Post-blockage inspection — flow restored to normal.`,
     created_at: iso(daysAgo(18)),
   }, 'Inspection report');
