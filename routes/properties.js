@@ -656,6 +656,17 @@ router.get('/:propertyId/network', authenticateToken, async (req, res) => {
     if (!pRows.length) return res.status(404).json({ success: false, error: 'Property not found' });
     const property = pRows[0];
 
+    // Commercial context for the mission-control header (MRR, tier). Best
+    // effort only — properties.client_id may not resolve to a clients row
+    // (older data, or a property not yet tied to a billing account), and
+    // that's fine: the frontend shows "—" rather than a fabricated number.
+    let billing = null;
+    if (property.client_id) {
+      const { rows: cRows } = await pool.query(
+        `SELECT name, tier, mrr FROM clients WHERE id = $1`, [property.client_id]);
+      billing = cRows[0] || null;
+    }
+
     // assets inside this property, each with the Sentinels covering it
     const { rows: assets } = await pool.query(`
       SELECT a.property_id, a.asset_code, a.property_name, a.property_type,
@@ -714,6 +725,7 @@ router.get('/:propertyId/network', authenticateToken, async (req, res) => {
       success: true,
       data: {
         property,
+        billing,
         assets,
         unassigned_sentinels: orphans,
         summary: {
@@ -721,6 +733,7 @@ router.get('/:propertyId/network', authenticateToken, async (req, res) => {
           monitored: assets.filter(a => (a.sentinels || []).length).length,
           unmonitored: assets.filter(a => !(a.sentinels || []).length).length,
           sentinel_count: new Set(assets.flatMap(a => (a.sentinels || []).map(s => s.sensor_id))).size,
+          sentinels_active: new Set(assets.flatMap(a => (a.sentinels || []).filter(s => s.status === 'active').map(s => s.sensor_id))).size,
         },
       },
     });
