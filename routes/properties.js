@@ -310,7 +310,76 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
       `SELECT p.*,
               u.full_name AS client_name,
               u.email     AS client_email,
-              u.phone     AS client_phone
+              u.phone     AS client_phone,
+              (SELECT pp.property_name FROM properties pp
+                 WHERE pp.property_id = p.parent_property_id) AS parent_name,
+              -- child drainage assets belonging to this property
+              (SELECT json_agg(json_build_object(
+                        'property_id', a.property_id,
+                        'name',        COALESCE(a.asset_code, a.property_name),
+                        'asset_class', a.asset_class,
+                        'type',        a.property_type,
+                        'health_score', a.health_score,
+                        'status',      a.status
+                      ) ORDER BY a.property_name)
+                 FROM properties a
+                WHERE a.parent_property_id = p.property_id
+                  AND a.asset_class = 'drainage_asset') AS assets,
+              -- Sentinel devices covering this property or any of its assets
+              (SELECT json_agg(d) FROM (
+                 SELECT DISTINCT s.sensor_id, s.name, s.status
+                   FROM sensors s
+                   JOIN sentinel_coverage sc ON sc.sensor_id = s.sensor_id
+                  WHERE sc.property_id = p.property_id
+                     OR sc.property_id IN (SELECT property_id FROM properties
+                                            WHERE parent_property_id = p.property_id)
+                  ORDER BY s.name
+              ) d) AS devices,
+              -- incident history (alerts) tied to this property
+              (SELECT json_agg(json_build_object(
+                        'alert_id', al.alert_id,
+                        'alert_type', al.alert_type,
+                        'severity', al.severity,
+                        'status',   al.status,
+                        'description', al.description,
+                        'created_at', al.created_at
+                      ) ORDER BY al.created_at DESC)
+                 FROM alerts al WHERE al.property_id = p.property_id) AS incidents,
+              -- inspections / work
+              (SELECT json_agg(json_build_object(
+                        'inspection_id', i.inspection_id,
+                        'status', i.status,
+                        'scheduled_date', i.scheduled_date,
+                        'assigned_team', i.assigned_team,
+                        'flood_risk_level', i.flood_risk_level,
+                        'drainage_condition_score', i.drainage_condition_score
+                      ) ORDER BY i.scheduled_date DESC NULLS LAST)
+                 FROM inspections i WHERE i.property_id = p.property_id) AS inspections,
+              -- scheduled / dispatched work orders
+              (SELECT json_agg(json_build_object(
+                        'ticket_id', t.ticket_id,
+                        'title', t.title,
+                        'work_type', t.work_type,
+                        'status', t.status,
+                        'assigned_team', t.assigned_team,
+                        'scheduled_date', t.scheduled_date
+                      ) ORDER BY COALESCE(t.scheduled_date, t.created_at) DESC)
+                 FROM tickets t WHERE t.property_id = p.property_id) AS tickets,
+              -- quotes
+              (SELECT json_agg(json_build_object(
+                        'quote_id', q.quote_id,
+                        'total_monthly', COALESCE(q.total_monthly, q.total_amount),
+                        'status', q.status
+                      ) ORDER BY q.created_at DESC)
+                 FROM service_quotes q WHERE q.property_id = p.property_id) AS quotes,
+              -- invoices
+              (SELECT json_agg(json_build_object(
+                        'invoice_id', v.invoice_id,
+                        'total_amount', v.total_amount,
+                        'payment_status', v.payment_status,
+                        'due_date', v.due_date
+                      ) ORDER BY v.created_at DESC)
+                 FROM invoices v WHERE v.property_id = p.property_id) AS invoices
        FROM properties p
        LEFT JOIN users u ON p.user_id = u.id
        WHERE p.property_id = $1`,

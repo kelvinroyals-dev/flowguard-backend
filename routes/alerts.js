@@ -23,10 +23,16 @@ router.get('/', authenticateToken, async (req, res) => {
       SELECT a.alert_id, a.alert_id AS id, a.sensor_id, a.client_id, a.severity,
              a.alert_type, a.alert_type AS type, a.description, a.location,
              a.status, a.assigned_team_id, a.created_at, a.created_at AS timestamp,
-             c.name AS property, c.name AS site_name,
+             a.property_id,
+             COALESCE(p.property_name, c.name) AS property,
+             COALESCE(p.property_name, c.name) AS property_name,
+             c.name AS site_name,
+             s.name AS sensor_name,
              ft.team_name AS assigned_team
       FROM alerts a
       LEFT JOIN clients c ON a.client_id = c.id
+      LEFT JOIN properties p ON p.property_id = a.property_id
+      LEFT JOIN sensors s ON s.sensor_id = a.sensor_id
       LEFT JOIN field_teams ft ON a.assigned_team_id = ft.team_id
       WHERE a.status != 'closed'${clientFilter}
       ORDER BY CASE a.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2
