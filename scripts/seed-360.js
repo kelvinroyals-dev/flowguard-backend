@@ -198,8 +198,9 @@ async function build(client) {
   //    sentinel_coverage row) AND the ESTATE (so the estate's network shows
   //    its devices). sensor_id is the varchar code.
   for (const [i, s] of ID.sensors.entries()) {
+    // a node is primary for exactly one place (its asset); the estate cover is secondary
     await insert(client, 'sentinel_coverage', { sensor_id: s, property_id: ID.assets[i], is_primary: true, note: `${MARK} coverage (asset)` }, `coverage asset ${i + 1}`);
-    await insert(client, 'sentinel_coverage', { sensor_id: s, property_id: ID.prop, is_primary: i === 0, note: `${MARK} coverage (estate)` }, `coverage estate ${i + 1}`);
+    await insert(client, 'sentinel_coverage', { sensor_id: s, property_id: ID.prop, is_primary: false, note: `${MARK} coverage (estate)` }, `coverage estate ${i + 1}`);
   }
 
   // 7b) Telemetry history — so each node shows live water level / flow /
