@@ -326,15 +326,18 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
                 WHERE a.parent_property_id = p.property_id
                   AND a.asset_class = 'drainage_asset') AS assets,
               -- Sentinel devices covering this property or any of its assets
-              (SELECT json_agg(d) FROM (
-                 SELECT DISTINCT s.sensor_id, s.name, s.status
-                   FROM sensors s
-                   JOIN sentinel_coverage sc ON sc.sensor_id = s.sensor_id
-                  WHERE sc.property_id = p.property_id
-                     OR sc.property_id IN (SELECT property_id FROM properties
-                                            WHERE parent_property_id = p.property_id)
-                  ORDER BY s.name
-              ) d) AS devices,
+              (SELECT json_agg(json_build_object(
+                        'sensor_id', s.sensor_id,
+                        'name',      s.name,
+                        'status',    s.status
+                      ) ORDER BY s.name)
+                 FROM sensors s
+                WHERE s.sensor_id IN (
+                        SELECT sc.sensor_id FROM sentinel_coverage sc
+                         WHERE sc.property_id = p.property_id
+                            OR sc.property_id IN (SELECT a.property_id FROM properties a
+                                                   WHERE a.parent_property_id = p.property_id)
+                      )) AS devices,
               -- incident history (alerts) tied to this property
               (SELECT json_agg(json_build_object(
                         'alert_id', al.alert_id,
