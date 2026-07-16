@@ -193,11 +193,29 @@ async function build(client) {
     }, `Sentinel O-${114 + i}`);
   }
 
-  // 7) Sentinel ↔ property coverage (sensor_id is the varchar code)
+  // 7) Sentinel coverage — each node covers its ASSET (this is what the
+  //    dashboard's "monitored" KPI counts: drainage_asset rows with a
+  //    sentinel_coverage row) AND the ESTATE (so the estate's network shows
+  //    its devices). sensor_id is the varchar code.
   for (const [i, s] of ID.sensors.entries()) {
-    await insert(client, 'sentinel_coverage', {
-      sensor_id: s, property_id: ID.prop, is_primary: i === 0, note: `${MARK} coverage`,
-    }, `coverage ${i + 1}`);
+    await insert(client, 'sentinel_coverage', { sensor_id: s, property_id: ID.assets[i], is_primary: true, note: `${MARK} coverage (asset)` }, `coverage asset ${i + 1}`);
+    await insert(client, 'sentinel_coverage', { sensor_id: s, property_id: ID.prop, is_primary: i === 0, note: `${MARK} coverage (estate)` }, `coverage estate ${i + 1}`);
+  }
+
+  // 7b) Telemetry history — so each node shows live water level / flow /
+  //     temperature and a recent trend, and last_ping stays fresh.
+  let readingCount = 0;
+  for (const [i, s] of ID.sensors.entries()) {
+    const cap = i === 0 ? 50000 : 8000;
+    for (const h of [72, 48, 36, 24, 16, 8, 4, 2, 0]) {
+      const lvl = Math.max(8, Math.min(96, Math.round(34 + 22 * Math.sin(h / 10) + (Math.random() * 8 - 4))));
+      await insert(client, 'sensor_readings', {
+        sensor_id: s, time: iso(new Date(now.getTime() - h * 36e5)),
+        water_level_percent: lvl, water_level_liters: Math.round(cap * lvl / 100),
+        inflow_rate: +(2 + Math.random() * 3).toFixed(1), outflow_rate: +(1.5 + Math.random() * 3).toFixed(1),
+        temperature: +(26 + Math.random() * 3).toFixed(1), debris_detected: false,
+      }, readingCount++ === 0 ? 'sensor_readings (history ×' + (ID.sensors.length * 9) + ')' : null);
+    }
   }
 
   // 8) Incident history — one resolved, one open
@@ -329,6 +347,7 @@ async function wipe(client) {
   await del('sentinel_coverage', `sensor_id LIKE $1`, [like]);
   await del('team_members', `team_id LIKE $1`, [like]);
   await del('field_teams', `team_id LIKE $1`, [like]);
+  await del('sensor_readings', `sensor_id LIKE $1`, [like]);
   await del('sensors', `sensor_id LIKE $1`, [like]);
   await del('properties', `property_id LIKE $1`, [like]);
   await del('users', `email LIKE '%demo360%'`, []);
