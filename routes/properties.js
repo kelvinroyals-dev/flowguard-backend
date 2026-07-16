@@ -43,16 +43,25 @@ router.get('/all', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT p.property_id, p.property_name, p.property_type, p.city, p.state, p.country,
-             p.latitude, p.longitude, p.status, p.urgency_level, p.risk_level, p.created_at,
+             p.latitude, p.longitude, p.status, p.urgency_level, p.risk_level, p.health_score, p.created_at,
              p.number_of_units, p.number_of_buildings,
              u.full_name AS client_name, u.email AS client_email,
-             i.status AS inspection_status, i.scheduled_date AS inspection_date
+             i.status AS inspection_status, i.scheduled_date AS inspection_date,
+             -- Devices: Sentinels covering this property (via sentinel_coverage)
+             (SELECT COUNT(*) FROM sentinel_coverage sc WHERE sc.property_id = p.property_id) AS sentinel_count,
+             -- Assets that sit under this property
+             (SELECT COUNT(*) FROM properties a WHERE a.parent_property_id = p.property_id AND a.asset_class = 'drainage_asset') AS asset_count,
+             -- Open incidents on this property
+             (SELECT COUNT(*) FROM alerts al WHERE al.property_id = p.property_id AND al.status = 'active') AS open_incidents,
+             -- SLA: latest monthly compliance for the property's client, as a short label
+             (SELECT ROUND(st.uptime_percentage)::text || '%' FROM sla_tracking st WHERE st.client_id = p.client_id ORDER BY st.month DESC LIMIT 1) AS sla
       FROM properties p
       LEFT JOIN users u ON p.user_id = u.id
       LEFT JOIN LATERAL (
         SELECT status, scheduled_date FROM inspections
         WHERE property_id = p.property_id ORDER BY created_at DESC LIMIT 1
       ) i ON true
+      WHERE p.asset_class = 'customer_property' OR p.asset_class IS NULL
       ORDER BY
         CASE WHEN p.status='submitted' THEN 1 WHEN p.status='active' THEN 3 ELSE 2 END,
         p.created_at DESC
