@@ -28,7 +28,10 @@ router.get('/', authenticateToken, async (req, res) => {
              COALESCE(p.property_name, c.name) AS property_name,
              c.name AS site_name,
              s.name AS sensor_name,
-             ft.team_name AS assigned_team
+             ft.team_name AS assigned_team,
+             (SELECT t.ticket_id FROM tickets t
+               WHERE t.alert_id = a.alert_id
+               ORDER BY t.created_at DESC LIMIT 1) AS ticket_id
       FROM alerts a
       LEFT JOIN clients c ON a.client_id = c.id
       LEFT JOIN properties p ON p.property_id = a.property_id
@@ -101,6 +104,22 @@ router.put('/:id/resolve', authenticateToken, async (req, res) => {
     res.json({ success: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to resolve alert' });
+  }
+});
+
+// PUT /alerts/:id/reopen — put a resolved alert back into active state.
+router.put('/:id/reopen', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE alerts SET status='active', resolved_at=NULL
+       WHERE alert_id=$1 RETURNING *`, [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ success: false, error: 'Alert not found' });
+    if (realtime.events.alertNew) realtime.events.alertNew(rows[0]);
+    res.json({ success: true, data: rows[0] });
+  } catch (err) {
+    console.error('PUT /alerts/:id/reopen', err);
+    res.status(500).json({ success: false, error: 'Failed to reopen alert' });
   }
 });
 
