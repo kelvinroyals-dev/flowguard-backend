@@ -371,7 +371,7 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
               -- quotes
               (SELECT json_agg(json_build_object(
                         'quote_id', q.quote_id,
-                        'total_monthly', COALESCE(q.total_monthly, q.total_amount),
+                        'total_monthly', q.total_monthly,
                         'status', q.status
                       ) ORDER BY q.created_at DESC)
                  FROM service_quotes q WHERE q.property_id = p.property_id) AS quotes,
