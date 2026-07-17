@@ -228,7 +228,7 @@ router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
     let tx = L;
     try {
       const logoPath = require('path').join(__dirname, '..', 'assets', 'fg-logo.png');
-      if (fs.existsSync(logoPath)) { const lh = 40; doc.image(logoPath, L, 46, { height: lh }); tx = L + Math.round(lh * 824 / 609) + 12; }
+      if (fs.existsSync(logoPath)) { const lh = 40; doc.image(logoPath, L, 46, { height: lh }); tx = L + Math.round(lh * 834 / 620) + 12; }
     } catch (_) { /* no logo — text-only header */ }
     doc.font(F.b).fontSize(15).fillColor(BLACK).text('FlowGuard Solutions Limited', tx, 50);
     doc.font(F.r).fontSize(9).fillColor(GREY).text('Drainage & flood-prevention infrastructure', tx, 70);
