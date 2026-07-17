@@ -78,10 +78,14 @@ router.get('/sensors', authenticateToken, async (req, res) => {
     if (!ids.length) return res.json({ success: true, data: [] });
 
     const sensors = await pool.query(
-      `SELECT sensor_id, name, zone, status, device_variant,
-              enzyme_level_percent, cartridge_status, enzyme_capacity_ml,
-              enzyme_installed_date, estimated_depletion_date, daily_dispense_ml
-         FROM sensors WHERE client_id = ANY($1) ORDER BY name`, [ids]);
+      `SELECT s.sensor_id, s.name, s.zone, s.status, s.device_variant,
+              s.battery_voltage, s.signal_strength, s.last_ping,
+              COALESCE(pp.parent_property_id, pp.property_id) AS property_id,
+              s.enzyme_level_percent, s.cartridge_status, s.enzyme_capacity_ml,
+              s.enzyme_installed_date, s.estimated_depletion_date, s.daily_dispense_ml
+         FROM sensors s
+         LEFT JOIN properties pp ON pp.property_id = s.property_id
+        WHERE s.client_id = ANY($1) ORDER BY s.name`, [ids]);
 
     // Attach the latest reading + a small trend (last 7 readings) per sensor
     const out = [];
@@ -122,9 +126,14 @@ router.get('/sensors', authenticateToken, async (req, res) => {
       out.push({
         sensor_id: s.sensor_id, name: s.name, zone: s.zone, status: s.status,
         device_variant: s.device_variant || 'basic',
+        property_id: s.property_id,   // top-level customer property — needed for the portal's per-property scope
         level: trend.length ? trend[trend.length - 1] : null,
         flow_rate: latest && latest.inflow_rate != null ? parseFloat(latest.inflow_rate) : null,
         silt_level: latest && latest.debris_detected ? 70 : (latest ? 20 : null),
+        battery_percent: s.battery_voltage != null
+          ? Math.max(0, Math.min(100, Math.round(((parseFloat(s.battery_voltage) - 3.3) / 0.9) * 100))) : null,
+        signal_strength: s.signal_strength,
+        last_ping: s.last_ping,
         trend, has_data: trend.length > 0,
         enzyme
       });
@@ -188,6 +197,7 @@ router.get('/sensor/:sensorId', authenticateToken, async (req, res) => {
 
     const sres = await pool.query(
       `SELECT sensor_id, name, zone, status, device_variant,
+              battery_voltage, signal_strength, last_ping,
               enzyme_level_percent, cartridge_status, enzyme_capacity_ml,
               enzyme_installed_date, estimated_depletion_date, daily_dispense_ml
          FROM sensors WHERE sensor_id = $1 AND client_id = ANY($2)`, [req.params.sensorId, ids]);
@@ -206,6 +216,9 @@ router.get('/sensor/:sensorId', authenticateToken, async (req, res) => {
     res.json({ success: true, data: {
       sensor_id: s.sensor_id, name: s.name, zone: s.zone, status: s.status,
       device_variant: s.device_variant || 'basic',
+      battery_percent: s.battery_voltage != null
+        ? Math.max(0, Math.min(100, Math.round(((parseFloat(s.battery_voltage) - 3.3) / 0.9) * 100))) : null,
+      signal_strength: s.signal_strength, last_ping: s.last_ping,
       enzyme: s.device_variant === 'bio_dispenser' ? {
         level_percent: s.enzyme_level_percent != null ? parseFloat(s.enzyme_level_percent) : null,
         status: s.cartridge_status, depletion_date: s.estimated_depletion_date
