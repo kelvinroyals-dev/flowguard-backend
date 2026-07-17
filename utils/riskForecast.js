@@ -21,6 +21,24 @@ const CURRENT_WEIGHT = 0.55;
 const RAIN_WEIGHT = 0.45;
 const RAIN_TO_SCORE = 3;   // mm of forecast rain -> risk-score points, capped at 100
 
+// So the risk map is NEVER blank: properties geocode on submission, but older
+// or geocode-failed rows have no lat/long. Rather than drop them off the map,
+// place them at a STABLE approximate point inside the Lagos metro (derived from
+// the property id, so it doesn't jump around) and flag geo_approx=true so the UI
+// can mark it "approximate". A real geocode always overrides this.
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < String(s).length; i++) { h = (h * 31 + String(s).charCodeAt(i)) >>> 0; }
+  return h;
+}
+function approxLagos(seed) {
+  const h = hashStr(seed || 'x');
+  return {
+    lat: 6.415 + ((h % 1000) / 1000) * 0.225,               // ~6.415 – 6.640
+    lon: 3.305 + ((Math.floor(h / 1000) % 1000) / 1000) * 0.29, // ~3.305 – 3.595
+  };
+}
+
 // Score EVERY managed property — not just the ones with Sentinels.
 // The forecast is a "brain" that must be useful before a single device is
 // installed, then sharpen as they come online. So each property gets:
@@ -98,9 +116,16 @@ async function scoreProperties() {
     const fresh = r.latest_reading && (Date.now() - new Date(r.latest_reading).getTime()) < 6 * 3600 * 1000;
     const hasLive = sensorCount > 0 && !isNaN(peak) && fresh;
     const sensorRisk = hasLive ? Math.round(Math.min(100, peak * 0.7 + avg * 0.3)) : null;
+    let lat = r.latitude != null ? Number(r.latitude) : null;
+    let lon = r.longitude != null ? Number(r.longitude) : null;
+    let geoApprox = false;
+    if (lat == null || lon == null || isNaN(lat) || isNaN(lon)) {
+      const p = approxLagos(r.property_id || r.name);
+      lat = p.lat; lon = p.lon; geoApprox = true;
+    }
     return {
       property_id: r.property_id, name: r.name, client_name: r.client_name,
-      latitude: r.latitude, longitude: r.longitude,
+      latitude: lat, longitude: lon, geo_approx: geoApprox,
       has_live: hasLive,
       current_risk: hasLive ? sensorRisk : env.score,
       env_score: env.score,
