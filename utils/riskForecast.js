@@ -21,23 +21,13 @@ const CURRENT_WEIGHT = 0.55;
 const RAIN_WEIGHT = 0.45;
 const RAIN_TO_SCORE = 3;   // mm of forecast rain -> risk-score points, capped at 100
 
-// So the risk map is NEVER blank: properties geocode on submission, but older
-// or geocode-failed rows have no lat/long. Rather than drop them off the map,
-// place them at a STABLE approximate point inside the Lagos metro (derived from
-// the property id, so it doesn't jump around) and flag geo_approx=true so the UI
-// can mark it "approximate". A real geocode always overrides this.
-function hashStr(s) {
-  let h = 0;
-  for (let i = 0; i < String(s).length; i++) { h = (h * 31 + String(s).charCodeAt(i)) >>> 0; }
-  return h;
-}
-function approxLagos(seed) {
-  const h = hashStr(seed || 'x');
-  return {
-    lat: 6.415 + ((h % 1000) / 1000) * 0.225,               // ~6.415 – 6.640
-    lon: 3.305 + ((Math.floor(h / 1000) % 1000) / 1000) * 0.29, // ~3.305 – 3.595
-  };
-}
+// Coordinates are the source of truth for the map — never invented. A property
+// is plotted ONLY if it has real lat/long (geocoded from its address on
+// registration, or set/confirmed by an operator via the pin tool). Rows with no
+// coordinates are returned with latitude/longitude = null so the UI can list
+// them under "location not set" and prompt an operator to place the pin, rather
+// than guessing a point. `geo_approx` = we have coordinates but no human has
+// confirmed them yet (address geocode); it clears once location_verified.
 
 // Score EVERY managed property — not just the ones with Sentinels.
 // The forecast is a "brain" that must be useful before a single device is
@@ -82,7 +72,8 @@ function envScore(p) {
 async function scoreProperties() {
   const { rows } = await pool.query(`
     SELECT p.property_id, COALESCE(p.asset_code, p.property_name) AS name, p.property_name,
-           p.latitude, p.longitude, p.health_score, p.risk_level, p.user_id, p.last_inspected_at,
+           p.latitude, p.longitude, p.location_verified, p.geocode_source,
+           p.health_score, p.risk_level, p.user_id, p.last_inspected_at,
            u.full_name AS client_name,
            live.peak_level, live.avg_level, live.sensor_count, live.latest_reading,
            (SELECT COUNT(*) FROM alerts a WHERE a.property_id = p.property_id AND a.status = 'active') AS open_alerts,
@@ -118,14 +109,15 @@ async function scoreProperties() {
     const sensorRisk = hasLive ? Math.round(Math.min(100, peak * 0.7 + avg * 0.3)) : null;
     let lat = r.latitude != null ? Number(r.latitude) : null;
     let lon = r.longitude != null ? Number(r.longitude) : null;
-    let geoApprox = false;
-    if (lat == null || lon == null || isNaN(lat) || isNaN(lon)) {
-      const p = approxLagos(r.property_id || r.name);
-      lat = p.lat; lon = p.lon; geoApprox = true;
-    }
+    if (lat == null || lon == null || isNaN(lat) || isNaN(lon)) { lat = null; lon = null; }
+    const located = lat != null && lon != null;
+    const verified = r.location_verified === true;
     return {
       property_id: r.property_id, name: r.name, client_name: r.client_name,
-      latitude: lat, longitude: lon, geo_approx: geoApprox,
+      latitude: lat, longitude: lon,
+      located, location_verified: verified,
+      geo_approx: located && !verified,
+      geocode_source: r.geocode_source || null,
       has_live: hasLive,
       current_risk: hasLive ? sensorRisk : env.score,
       env_score: env.score,
@@ -232,6 +224,8 @@ async function buildForecast(startHour, endHour) {
   });
 
   const liveCount = forecastEstates.filter(e => e.has_live).length;
+  const locatedCount = forecastEstates.filter(e => e.located).length;
+  const unverifiedCount = forecastEstates.filter(e => e.geo_approx).length;
   const portfolioConfidence = forecastEstates.length
     ? Math.round(forecastEstates.reduce((s, e) => s + e.confidence, 0) / forecastEstates.length) : (rain ? 60 : 50);
 

@@ -300,6 +300,35 @@ router.post('/assets', authenticateToken, async (req, res) => {
 });
 
 
+// PUT /properties/:propertyId/location — operator sets/confirms the exact pin.
+//   Coordinates are the source of truth for the map, dispatch and risk calc, so
+//   this marks the property location_verified (a human placed it) and records
+//   the source. Ops-only; a client can't move their own pin.
+router.put('/:propertyId/location', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  try {
+    const lat = Number(req.body && req.body.latitude);
+    const lon = Number(req.body && req.body.longitude);
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90 ||
+        !Number.isFinite(lon) || lon < -180 || lon > 180) {
+      return res.status(400).json({ success: false, error: 'Valid latitude and longitude are required' });
+    }
+    const { rows } = await pool.query(
+      `UPDATE properties
+          SET latitude = $2, longitude = $3, location_verified = true,
+              geocoded_at = NOW(), geocode_source = 'manual:verified'
+        WHERE property_id = $1
+        RETURNING property_id, latitude, longitude, location_verified`,
+      [req.params.propertyId, lat, lon]);
+    if (!rows[0]) return res.status(404).json({ success: false, error: 'Property not found' });
+    logAction(req.user.id, 'set property location', 'property', req.params.propertyId, { latitude: lat, longitude: lon });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) {
+    console.error('PUT /properties/:propertyId/location', err);
+    res.status(500).json({ success: false, error: 'Failed to save location' });
+  }
+});
+
 // GET /properties/:propertyId/network
 //   The hierarchy in one call: a customer property, the drainage assets
 //   inside it, and the Sentinel(s) watching each asset with their latest
