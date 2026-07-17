@@ -3,7 +3,7 @@ const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { isClient } = require('../utils/scope');
-const { currentRiskByEstate } = require('../utils/riskForecast');
+const { scoreProperties } = require('../utils/riskForecast');
 const router = express.Router();
 
 // Company-wide revenue/MRR and every client's map location — ops only.
@@ -107,7 +107,7 @@ router.get('/map-data', authenticateToken, async (req, res) => {
     // screen (utils/riskForecast.js) — one risk number, three consumers.
     let floodRisk = [];
     try {
-      const estates = await currentRiskByEstate();
+      const estates = await scoreProperties();
       floodRisk = estates
         .filter(e => e.latitude != null && e.longitude != null)
         .map(e => ({

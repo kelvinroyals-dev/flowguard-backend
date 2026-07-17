@@ -21,44 +21,98 @@ const CURRENT_WEIGHT = 0.55;
 const RAIN_WEIGHT = 0.45;
 const RAIN_TO_SCORE = 3;   // mm of forecast rain -> risk-score points, capped at 100
 
-// Current risk per ESTATE (top-level property), rolled up from whichever
-// asset its Sentinels are actually mounted on — mirrors the two-hop
-// sensor -> asset -> parent estate relationship already used in
-// routes/properties.js's /network endpoint and the coverage PUT handler.
-async function currentRiskByEstate() {
+// Score EVERY managed property — not just the ones with Sentinels.
+// The forecast is a "brain" that must be useful before a single device is
+// installed, then sharpen as they come online. So each property gets:
+//   • an ENVIRONMENTAL/HISTORICAL baseline (risk_level, drain health, months
+//     since last cleaning/inspection, historical flood events, open incidents)
+//     that needs no hardware, and
+//   • a LIVE sensor rollup (two-hop sensor -> asset -> estate) blended in when
+//     any Sentinel is reporting.
+// `has_live` flags which properties are actually monitored; `confidence`
+// reflects how much to trust the number; `contributors` explains WHY.
+function envScore(p) {
+  const c = [];
+  let s = 12;
+  const rl = String(p.risk_level || '').toLowerCase();
+  const rlAdd = rl === 'critical' ? 42 : rl === 'high' ? 28 : rl === 'moderate' ? 14 : rl === 'low' ? 4 : 8;
+  s += rlAdd; c.push({ label: `Base risk level: ${rl || 'unrated'}`, delta: rlAdd, dir: 'up' });
+
+  const health = p.health_score != null ? Number(p.health_score) : null;
+  if (health != null) {
+    if (health < 60) { const a = Math.round((60 - health) * 0.4); s += a; c.push({ label: `Low drain health (${health}/100)`, delta: a, dir: 'up' }); }
+    else if (health >= 80) { const a = Math.round((health - 80) * 0.3); s -= a; c.push({ label: `Good drain capacity (${health}/100)`, delta: a, dir: 'down' }); }
+  }
+
+  const clean = p.last_cleaning || p.last_inspection;
+  if (clean) {
+    const days = Math.max(0, Math.floor((Date.now() - new Date(clean).getTime()) / 864e5));
+    if (days > 270) { s += 18; c.push({ label: `Drain cleaned ${Math.round(days / 30)} months ago`, delta: 18, dir: 'up' }); }
+    else if (days > 120) { s += 10; c.push({ label: `Drain cleaned ${Math.round(days / 30)} months ago`, delta: 10, dir: 'up' }); }
+    else if (days < 60) { s -= 10; c.push({ label: 'Recently inspected / cleaned', delta: 10, dir: 'down' }); }
+  } else { s += 8; c.push({ label: 'No maintenance record on file', delta: 8, dir: 'up' }); }
+
+  const floods = parseInt(p.flood_events) || 0;
+  if (floods > 0) { const a = Math.min(20, floods * 7); s += a; c.push({ label: `Historical flooding (${floods} event${floods === 1 ? '' : 's'})`, delta: a, dir: 'up' }); }
+
+  const alerts = parseInt(p.open_alerts) || 0;
+  if (alerts > 0) { const a = Math.min(18, alerts * 8); s += a; c.push({ label: `${alerts} open incident${alerts === 1 ? '' : 's'}`, delta: a, dir: 'up' }); }
+
+  return { score: Math.max(0, Math.min(100, Math.round(s))), contributors: c };
+}
+
+async function scoreProperties() {
   const { rows } = await pool.query(`
-    SELECT est.property_id, COALESCE(est.asset_code, est.property_name) AS name,
-           est.latitude, est.longitude,
-           MAX(r.water_level_percent) AS peak_level,
-           AVG(r.water_level_percent) AS avg_level,
-           COUNT(DISTINCT s.sensor_id) AS sensor_count,
-           MAX(r.time) AS latest_reading
-      FROM sensors s
-      JOIN properties asset ON asset.property_id = s.property_id
-      JOIN properties est   ON est.property_id = COALESCE(asset.parent_property_id, asset.property_id)
+    SELECT p.property_id, COALESCE(p.asset_code, p.property_name) AS name, p.property_name,
+           p.latitude, p.longitude, p.health_score, p.risk_level, p.user_id, p.last_inspected_at,
+           u.full_name AS client_name,
+           live.peak_level, live.avg_level, live.sensor_count, live.latest_reading,
+           (SELECT COUNT(*) FROM alerts a WHERE a.property_id = p.property_id AND a.status = 'active') AS open_alerts,
+           (SELECT COUNT(*) FROM property_events e WHERE e.property_id = p.property_id AND e.event_type = 'flood_incident') AS flood_events,
+           (SELECT MAX(e.occurred_at) FROM property_events e WHERE e.property_id = p.property_id AND e.event_type IN ('silt_clearing','maintenance')) AS last_cleaning,
+           (SELECT MAX(i.completed_at) FROM inspections i WHERE i.property_id = p.property_id AND i.completed_at IS NOT NULL) AS last_inspection
+      FROM properties p
+      LEFT JOIN users u ON u.id = p.user_id
       LEFT JOIN LATERAL (
-        SELECT water_level_percent, time FROM sensor_readings
-         WHERE sensor_id = s.sensor_id AND time > NOW() - INTERVAL '6 hours'
-         ORDER BY time DESC LIMIT 1
-      ) r ON true
-     WHERE s.status = 'active' AND s.property_id IS NOT NULL
-     GROUP BY est.property_id, est.asset_code, est.property_name, est.latitude, est.longitude
-    HAVING COUNT(r.water_level_percent) > 0
-     ORDER BY 1`);
+        SELECT MAX(r.water_level_percent) AS peak_level, AVG(r.water_level_percent) AS avg_level,
+               COUNT(DISTINCT s.sensor_id) AS sensor_count, MAX(r.time) AS latest_reading
+          FROM sensors s
+          JOIN properties asset ON asset.property_id = s.property_id
+          LEFT JOIN LATERAL (
+            SELECT water_level_percent, time FROM sensor_readings
+             WHERE sensor_id = s.sensor_id AND time > NOW() - INTERVAL '6 hours'
+             ORDER BY time DESC LIMIT 1
+          ) r ON true
+         WHERE s.status = 'active' AND s.property_id IS NOT NULL
+           AND COALESCE(asset.parent_property_id, asset.property_id) = p.property_id
+      ) live ON true
+     WHERE (p.asset_class = 'customer_property' OR p.asset_class IS NULL)
+       AND p.parent_property_id IS NULL
+     ORDER BY p.property_name`);
 
   return rows.map(r => {
-    const peak = parseFloat(r.peak_level) || 0;
-    const avg = parseFloat(r.avg_level) || 0;
+    const env = envScore(r);
+    const peak = parseFloat(r.peak_level);
+    const avg = parseFloat(r.avg_level);
     const sensorCount = parseInt(r.sensor_count) || 0;
+    const fresh = r.latest_reading && (Date.now() - new Date(r.latest_reading).getTime()) < 6 * 3600 * 1000;
+    const hasLive = sensorCount > 0 && !isNaN(peak) && fresh;
+    const sensorRisk = hasLive ? Math.round(Math.min(100, peak * 0.7 + avg * 0.3)) : null;
     return {
-      property_id: r.property_id, name: r.name,
+      property_id: r.property_id, name: r.name, client_name: r.client_name,
       latitude: r.latitude, longitude: r.longitude,
-      current_risk: Math.round(Math.min(100, peak * 0.7 + avg * 0.3)),
+      has_live: hasLive,
+      current_risk: hasLive ? sensorRisk : env.score,
+      env_score: env.score,
+      env_contributors: env.contributors,
       sensor_count: sensorCount,
-      latest_reading: r.latest_reading,
-      // proxy for how much to trust this number — more nodes reporting
-      // recently = more coverage, NOT a statistical confidence interval.
-      data_coverage: Math.min(100, sensorCount * 25),
+      data_coverage: hasLive ? Math.min(100, sensorCount * 25) : 0,
+      latest_reading: r.latest_reading || null,
+      open_incidents: parseInt(r.open_alerts) || 0,
+      flood_events: parseInt(r.flood_events) || 0,
+      last_cleaning: r.last_cleaning || null,
+      last_inspection: r.last_inspection || r.last_inspected_at || null,
+      health_score: r.health_score != null ? Number(r.health_score) : null,
     };
   });
 }
@@ -91,41 +145,81 @@ function recommendationFor(predicted, delta) {
   return { text: 'Monitor as usual', level: 'ok' };
 }
 
+// Per-property forecast confidence — how much to trust the number, NOT a
+// statistical interval. Weather + history give a usable baseline (~55–70);
+// live Sentinels and a recent inspection push it higher.
+function confidenceFor(e, hasRain) {
+  const sources = [];
+  let conf = 50;
+  if (hasRain) { conf += 12; sources.push('Weather forecast'); }
+  sources.push('Historical data');
+  if (e.has_live) { conf += 26; sources.push('Live Sentinels'); }
+  const insp = e.last_inspection && (Date.now() - new Date(e.last_inspection).getTime()) < 90 * 864e5;
+  if (insp) { conf += 8; sources.push('Recent inspection'); }
+  if (e.flood_events > 0) conf += 4;
+  conf = Math.max(38, Math.min(97, Math.round(conf)));
+  return { confidence: conf, sources };
+}
+
 // Full forecast for a horizon window (in hours from now).
 async function buildForecast(startHour, endHour) {
-  const [estates, rain] = await Promise.all([
-    currentRiskByEstate(),
+  const [properties, rain] = await Promise.all([
+    scoreProperties(),
     rainfallWindow(startHour, endHour),
   ]);
 
   const cumulativeRain = rain ? rain.reduce((sum, h) => sum + h.mm, 0) : 0;
   const rainScore = Math.min(100, cumulativeRain * RAIN_TO_SCORE);
+  const rainAdd = Math.round(rainScore * RAIN_WEIGHT);
 
-  const forecastEstates = estates.map(e => {
+  const forecastEstates = properties.map(e => {
     const predicted = Math.round(Math.min(100, Math.max(0,
       e.current_risk * CURRENT_WEIGHT + rainScore * RAIN_WEIGHT)));
     const delta = predicted - e.current_risk;
     const rec = recommendationFor(predicted, delta);
-    return { ...e, predicted_risk: predicted, delta, recommendation: rec.text, recommendation_level: rec.level };
+    const { confidence, sources } = confidenceFor(e, !!rain);
+
+    // Explainable "why": rainfall driver + the environmental/historical
+    // contributors, sorted by magnitude, plus a confidence note about live data.
+    const contributors = [];
+    if (rainAdd > 0) contributors.push({ label: `Rainfall forecast (${Math.round(cumulativeRain)}mm)`, delta: rainAdd, dir: 'up' });
+    (e.env_contributors || []).forEach(c => contributors.push(c));
+    contributors.sort((a, b) => (b.delta || 0) - (a.delta || 0));
+    contributors.push(e.has_live
+      ? { label: 'Live Sentinel data', delta: 0, dir: 'down', note: 'raises confidence' }
+      : { label: 'No live Sentinel installed', delta: 0, dir: 'down', note: 'forecast from environment only' });
+
+    return {
+      ...e, predicted_risk: predicted, delta,
+      recommendation: rec.text, recommendation_level: rec.level,
+      confidence, confidence_sources: sources,
+      contributors: contributors.slice(0, 7),
+    };
   }).sort((a, b) => b.predicted_risk - a.predicted_risk);
 
-  // network-wide hourly series for the chart: same rain-driven blend,
-  // applied to the network's average current risk hour by hour.
-  const avgCurrent = estates.length
-    ? estates.reduce((s, e) => s + e.current_risk, 0) / estates.length : 0;
+  // network-wide hourly series for the chart
+  const avgCurrent = properties.length
+    ? properties.reduce((s, e) => s + e.current_risk, 0) / properties.length : 0;
   const series = (rain || []).map(h => {
-    const hourScore = Math.min(100, h.mm * RAIN_TO_SCORE * 4); // single-hour rain hits harder than the cumulative average
+    const hourScore = Math.min(100, h.mm * RAIN_TO_SCORE * 4);
     const risk = Math.round(Math.min(100, Math.max(0, avgCurrent * CURRENT_WEIGHT + hourScore * RAIN_WEIGHT)));
     return { t: h.t, risk, rainfall: h.mm };
   });
 
+  const liveCount = forecastEstates.filter(e => e.has_live).length;
+  const portfolioConfidence = forecastEstates.length
+    ? Math.round(forecastEstates.reduce((s, e) => s + e.confidence, 0) / forecastEstates.length) : (rain ? 60 : 50);
+
   return {
-    method: `Rule-based projection: ${Math.round(CURRENT_WEIGHT * 100)}% current sensor trend + ${Math.round(RAIN_WEIGHT * 100)}% forecast rainfall intensity — not a trained model.`,
+    method: `Rule-based projection: ${Math.round(CURRENT_WEIGHT * 100)}% current risk (live sensors where installed, else environmental/historical baseline) + ${Math.round(RAIN_WEIGHT * 100)}% forecast rainfall — not a trained model.`,
     has_rainfall_data: !!rain,
     cumulative_rain_mm: Math.round(cumulativeRain * 10) / 10,
+    live_count: liveCount,
+    total_count: forecastEstates.length,
+    portfolio_confidence: portfolioConfidence,
     estates: forecastEstates,
     series,
   };
 }
 
-module.exports = { currentRiskByEstate, rainfallWindow, buildForecast, LAGOS };
+module.exports = { scoreProperties, rainfallWindow, buildForecast, LAGOS };
