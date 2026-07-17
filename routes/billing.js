@@ -4,6 +4,8 @@ const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { isClient } = require('../utils/scope');
 const { logAction } = require('../utils/audit');
+const PDFDocument = require('pdfkit');
+const fs = require('fs');
 const router = express.Router();
 
 // GET /billing/summary — company-wide revenue/MRR. Ops only.
@@ -160,6 +162,161 @@ router.get('/invoices/:id', authenticateToken, async (req, res) => {
     }
     res.json({ success: true, data: rows[0] });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to load invoice' }); }
+});
+
+// GET /billing/invoices/:id/pdf — a printable invoice matching the FlowGuard
+// template. Brand colours only: black (structure), green (section labels / paid),
+// red (balance due / overdue). Server-side (pdfkit) so the ₦ glyph renders via
+// an embedded font — a client-side lib can't do that reliably.
+router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT i.*, u.full_name AS client_name, u.email AS client_email,
+             p.property_name, p.address_line1, p.city, p.state,
+             COALESCE(p.asset_code, p.property_id) AS property_ref,
+             (SELECT array_to_json(array_agg(DISTINCT s.sensor_id))
+                FROM sensors s
+               WHERE s.property_id = i.property_id
+                  OR s.property_id IN (SELECT property_id FROM properties WHERE parent_property_id = i.property_id)
+             ) AS sensor_ids
+        FROM invoices i
+        LEFT JOIN users u ON i.user_id = u.id
+        LEFT JOIN properties p ON i.property_id = p.property_id
+       WHERE i.invoice_id = $1`, [req.params.id]);
+    const inv = rows[0];
+    if (!inv) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    if (isClient(req) && inv.user_id !== req.user.id) return res.status(403).json({ success: false, error: 'Not authorised' });
+
+    // ── brand palette ──
+    const BLACK = '#141414', RED = '#d12b2b', GREEN = '#1f9d5b',
+          GREY = '#6b7a82', LGREY = '#9aa7ad', LINE = '#e4e9ec',
+          RED_T = '#fbeceb', GREEN_T = '#eaf6ef';
+
+    const doc = new PDFDocument({ size: 'A4', margin: 45 });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${inv.invoice_id}.pdf"`);
+    doc.pipe(res);
+
+    // Naira-capable font if the OS ships DejaVu (Ubuntu does); else Helvetica + "NGN".
+    let F = { r: 'Helvetica', b: 'Helvetica-Bold' }, NG = 'NGN ';
+    try {
+      const R_ = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+      const B_ = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+      if (fs.existsSync(R_)) {
+        doc.registerFont('body', R_);
+        if (fs.existsSync(B_)) doc.registerFont('bodyB', B_);
+        F = { r: 'body', b: fs.existsSync(B_) ? 'bodyB' : 'body' };
+        NG = '₦';
+      }
+    } catch (_) { /* fall back to Helvetica + NGN */ }
+
+    const money = n => NG + Number(n || 0).toLocaleString('en-US');
+    const fmtDate = ds => ds ? new Date(ds).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
+    const cap = s => s ? String(s).charAt(0).toUpperCase() + String(s).slice(1).replace(/_/g, ' ') : '—';
+    const L = 45, R = 550, W = R - L;
+
+    // ── header ──
+    doc.font(F.b).fontSize(15).fillColor(BLACK).text('FlowGuard Solutions Limited', L, 50);
+    doc.font(F.r).fontSize(9).fillColor(GREY).text('Drainage & flood-prevention infrastructure', L, 70);
+    doc.fontSize(8.5).fillColor(GREY).text('support@flowguard.ng  ·  info@flowguard.ng', L, 84);
+    doc.text('020 1700 3062', L, 96);
+
+    doc.font(F.b).fontSize(20).fillColor(BLACK).text('INVOICE', L, 48, { width: W, align: 'right' });
+    let my = 78;
+    [['Invoice No.', inv.invoice_id], ['Issue date', fmtDate(inv.issue_date || inv.created_at)], ['Due date', fmtDate(inv.due_date)]].forEach(([k, v]) => {
+      doc.font(F.r).fontSize(9).fillColor(GREY).text(k, R - 300, my, { width: 180, align: 'right' });
+      doc.font(F.b).fontSize(9).fillColor(BLACK).text(String(v || '—'), R - 110, my, { width: 110, align: 'right' });
+      my += 15;
+    });
+    // status badge
+    const ps = String(inv.payment_status || 'pending').toLowerCase();
+    const overdue = ps !== 'paid' && inv.due_date && new Date(inv.due_date) < new Date();
+    const badge = ps === 'paid' ? { l: 'PAID', c: GREEN } : overdue ? { l: 'OVERDUE', c: RED } : ps === 'partial' ? { l: 'PARTIALLY PAID', c: BLACK } : { l: 'PENDING', c: BLACK };
+    doc.font(F.b).fontSize(9);
+    const bw = doc.widthOfString(badge.l) + 20;
+    doc.roundedRect(R - bw, my + 2, bw, 18, 4).fill(badge.c);
+    doc.fillColor('#ffffff').font(F.b).fontSize(9).text(badge.l, R - bw, my + 7, { width: bw, align: 'center' });
+
+    // divider (black rule + short green brand accent)
+    const hy = 150;
+    doc.moveTo(L, hy).lineTo(R, hy).lineWidth(1).strokeColor(BLACK).stroke();
+    doc.moveTo(L, hy).lineTo(L + 90, hy).lineWidth(2.5).strokeColor(GREEN).stroke();
+
+    const sectionLabel = (t, x, yy) => doc.font(F.b).fontSize(8.5).fillColor(GREEN).text(t.toUpperCase(), x, yy, { characterSpacing: 0.6 });
+
+    // ── BILL TO ──
+    sectionLabel('Bill to', L, 170);
+    doc.font(F.b).fontSize(11).fillColor(BLACK).text(inv.property_name || '—', L, 186, { width: 245 });
+    const addr = [inv.address_line1, [inv.city, inv.state].filter(Boolean).join(', '), 'Nigeria'].filter(Boolean).join('\n');
+    doc.font(F.r).fontSize(9).fillColor(GREY).text(addr || '—', L, doc.y + 2, { width: 245 });
+    if (!inv.client_name)
+      doc.font(F.r).fontSize(8.5).fillColor(LGREY).text('No billing contact is linked to this property yet — invoice issued against the property record only.', L, doc.y + 5, { width: 245 });
+    else
+      doc.font(F.r).fontSize(9).fillColor(GREY).text(inv.client_name + (inv.client_email ? '  ·  ' + inv.client_email : ''), L, doc.y + 4, { width: 245 });
+
+    // ── INVOICE DETAILS ──
+    sectionLabel('Invoice details', 315, 170);
+    let dy = 188;
+    const sensors = Array.isArray(inv.sensor_ids) ? inv.sensor_ids : [];
+    [['Invoice type', cap(inv.invoice_type)], ['Property ref', inv.property_ref], ['Sentinel coverage', sensors.length ? sensors.join(', ') : 'None']].forEach(([k, v]) => {
+      doc.font(F.r).fontSize(9).fillColor(GREY).text(k, 315, dy, { width: 95 });
+      const h = doc.heightOfString(String(v || '—'), { width: 140 });
+      doc.font(F.b).fontSize(9).fillColor(BLACK).text(String(v || '—'), 412, dy, { width: 138 });
+      dy += Math.max(16, h + 5);
+    });
+
+    // ── line items table ──
+    const items = Array.isArray(inv.line_items) ? inv.line_items : (() => { try { return JSON.parse(inv.line_items || '[]'); } catch { return []; } })();
+    let ty = Math.max(275, dy + 14, doc.y + 14);
+    doc.rect(L, ty, W, 22).fill(BLACK);
+    doc.fillColor('#ffffff').font(F.b).fontSize(8.5);
+    doc.text('DESCRIPTION', L + 8, ty + 7, { width: 250 });
+    doc.text('QTY', 305, ty + 7, { width: 50, align: 'right' });
+    doc.text('UNIT PRICE', 365, ty + 7, { width: 90, align: 'right' });
+    doc.text('AMOUNT', 465, ty + 7, { width: 77, align: 'right' });
+    let ry = ty + 22;
+    (items.length ? items : [{ description: 'No line items', amount: 0 }]).forEach(it => {
+      doc.font(F.r).fontSize(9).fillColor(BLACK);
+      const dh = doc.heightOfString(String(it.description || '—'), { width: 250 });
+      const rh = Math.max(24, dh + 14);
+      doc.text(String(it.description || '—'), L + 8, ry + 7, { width: 250 });
+      doc.fillColor(BLACK).text(it.qty != null ? String(it.qty) : '—', 305, ry + 7, { width: 50, align: 'right' });
+      doc.text(it.unit_price != null ? money(it.unit_price) : '—', 365, ry + 7, { width: 90, align: 'right' });
+      doc.font(F.b).text(money(it.amount), 465, ry + 7, { width: 77, align: 'right' });
+      ry += rh;
+      doc.moveTo(L, ry).lineTo(R, ry).lineWidth(0.5).strokeColor(LINE).stroke();
+    });
+
+    // ── totals ──
+    let tvy = ry + 14;
+    const balance = inv.balance_due != null ? Number(inv.balance_due) : Number(inv.total_amount);
+    const totRow = (label, val, bold) => {
+      doc.font(bold ? F.b : F.r).fontSize(9.5).fillColor(bold ? BLACK : GREY).text(label, 320, tvy, { width: 130, align: 'right' });
+      doc.font(bold ? F.b : F.r).fillColor(BLACK).text(val, 460, tvy, { width: 82, align: 'right' });
+      tvy += 17;
+    };
+    totRow('Subtotal', money(inv.subtotal != null ? inv.subtotal : inv.total_amount));
+    if (Number(inv.vat_amount) > 0 || inv.vat_rate != null) totRow(`VAT (${inv.vat_rate != null ? inv.vat_rate : 7.5}%)`, money(inv.vat_amount || 0));
+    totRow('Total', money(inv.total_amount), true);
+    if (Number(inv.amount_paid) > 0) totRow('Amount paid', money(inv.amount_paid));
+    // balance-due highlight box
+    const bcol = balance > 0 ? RED : GREEN;
+    doc.rect(320, tvy + 2, 222, 26).fill(balance > 0 ? RED_T : GREEN_T);
+    doc.fillColor(bcol).font(F.b).fontSize(10).text('BALANCE DUE', 328, tvy + 10, { width: 120 });
+    doc.text(money(balance), 440, tvy + 10, { width: 96, align: 'right' });
+    tvy += 40;
+
+    // ── footer notes ──
+    let fy = Math.max(tvy + 16, 690);
+    doc.font(F.r).fontSize(8.5).fillColor(GREY).text('Balance due within 30 days of the issue date. For payment queries or to confirm receipt, contact support@flowguard.ng or call 020 1700 3062.', L, fy, { width: W });
+    if (ps === 'partial') doc.text('This invoice reflects a partial payment already received against the total above. A full itemized payment history is available on request.', L, doc.y + 6, { width: W });
+    doc.font(F.r).fontSize(8).fillColor(LGREY).text('FlowGuard Solutions Limited  ·  Lagos, Nigeria  ·  support@flowguard.ng  ·  @theflowguards', L, 805, { width: W, align: 'center' });
+
+    doc.end();
+  } catch (err) {
+    console.error('GET /billing/invoices/:id/pdf', err);
+    if (!res.headersSent) res.status(500).json({ success: false, error: 'Failed to render invoice PDF' });
+  }
 });
 
 // POST /billing/invoices/:id/mark-paid — this waives a real balance; restrict
