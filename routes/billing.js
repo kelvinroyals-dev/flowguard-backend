@@ -67,7 +67,10 @@ router.post('/invoices', authenticateToken, requireRole('admin', 'super_admin', 
 
     const items = Array.isArray(b.line_items) ? b.line_items.filter(l => l && (l.description || l.amount)) : [];
     const subtotal = items.reduce((s, l) => s + (Number(l.amount) || 0), 0);
-    const total = b.total_amount != null ? Number(b.total_amount) : subtotal;
+    // VAT: default 7.5% (Nigeria), overridable per invoice.
+    const vatRate = b.vat_rate != null ? Math.max(0, Number(b.vat_rate)) : 7.5;
+    const vatAmount = Math.round(subtotal * vatRate) / 100;
+    const total = b.total_amount != null ? Number(b.total_amount) : subtotal + vatAmount;
     // Normalise the form's status vocab to the values the rest of the app queries.
     let payStatus = String(b.payment_status || 'pending').toLowerCase();
     if (payStatus === 'unpaid') payStatus = 'pending';
@@ -79,12 +82,12 @@ router.post('/invoices', authenticateToken, requireRole('admin', 'super_admin', 
 
     const { rows } = await pool.query(
       `INSERT INTO invoices
-         (invoice_id, property_id, user_id, invoice_type, subtotal, total_amount, balance_due,
-          amount_paid, payment_status, status, issue_date, due_date, line_items)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         (invoice_id, property_id, user_id, invoice_type, subtotal, vat_rate, vat_amount,
+          total_amount, balance_due, amount_paid, payment_status, status, issue_date, due_date, line_items)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING *`,
       [invoiceId, b.property_id, userId, b.invoice_type || 'maintenance',
-       subtotal, total, balanceDue, total - balanceDue, payStatus, status,
+       subtotal, vatRate, vatAmount, total, balanceDue, total - balanceDue, payStatus, status,
        b.issue_date || new Date().toISOString().slice(0, 10),
        b.due_date || null, JSON.stringify(items)]);
 
@@ -93,6 +96,45 @@ router.post('/invoices', authenticateToken, requireRole('admin', 'super_admin', 
   } catch (err) {
     console.error('POST /billing/invoices', err);
     res.status(500).json({ success: false, error: 'Failed to create invoice' });
+  }
+});
+
+// PUT /billing/invoices/:id — edit an invoice (ops-only). Recomputes VAT and
+// totals from line_items + vat_rate so the stored figures stay consistent.
+router.put('/invoices/:id', authenticateToken, requireRole('admin', 'super_admin', 'finance', 'operations_manager'), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const cur = await pool.query('SELECT * FROM invoices WHERE invoice_id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    const prev = cur.rows[0];
+
+    const items = Array.isArray(b.line_items)
+      ? b.line_items.filter(l => l && (l.description || l.amount))
+      : (Array.isArray(prev.line_items) ? prev.line_items : []);
+    const subtotal = items.reduce((s, l) => s + (Number(l.amount) || 0), 0);
+    const vatRate = b.vat_rate != null ? Math.max(0, Number(b.vat_rate)) : Number(prev.vat_rate ?? 7.5);
+    const vatAmount = Math.round(subtotal * vatRate) / 100;
+    const total = subtotal + vatAmount;
+    let payStatus = String(b.payment_status || prev.payment_status || 'pending').toLowerCase();
+    if (payStatus === 'unpaid') payStatus = 'pending';
+    const status = String(b.status || prev.status || 'open').toLowerCase();
+    const balanceDue = payStatus === 'paid' ? 0 : total;
+
+    const { rows } = await pool.query(
+      `UPDATE invoices SET
+         invoice_type = $2, subtotal = $3, vat_rate = $4, vat_amount = $5,
+         total_amount = $6, balance_due = $7, amount_paid = $8, payment_status = $9,
+         status = $10, issue_date = $11, due_date = $12, line_items = $13, updated_at = NOW()
+       WHERE invoice_id = $1 RETURNING *`,
+      [req.params.id, b.invoice_type || prev.invoice_type, subtotal, vatRate, vatAmount,
+       total, balanceDue, total - balanceDue, payStatus, status,
+       b.issue_date || prev.issue_date, b.due_date || prev.due_date, JSON.stringify(items)]);
+
+    logAction(req.user.id, 'edited an invoice', 'invoice', req.params.id, { total });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) {
+    console.error('PUT /billing/invoices/:id', err);
+    res.status(500).json({ success: false, error: 'Failed to update invoice' });
   }
 });
 
