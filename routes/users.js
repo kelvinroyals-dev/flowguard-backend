@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 const { requireIntParam } = require('../middleware/validate-id');
 const { isClient } = require('../utils/scope');
 const router = express.Router();
@@ -73,7 +74,7 @@ router.get('/:id', authenticateToken, requireIntParam('id'), async (req, res) =>
 // POST /users/invite — admin/super_admin only: this mints a new internal
 // login, so it's the single highest-value privilege-escalation target in
 // the app if left open.
-router.post('/invite', authenticateToken, canManageRoles, async (req, res) => {
+router.post('/invite', authenticateToken, canManageRoles, requirePermission('team-members.manage'), async (req, res) => {
   try {
     const { email, full_name, role } = req.body || {};
     const roleVal = role || req.body.role_id;
@@ -100,7 +101,7 @@ router.post('/invite', authenticateToken, canManageRoles, async (req, res) => {
 // PUT /users/:id — any internal (non-client) account may update a colleague's
 // contact details, but changing role or active-state is a privilege change
 // and is restricted to admin/super_admin.
-router.put('/:id', authenticateToken, requireIntParam('id'), async (req, res) => {
+router.put('/:id', authenticateToken, requireIntParam('id'), requirePermission('team-members.manage'), async (req, res) => {
   try {
     const body = req.body || {};
     const changesPrivilege = ['role', 'role_id', 'status', 'is_active'].some(k => k in body);
@@ -132,7 +133,7 @@ router.put('/:id', authenticateToken, requireIntParam('id'), async (req, res) =>
 });
 
 // DELETE /users/:id — admin/super_admin only.
-router.delete('/:id', authenticateToken, canManageRoles, requireIntParam('id'), async (req, res) => {
+router.delete('/:id', authenticateToken, canManageRoles, requireIntParam('id'), requirePermission('team-members.manage'), async (req, res) => {
   try {
     const { rowCount } = await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
     if (!rowCount) return res.status(404).json({ success: false, error: 'User not found' });

@@ -2,6 +2,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 const { isClient } = require('../utils/scope');
 const router = express.Router();
 
@@ -27,7 +28,7 @@ router.get('/', authenticateToken, async (req, res) => {
 });
 
 // POST /reports/generate  body: { type }
-router.post('/generate', authenticateToken, async (req, res) => {
+router.post('/generate', authenticateToken, requirePermission('reports.manage'), async (req, res) => {
   try {
     const { type } = req.body || {};
     const reportId = 'RPT-' + Date.now() + '-' + Math.floor(Math.random()*900+100);

@@ -4,6 +4,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 const router = express.Router();
 
 // Resolve which client(s) this user owns (client-portal users map to a client)
@@ -463,7 +464,7 @@ router.post('/readings', authenticateDevice, async (req, res) => {
 
 // POST /monitoring/sensors/:sensorId/device-key — issue/rotate a device key (ops only)
 // Returns the plaintext key ONCE; only its hash is stored.
-router.post('/sensors/:sensorId/device-key', authenticateToken, async (req, res) => {
+router.post('/sensors/:sensorId/device-key', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -505,7 +506,7 @@ router.get('/ingest-errors', authenticateToken, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 
 // PUT /monitoring/sensors/:sensorId/coverage  { assets: [{property_id, is_primary}] }
-router.put('/sensors/:sensorId/coverage', authenticateToken, async (req, res) => {
+router.put('/sensors/:sensorId/coverage', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
   const client = await pool.connect();
   try {
     const { isClient } = require('../utils/scope');
@@ -585,7 +586,7 @@ router.get('/sensors/:sensorId/events', authenticateToken, async (req, res) => {
 });
 
 // POST /monitoring/sensors/:sensorId/events  { event_type, detail? }
-router.post('/sensors/:sensorId/events', authenticateToken, async (req, res) => {
+router.post('/sensors/:sensorId/events', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -651,7 +652,7 @@ router.get('/sensors/:sensorId/commands', authenticateToken, async (req, res) =>
 });
 
 // POST /monitoring/sensors/:sensorId/commands  { command_type, payload?, note? }
-router.post('/sensors/:sensorId/commands', authenticateToken, async (req, res) => {
+router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -677,7 +678,7 @@ router.post('/sensors/:sensorId/commands', authenticateToken, async (req, res) =
 });
 
 // POST /monitoring/sensors/commands/bulk  { sensor_ids: [...], command_type, payload?, note? }
-router.post('/sensors/commands/bulk', authenticateToken, async (req, res) => {
+router.post('/sensors/commands/bulk', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -710,7 +711,7 @@ router.post('/sensors/commands/bulk', authenticateToken, async (req, res) => {
 });
 
 // POST /monitoring/sensors/:sensorId/commands/:commandId/cancel — pull back a queued command
-router.post('/sensors/:sensorId/commands/:commandId/cancel', authenticateToken, async (req, res) => {
+router.post('/sensors/:sensorId/commands/:commandId/cancel', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -751,7 +752,7 @@ router.get('/incident-candidates', authenticateToken, async (req, res) => {
 // POST /monitoring/incident-candidates/:id/confirm  { confirmed: true|false, note? }
 //   confirmed → writes a flood_incident property_event (resets days-flood-free)
 //   dismissed → nothing client-facing; a false positive never touches their record
-router.post('/incident-candidates/:id/confirm', authenticateToken, async (req, res) => {
+router.post('/incident-candidates/:id/confirm', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
   const client = await pool.connect();
   try {
     const { isClient } = require('../utils/scope');

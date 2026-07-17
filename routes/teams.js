@@ -2,6 +2,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 const { isClient } = require('../utils/scope');
 const router = express.Router();
 
@@ -53,7 +54,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
 });
 
 // PUT /teams/:id/status
-router.put('/:id/status', authenticateToken, async (req, res) => {
+router.put('/:id/status', authenticateToken, requirePermission('teams.manage'), async (req, res) => {
   try {
     const { status, location } = req.body || {};
     const { rows } = await pool.query(
@@ -69,7 +70,7 @@ router.put('/:id/status', authenticateToken, async (req, res) => {
 });
 
 // POST /teams/:id/members  body: { user_id, team_role }
-router.post('/:id/members', authenticateToken, async (req, res) => {
+router.post('/:id/members', authenticateToken, requirePermission('teams.manage'), async (req, res) => {
   try {
     const { user_id, team_role } = req.body || {};
     if (!user_id) return res.status(400).json({ success: false, error: 'user_id required' });
@@ -85,7 +86,7 @@ router.post('/:id/members', authenticateToken, async (req, res) => {
 });
 
 // DELETE /teams/:id/members/:userId
-router.delete('/:id/members/:userId', authenticateToken, async (req, res) => {
+router.delete('/:id/members/:userId', authenticateToken, requirePermission('teams.manage'), async (req, res) => {
   try {
     await pool.query('DELETE FROM team_members WHERE team_id=$1 AND user_id=$2',
       [req.params.id, req.params.userId]);

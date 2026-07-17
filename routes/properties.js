@@ -2,6 +2,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 const { isClient, clientIdsForUser, propertyIdsForUser } = require('../utils/scope');
 const { logAction } = require('../utils/audit');
 const router = express.Router();
@@ -251,7 +252,7 @@ router.get('/assets', authenticateToken, async (req, res) => {
 });
 
 // POST /properties/assets  (ops only) — register a drainage asset
-router.post('/assets', authenticateToken, async (req, res) => {
+router.post('/assets', authenticateToken, requirePermission('properties.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -304,7 +305,7 @@ router.post('/assets', authenticateToken, async (req, res) => {
 //   Coordinates are the source of truth for the map, dispatch and risk calc, so
 //   this marks the property location_verified (a human placed it) and records
 //   the source. Ops-only; a client can't move their own pin.
-router.put('/:propertyId/location', authenticateToken, async (req, res) => {
+router.put('/:propertyId/location', authenticateToken, requirePermission('properties.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const lat = Number(req.body && req.body.latitude);
@@ -532,7 +533,7 @@ router.get('/:propertyId/tickets', authenticateToken, async (req, res) => {
 // POST /properties/:propertyId/schedule-inspection — ops dispatches a field
 // team; a client submitting their own inspection date is not this endpoint.
 // body: { scheduled_date, team_id, notes, priority }
-router.post('/:propertyId/schedule-inspection', authenticateToken, async (req, res) => {
+router.post('/:propertyId/schedule-inspection', authenticateToken, requirePermission('properties.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const pid = req.params.propertyId;
@@ -593,7 +594,7 @@ router.post('/:propertyId/schedule-inspection', authenticateToken, async (req, r
 // POST /properties/:propertyId/generate-invoice — ops bills the customer;
 // a client account must never be able to create its own invoice.
 // body: { amount, description }
-router.post('/:propertyId/generate-invoice', authenticateToken, async (req, res) => {
+router.post('/:propertyId/generate-invoice', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const pid = req.params.propertyId;
@@ -720,7 +721,7 @@ router.get('/:propertyId/health-history', authenticateToken, async (req, res) =>
 });
 
 // POST /properties/:propertyId/events — ops records a value event (clearing done, incident prevented, etc.)
-router.post('/:propertyId/events', authenticateToken, async (req, res) => {
+router.post('/:propertyId/events', authenticateToken, requirePermission('properties.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success:false, error:'Ops only' });

@@ -2,6 +2,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 const realtime = require('../realtime/io');
 const router = express.Router();
 const { logAction } = require('../utils/audit');
@@ -68,7 +69,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
 // PUT /field-reports/:id  (edit + status change) — ops only: this is the
 // inspection report an ops/field user drafts and approves, not something a
 // client edits.
-router.put('/:id', authenticateToken, async (req, res) => {
+router.put('/:id', authenticateToken, requirePermission('field-reports.manage'), async (req, res) => {
   const { isClient } = require('../utils/scope');
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
@@ -86,7 +87,7 @@ router.put('/:id', authenticateToken, async (req, res) => {
 });
 
 // POST /field-reports/:id/send-to-client — ops only.
-router.post('/:id/send-to-client', authenticateToken, async (req, res) => {
+router.post('/:id/send-to-client', authenticateToken, requirePermission('field-reports.manage'), async (req, res) => {
   const { isClient } = require('../utils/scope');
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {

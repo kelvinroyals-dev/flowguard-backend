@@ -2,6 +2,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 const { isClient } = require('../utils/scope');
 const router = express.Router();
 const { logAction } = require('../utils/audit');
@@ -112,7 +113,7 @@ router.get('/planner', authenticateToken, async (req, res) => {
 
 // POST /tickets/planner — schedule a new maintenance job (ops-only)
 // body: { property_id, work_type, title?, priority?, assigned_team?, scheduled_date, estimated_hours? }
-router.post('/planner', authenticateToken, async (req, res) => {
+router.post('/planner', authenticateToken, requirePermission('maintenance.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const b = req.body || {};
@@ -187,7 +188,7 @@ router.post('/:ticketId/reply', authenticateToken, async (req, res) => {
 // POST /tickets/:ticketId/complete  { resolution_notes?, work_type? }
 //   The field crew closes the job in field.html. THIS is where the client's
 //   outcome record is written — no separate "log an event" chore for ops.
-router.post('/:ticketId/complete', authenticateToken, async (req, res) => {
+router.post('/:ticketId/complete', authenticateToken, requirePermission('maintenance.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   const client = await pool.connect();
   try {
@@ -272,7 +273,7 @@ router.post('/:ticketId/complete', authenticateToken, async (req, res) => {
 // (Scheduled <-> In Progress). Completion has real side-effects (crew
 // release, client outcome record) so it stays on POST /:id/complete —
 // this endpoint deliberately refuses 'resolved'/'closed'.
-router.put('/:ticketId/status', authenticateToken, async (req, res) => {
+router.put('/:ticketId/status', authenticateToken, requirePermission('maintenance.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const VALID = ['scheduled', 'in_progress'];

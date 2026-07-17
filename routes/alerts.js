@@ -2,6 +2,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 const { isClient } = require('../utils/scope');
 const realtime = require('../realtime/io');
 const router = express.Router();
@@ -59,7 +60,7 @@ router.get('/', authenticateToken, async (req, res) => {
 // POST /alerts — create an alert (sensor ingestion / manual) + broadcast.
 // Manual creation is an ops action; sensors report via /monitoring/readings
 // with a device key, not this user-facing endpoint.
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', authenticateToken, requirePermission('alerts.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const b = req.body || {};
@@ -78,7 +79,7 @@ router.post('/', authenticateToken, async (req, res) => {
 });
 
 // PUT /alerts/:id/assign  body: { team_id }
-router.put('/:id/assign', authenticateToken, async (req, res) => {
+router.put('/:id/assign', authenticateToken, requirePermission('alerts.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const { team_id } = req.body || {};
@@ -93,7 +94,7 @@ router.put('/:id/assign', authenticateToken, async (req, res) => {
 });
 
 // PUT /alerts/:id/resolve
-router.put('/:id/resolve', authenticateToken, async (req, res) => {
+router.put('/:id/resolve', authenticateToken, requirePermission('alerts.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const { rows } = await pool.query(
@@ -108,7 +109,7 @@ router.put('/:id/resolve', authenticateToken, async (req, res) => {
 });
 
 // PUT /alerts/:id/reopen — put a resolved alert back into active state.
-router.put('/:id/reopen', authenticateToken, async (req, res) => {
+router.put('/:id/reopen', authenticateToken, requirePermission('alerts.manage'), async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const { rows } = await pool.query(
@@ -132,7 +133,7 @@ router.put('/:id/reopen', authenticateToken, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 
 // POST /alerts/:alertId/dispatch  { team_id, work_type, note? }
-router.post('/:alertId/dispatch', authenticateToken, async (req, res) => {
+router.post('/:alertId/dispatch', authenticateToken, requirePermission('alerts.manage'), async (req, res) => {
   const { isClient } = require('../utils/scope');
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
 
@@ -218,7 +219,7 @@ router.post('/:alertId/dispatch', authenticateToken, async (req, res) => {
 //   outcome: 'prevented'  -> logs incident_prevented (we caught it in time)
 //            'flooded'    -> logs flood_incident (it flooded anyway — resets days-flood-free)
 //            'false_alarm'-> logs nothing
-router.post('/:alertId/resolve', authenticateToken, async (req, res) => {
+router.post('/:alertId/resolve', authenticateToken, requirePermission('alerts.manage'), async (req, res) => {
   const { isClient } = require('../utils/scope');
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
 
