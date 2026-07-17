@@ -59,4 +59,28 @@ router.put('/', authenticateToken, requireRole('admin', 'super_admin'), async (r
   }
 });
 
+// ── Role permissions ──────────────────────────────────────────────
+const perms = require('../utils/permissions');
+
+// GET /settings/permissions — the editable role×permission matrix (admin).
+router.get('/permissions', requireRole('admin', 'super_admin'), async (_req, res) => {
+  try { res.json({ success: true, data: await perms.matrix() }); }
+  catch (err) { console.error('GET /settings/permissions', err); res.status(500).json({ success: false, error: 'Failed to load permissions' }); }
+});
+
+// PUT /settings/permissions — save overrides. body: { changes: [{role, permission_key, allowed}] } (admin).
+router.put('/permissions', requireRole('admin', 'super_admin'), async (req, res) => {
+  try {
+    await perms.saveOverrides((req.body && req.body.changes) || []);
+    res.json({ success: true, data: await perms.matrix() });
+  } catch (err) { console.error('PUT /settings/permissions', err); res.status(500).json({ success: false, error: 'Failed to save permissions' }); }
+});
+
+// GET /settings/permissions/me — the current user's effective permissions
+// (any ops user) so the app can gate what they see and can do.
+router.get('/permissions/me', async (req, res) => {
+  try { res.json({ success: true, data: { role: req.user.role, permissions: await perms.effective(req.user.role) } }); }
+  catch (err) { console.error('GET /settings/permissions/me', err); res.status(500).json({ success: false, error: 'Failed to load permissions' }); }
+});
+
 module.exports = router;

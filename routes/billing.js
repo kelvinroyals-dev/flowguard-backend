@@ -2,6 +2,7 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 const { isClient } = require('../utils/scope');
 const { logAction } = require('../utils/audit');
 const PDFDocument = require('pdfkit');
@@ -59,7 +60,7 @@ router.get('/invoices', authenticateToken, async (req, res) => {
 // POST /billing/invoices — create an invoice (ops-only). Client is derived from
 // the property (invoices carry user_id, resolved via property.user_id), not
 // entered by hand. line_items is a jsonb array of {description, qty, unit_price, amount}.
-router.post('/invoices', authenticateToken, requireRole('admin', 'super_admin', 'finance', 'operations_manager'), async (req, res) => {
+router.post('/invoices', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
   try {
     const b = req.body || {};
     if (!b.property_id) return res.status(400).json({ success: false, error: 'property_id is required' });
@@ -103,7 +104,7 @@ router.post('/invoices', authenticateToken, requireRole('admin', 'super_admin', 
 
 // PUT /billing/invoices/:id — edit an invoice (ops-only). Recomputes VAT and
 // totals from line_items + vat_rate so the stored figures stay consistent.
-router.put('/invoices/:id', authenticateToken, requireRole('admin', 'super_admin', 'finance', 'operations_manager'), async (req, res) => {
+router.put('/invoices/:id', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
   try {
     const b = req.body || {};
     const cur = await pool.query('SELECT * FROM invoices WHERE invoice_id = $1', [req.params.id]);
@@ -341,7 +342,7 @@ router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
 
 // POST /billing/invoices/:id/send — email the invoice (with PDF attached and a
 // "log in to pay" CTA) to the client, and record that it was sent. Ops-only.
-router.post('/invoices/:id/send', authenticateToken, requireRole('admin', 'super_admin', 'finance', 'operations_manager'), async (req, res) => {
+router.post('/invoices/:id/send', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
   try {
     const inv = await fetchInvoiceFull(req.params.id);
     if (!inv) return res.status(404).json({ success: false, error: 'Invoice not found' });
@@ -365,7 +366,7 @@ router.post('/invoices/:id/send', authenticateToken, requireRole('admin', 'super
 
 // POST /billing/invoices/:id/mark-paid — this waives a real balance; restrict
 // to roles that actually handle money.
-router.post('/invoices/:id/mark-paid', authenticateToken, requireRole('admin', 'super_admin', 'finance', 'operations_manager'), async (req, res) => {
+router.post('/invoices/:id/mark-paid', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE invoices SET payment_status='paid', status='paid', paid_date=CURRENT_DATE,
