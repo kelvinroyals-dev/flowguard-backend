@@ -164,47 +164,39 @@ router.get('/invoices/:id', authenticateToken, async (req, res) => {
   } catch (err) { res.status(500).json({ success:false, error:'Failed to load invoice' }); }
 });
 
-// GET /billing/invoices/:id/pdf — a printable invoice matching the FlowGuard
-// template. Brand colours only: black (structure), green (section labels / paid),
-// red (balance due / overdue). Server-side (pdfkit) so the ₦ glyph renders via
-// an embedded font — a client-side lib can't do that reliably.
-router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT i.*, u.full_name AS client_name, u.email AS client_email,
-             p.property_name, p.address_line1, p.city, p.state,
-             COALESCE(p.asset_code, p.property_id) AS property_ref,
-             (SELECT array_to_json(array_agg(DISTINCT s.sensor_id))
-                FROM sensors s
-               WHERE s.property_id = i.property_id
-                  OR s.property_id IN (SELECT property_id FROM properties WHERE parent_property_id = i.property_id)
-             ) AS sensor_ids
-        FROM invoices i
-        LEFT JOIN users u ON i.user_id = u.id
-        LEFT JOIN properties p ON i.property_id = p.property_id
-       WHERE i.invoice_id = $1`, [req.params.id]);
-    const inv = rows[0];
-    if (!inv) return res.status(404).json({ success: false, error: 'Invoice not found' });
-    if (isClient(req) && inv.user_id !== req.user.id) return res.status(403).json({ success: false, error: 'Not authorised' });
+// Full invoice row (with property, client email, sentinel coverage) — shared by
+// the PDF and send flows.
+async function fetchInvoiceFull(id) {
+  const { rows } = await pool.query(`
+    SELECT i.*, u.full_name AS client_name, u.email AS client_email,
+           p.property_name, p.address_line1, p.city, p.state,
+           COALESCE(p.asset_code, p.property_id) AS property_ref,
+           (SELECT array_to_json(array_agg(DISTINCT s.sensor_id))
+              FROM sensors s
+             WHERE s.property_id = i.property_id
+                OR s.property_id IN (SELECT property_id FROM properties WHERE parent_property_id = i.property_id)
+           ) AS sensor_ids
+      FROM invoices i
+      LEFT JOIN users u ON i.user_id = u.id
+      LEFT JOIN properties p ON i.property_id = p.property_id
+     WHERE i.invoice_id = $1`, [id]);
+  return rows[0] || null;
+}
 
-    // ── brand palette ──
+// Render an invoice row to a PDF Buffer. Template layout, brand colours only:
+// black (structure), green (section labels / paid), red (balance due / overdue).
+// Server-side pdfkit so the ₦ glyph renders via an embedded font.
+function renderInvoicePdf(inv) {
+  return new Promise((resolve, reject) => {
     const BLACK = '#141414', RED = '#d12b2b', GREEN = '#1f9d5b',
           GREY = '#6b7a82', LGREY = '#9aa7ad', LINE = '#e4e9ec',
           RED_T = '#fbeceb', GREEN_T = '#eaf6ef';
 
     const doc = new PDFDocument({ size: 'A4', margin: 45 });
-    // Buffer the whole PDF and send with an explicit Content-Length. Piping a
-    // chunked stream gets corrupted by some reverse proxies (nginx + gzip); a
-    // single buffered response with a known length is proxy-safe.
     const chunks = [];
     doc.on('data', c => chunks.push(c));
-    doc.on('end', () => {
-      const pdf = Buffer.concat(chunks);
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Length', pdf.length);
-      res.setHeader('Content-Disposition', `attachment; filename="${inv.invoice_id}.pdf"`);
-      res.end(pdf);
-    });
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
 
     // Naira-capable font if the OS ships DejaVu (Ubuntu does); else Helvetica + "NGN".
     let F = { r: 'Helvetica', b: 'Helvetica-Bold' }, NG = 'NGN ';
@@ -327,9 +319,47 @@ router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
     doc.font(F.r).fontSize(8).fillColor(LGREY).text('FlowGuard Solutions Limited  ·  Lagos, Nigeria  ·  support@flowguard.ng  ·  @theflowguards', L, 805, { width: W, align: 'center' });
 
     doc.end();
+  });
+}
+
+// GET /billing/invoices/:id/pdf — download the invoice PDF.
+router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
+  try {
+    const inv = await fetchInvoiceFull(req.params.id);
+    if (!inv) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    if (isClient(req) && inv.user_id !== req.user.id) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const pdf = await renderInvoicePdf(inv);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Length', pdf.length);
+    res.setHeader('Content-Disposition', `attachment; filename="${inv.invoice_id}.pdf"`);
+    res.end(pdf);
   } catch (err) {
     console.error('GET /billing/invoices/:id/pdf', err);
     if (!res.headersSent) res.status(500).json({ success: false, error: 'Failed to render invoice PDF' });
+  }
+});
+
+// POST /billing/invoices/:id/send — email the invoice (with PDF attached and a
+// "log in to pay" CTA) to the client, and record that it was sent. Ops-only.
+router.post('/invoices/:id/send', authenticateToken, requireRole('admin', 'super_admin', 'finance', 'operations_manager'), async (req, res) => {
+  try {
+    const inv = await fetchInvoiceFull(req.params.id);
+    if (!inv) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    if (!inv.client_email) return res.status(400).json({ success: false, error: 'No client email on file — link a client to this property first.' });
+    const pdf = await renderInvoicePdf(inv).catch(() => null);
+    const emailed = await require('../utils/mailer').sendInvoice(
+      inv.client_email, inv.client_name,
+      { invoiceId: inv.invoice_id, propertyName: inv.property_name, total: inv.total_amount, balanceDue: inv.balance_due, dueDate: inv.due_date, currency: '₦' },
+      pdf);
+    const { rows } = await pool.query(
+      `UPDATE invoices SET sent_at = NOW(), sent_count = COALESCE(sent_count,0)+1,
+         status = CASE WHEN status IN ('draft','open') THEN 'sent' ELSE status END, updated_at = NOW()
+       WHERE invoice_id = $1 RETURNING sent_at, sent_count`, [req.params.id]);
+    logAction(req.user.id, 'sent an invoice to the client', 'invoice', req.params.id, { to: inv.client_email });
+    res.json({ success: true, data: { emailed, to: inv.client_email, sent_at: rows[0].sent_at, sent_count: rows[0].sent_count } });
+  } catch (err) {
+    console.error('POST /billing/invoices/:id/send', err);
+    res.status(500).json({ success: false, error: 'Failed to send invoice' });
   }
 });
 

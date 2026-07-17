@@ -4,13 +4,13 @@
 const API_KEY    = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL = process.env.MAIL_FROM || 'onboarding@resend.dev';
 const FROM_NAME  = process.env.MAIL_FROM_NAME || 'FlowGuard';
-const OPS_EMAIL  = process.env.OPS_EMAIL || 'kelvin@flowguard.ng';
+const OPS_EMAIL  = process.env.OPS_EMAIL || 'info@flowguard.ng';
 const PORTAL_URL = process.env.PORTAL_URL || 'https://app.flowguard.ng';
 
 const ready = !!API_KEY;
 if (!ready) console.warn('[mailer] RESEND_API_KEY not set — emails will be logged, not sent.');
 
-async function sendEmail({ to, subject, html, text, replyTo }) {
+async function sendEmail({ to, subject, html, text, replyTo, attachments }) {
   if (!ready) { console.log(`[mailer] (no key) would send to ${to}: "${subject}"`); return false; }
   try {
     const payload = {
@@ -21,6 +21,13 @@ async function sendEmail({ to, subject, html, text, replyTo }) {
       text: text || html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
     };
     if (replyTo) payload.reply_to = replyTo;
+    // Resend accepts attachments as { filename, content: base64 }.
+    if (Array.isArray(attachments) && attachments.length) {
+      payload.attachments = attachments.map(a => ({
+        filename: a.filename,
+        content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : a.content,
+      }));
+    }
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${API_KEY}`, 'Content-Type': 'application/json' },
@@ -87,7 +94,7 @@ async function sendPasswordChanged(to, name) {
   const body = p(`Hi ${name || 'there'},`)
     + p('This is a confirmation that the password for your FlowGuard account was just changed.')
     + p("If you made this change, no action is needed.")
-    + muted("If you did <strong>not</strong> change your password, your account may be at risk — please reset it immediately and contact us at kelvin@flowguard.ng.");
+    + muted("If you did <strong>not</strong> change your password, your account may be at risk — please reset it immediately and contact us at info@flowguard.ng.");
   return sendEmail({ to, subject: 'Your FlowGuard password was changed', html: shell('Password changed', body) });
 }
 
@@ -104,7 +111,7 @@ async function sendWelcome(to, name) {
        </table>`
     + btn(PORTAL_URL, 'Go to my portal')
     + p("<strong style=\"color:#12222b;\">What's coming:</strong> As your Sentinel devices come online, you'll get real-time flood alerts, automated inspection reports, and SLA-backed dispatch — all from your dashboard.")
-    + muted("Questions or want a walkthrough? Just reply to this email or reach us at kelvin@flowguard.ng — a real person will get back to you.");
+    + muted("Questions or want a walkthrough? Just reply to this email or reach us at info@flowguard.ng — a real person will get back to you.");
   return sendEmail({ to, subject: `Welcome to FlowGuard, ${first} 🌊`, html: shell('Welcome to FlowGuard', body), replyTo: OPS_EMAIL });
 }
 
@@ -171,10 +178,38 @@ async function sendOpsNewProperty(prop, submitter) {
   return sendEmail({ to: OPS_EMAIL, subject: `New property: ${prop.property_name || 'unnamed'}`, html: shell('New property submitted', body) });
 }
 
+// ── 9. Invoice issued to client (with PDF attached + pay CTA) ──
+//   inv: { invoiceId, propertyName, total, balanceDue, dueDate, currency }
+//   pdf: Buffer (optional) — attached as <invoiceId>.pdf
+async function sendInvoice(to, name, inv, pdfBuffer) {
+  const cur = inv.currency || '₦';
+  const money = n => cur + Number(n || 0).toLocaleString('en-US');
+  const payUrl = `${PORTAL_URL}/#billing`;
+  const due = inv.dueDate ? new Date(inv.dueDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : null;
+  const balance = inv.balanceDue != null ? inv.balanceDue : inv.total;
+  const body = p(`Hi ${name || 'there'},`)
+    + p(`Please find your FlowGuard invoice <strong>${inv.invoiceId}</strong>${inv.propertyName ? ` for <strong>${inv.propertyName}</strong>` : ''}${due ? `, due <strong>${due}</strong>` : ''}.`)
+    + `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin:6px 0 4px;border:1px solid #e2e9ed;border-radius:12px;">
+         <tr><td style="padding:12px 16px;font-size:14px;color:#4a626d;">Total</td><td style="padding:12px 16px;font-size:14px;color:#12222b;font-weight:700;text-align:right;">${money(inv.total)}</td></tr>
+         <tr><td style="padding:12px 16px;border-top:1px solid #eef2f4;font-size:14px;color:#4a626d;">Balance due</td><td style="padding:12px 16px;border-top:1px solid #eef2f4;font-size:14px;color:${balance > 0 ? '#d9463c' : '#1f9d5b'};font-weight:700;text-align:right;">${money(balance)}</td></tr>
+       </table>`
+    + btn(payUrl, 'Log in to make payment')
+    + p(`${pdfBuffer ? 'A PDF copy of this invoice is attached. ' : ''}You can also review it and pay securely from your portal.`)
+    + muted('Payment queries? Reply to this email or reach us at info@flowguard.ng.');
+  return sendEmail({
+    to,
+    subject: `Invoice ${inv.invoiceId} from FlowGuard`,
+    html: shell('Your invoice is ready', body),
+    replyTo: OPS_EMAIL,
+    attachments: pdfBuffer ? [{ filename: `${inv.invoiceId}.pdf`, content: pdfBuffer }] : undefined,
+  });
+}
+
 module.exports = {
   sendEmail, shell,
   sendPasswordReset, sendPasswordChanged,
   sendWelcome, sendVerification,
   sendPropertyReceived, sendStatusUpdate,
   sendOpsNewSignup, sendOpsNewProperty,
+  sendInvoice,
 };
