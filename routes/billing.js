@@ -224,11 +224,16 @@ router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
     const cap = s => s ? String(s).charAt(0).toUpperCase() + String(s).slice(1).replace(/_/g, ' ') : '—';
     const L = 45, R = 550, W = R - L;
 
-    // ── header ──
-    doc.font(F.b).fontSize(15).fillColor(BLACK).text('FlowGuard Solutions Limited', L, 50);
-    doc.font(F.r).fontSize(9).fillColor(GREY).text('Drainage & flood-prevention infrastructure', L, 70);
-    doc.fontSize(8.5).fillColor(GREY).text('support@flowguard.ng  ·  info@flowguard.ng', L, 84);
-    doc.text('020 1700 3062', L, 96);
+    // ── header (logo + company block) ──
+    let tx = L;
+    try {
+      const logoPath = require('path').join(__dirname, '..', 'assets', 'fg-logo.png');
+      if (fs.existsSync(logoPath)) { const lh = 40; doc.image(logoPath, L, 46, { height: lh }); tx = L + Math.round(lh * 824 / 609) + 12; }
+    } catch (_) { /* no logo — text-only header */ }
+    doc.font(F.b).fontSize(15).fillColor(BLACK).text('FlowGuard Solutions Limited', tx, 50);
+    doc.font(F.r).fontSize(9).fillColor(GREY).text('Drainage & flood-prevention infrastructure', tx, 70);
+    doc.fontSize(8.5).fillColor(GREY).text('support@flowguard.ng  ·  info@flowguard.ng', tx, 84);
+    doc.text('020 1700 3062', tx, 96);
 
     doc.font(F.b).fontSize(20).fillColor(BLACK).text('INVOICE', L, 48, { width: W, align: 'right' });
     let my = 78;
