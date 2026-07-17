@@ -483,13 +483,24 @@ router.post('/:propertyId/select-services', authenticateToken, async (req, res) 
   try {
     const owner = await assertPropertyAccess(req, res, req.params.propertyId);
     if (!owner) return;
-    const { packages } = req.body || {};
+    // The client portal sends { tier }; older callers may send { packages }.
+    // Resolve either into the stored packages + monthly value so the quote is
+    // never empty (the previous code read `packages` only, dropping the tier).
+    const { tier, packages } = req.body || {};
+    const TIERS = {
+      sentinel:   { monthly: 85000,  packages: ['Sentinel monitoring — sensors + alerts'] },
+      flowguard:  { monthly: 185000, packages: ['Monitoring', 'Bio-enzyme treatment', 'Scheduled clearing'] },
+      flood_zero: { monthly: 320000, packages: ['Full service', 'Priority dispatch', 'SLA guarantee'] },
+    };
+    const t = TIERS[tier] || null;
+    const pkgs = (Array.isArray(packages) && packages.length) ? packages : (t ? t.packages : []);
+    const monthly = t ? t.monthly : null;
     const quoteId = 'QUOTE-' + Date.now() + '-' + Math.floor(Math.random()*900+100);
     await pool.query(`UPDATE service_quotes SET is_latest=false WHERE property_id=$1`, [req.params.propertyId]);
     const { rows } = await pool.query(
-      `INSERT INTO service_quotes (quote_id, property_id, selected_packages, status, is_latest)
-       VALUES ($1,$2,$3,'draft',true) RETURNING *`,
-      [quoteId, req.params.propertyId, JSON.stringify(packages || [])]);
+      `INSERT INTO service_quotes (quote_id, property_id, selected_packages, total_monthly, status, is_latest)
+       VALUES ($1,$2,$3,$4,'draft',true) RETURNING *`,
+      [quoteId, req.params.propertyId, JSON.stringify(pkgs), monthly]);
     res.status(201).json({ success:true, data: rows[0] });
   } catch (err) { console.error('POST select-services', err); res.status(500).json({ success:false, error:'Failed to select services' }); }
 });

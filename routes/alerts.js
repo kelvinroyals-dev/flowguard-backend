@@ -23,8 +23,9 @@ router.get('/', authenticateToken, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT a.alert_id, a.alert_id AS id, a.sensor_id, a.client_id, a.severity,
              a.alert_type, a.alert_type AS type, a.description, a.location,
+             INITCAP(REPLACE(a.alert_type, '_', ' ')) AS title,
              a.status, a.assigned_team_id, a.created_at, a.created_at AS timestamp,
-             a.property_id,
+             a.resolved_at, a.property_id,
              COALESCE(p.property_name, c.name) AS property,
              COALESCE(p.property_name, c.name) AS property_name,
              c.name AS site_name,

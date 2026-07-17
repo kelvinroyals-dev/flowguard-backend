@@ -22,7 +22,9 @@ router.get('/', authenticateToken, async (req, res) => {
     if (isClient(req)) {
       const pids = await propertyIdsForUser(req.user.id);
       if (!pids.length) return res.json({ success: true, data: [] });
-      clientFilter = ` AND ir.property_id = ANY($2)`;
+      // Clients see reports for their own properties AND only once ops has sent
+      // them — drafts/unapproved reports must not leak before the send action.
+      clientFilter = ` AND ir.property_id = ANY($2) AND ir.sent_to_client_at IS NOT NULL`;
       params = [limit, pids];
     }
     const { rows } = await pool.query(`
@@ -57,7 +59,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
     if (!rows[0]) return res.status(404).json({ success:false, error:'Report not found' });
     if (isClient(req)) {
       const pids = await propertyIdsForUser(req.user.id);
-      if (!pids.includes(rows[0].property_id)) {
+      if (!pids.includes(rows[0].property_id) || !rows[0].sent_to_client_at) {
         return res.status(403).json({ success: false, error: 'Not authorised' });
       }
     }

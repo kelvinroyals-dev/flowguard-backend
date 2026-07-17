@@ -141,9 +141,12 @@ const STATUS_COPY = {
   inspection_ongoing:    { t: 'Inspection underway',    m: 'Our field team is currently assessing your property.' },
   report_ready:          { t: 'Your report is ready',   m: 'The assessment report for your property is now available.' },
   quote_sent:            { t: 'Quote sent',             m: 'We\'ve prepared a service quote for your property.' },
+  payment_pending:       { t: 'Payment pending',        m: 'Your service quote is ready — complete payment to activate monitoring for your property.' },
   payment_completed:     { t: 'Payment confirmed',      m: 'Thank you — your payment has been confirmed.' },
   deployment_scheduled:  { t: 'Deployment scheduled',   m: 'Your Sentinel deployment has been scheduled.' },
   active:                { t: 'Monitoring active',      m: 'Your drainage monitoring is now live.' },
+  suspended:             { t: 'Monitoring paused',      m: 'Monitoring for your property has been paused. Please contact us if this is unexpected.' },
+  cancelled:             { t: 'Service cancelled',      m: 'Your FlowGuard service for this property has been cancelled.' },
 };
 async function sendStatusUpdate(to, name, propertyName, status, propertyId) {
   const c = STATUS_COPY[status] || { t: 'Status updated', m: `Your property status is now: ${status}.` };
