@@ -26,6 +26,7 @@ const MODULES = [
   { key: 'teams',         label: 'Teams' },
   { key: 'team-members',  label: 'Team Members' },
   { key: 'field-reports', label: 'Field Reports' },
+  { key: 'support',       label: 'Support' },
   { key: 'forecast',      label: 'AI Forecast' },
   { key: 'audit',         label: 'Audit Log' },
   { key: 'administration',label: 'Administration' },
@@ -40,11 +41,11 @@ const ADMIN_ROLES = ['admin', 'super_admin'];
 const ROLE_DEFAULTS = {
   operations_manager: {
     view: '*',
-    manage: ['network', 'properties', 'clients', 'billing', 'assets', 'devices', 'alerts', 'maintenance', 'teams', 'team-members', 'field-reports', 'forecast', 'reports'],
+    manage: ['network', 'properties', 'clients', 'billing', 'assets', 'devices', 'alerts', 'maintenance', 'teams', 'team-members', 'field-reports', 'support', 'forecast', 'reports'],
   },
   dispatcher: {
-    view: ['situation', 'network', 'properties', 'assets', 'devices', 'alerts', 'maintenance', 'teams', 'field-reports', 'forecast'],
-    manage: ['alerts', 'maintenance'],
+    view: ['situation', 'network', 'properties', 'assets', 'devices', 'alerts', 'maintenance', 'teams', 'field-reports', 'support', 'forecast'],
+    manage: ['alerts', 'maintenance', 'support'],
   },
   field_lead: {
     view: ['situation', 'maintenance', 'field-reports', 'assets', 'alerts'],
@@ -55,8 +56,8 @@ const ROLE_DEFAULTS = {
     manage: ['reports'],
   },
   finance: {
-    view: ['situation', 'clients', 'properties', 'billing', 'reports'],
-    manage: ['billing'],
+    view: ['situation', 'clients', 'properties', 'billing', 'support', 'reports'],
+    manage: ['billing', 'support'],
   },
 };
 

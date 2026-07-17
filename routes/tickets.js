@@ -146,6 +146,44 @@ router.post('/planner', authenticateToken, requirePermission('maintenance.manage
   }
 });
 
+// GET /tickets/support — client-raised support tickets for the ops inbox.
+// These are inquiries (no work_type / crew) — distinct from maintenance jobs,
+// which is why they never showed up in the planner. Ops-only.
+router.get('/support', authenticateToken, requirePermission('support.view'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT t.ticket_id, t.title, t.description, t.category, t.priority, t.status,
+             t.property_id, t.created_at, t.user_id,
+             u.full_name AS client_name, u.email AS client_email,
+             p.property_name,
+             (SELECT COUNT(*) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id) AS message_count,
+             (SELECT MAX(created_at) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id) AS last_message_at
+        FROM tickets t
+        LEFT JOIN users u ON u.id = t.user_id
+        LEFT JOIN properties p ON p.property_id = t.property_id
+       WHERE t.work_type IS NULL AND t.assigned_team IS NULL
+       ORDER BY (t.status NOT IN ('resolved','closed')) DESC,
+                COALESCE((SELECT MAX(created_at) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id), t.created_at) DESC`);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('GET /tickets/support', err);
+    res.status(500).json({ success: false, error: 'Failed to load support tickets' });
+  }
+});
+
+// PUT /tickets/:ticketId/support-status — resolve/reopen a support ticket from
+// the ops Support inbox (gated on support.manage, separate from maintenance).
+router.put('/:ticketId/support-status', authenticateToken, requirePermission('support.manage'), async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  const status = ['resolved', 'in_progress', 'closed'].includes(req.body && req.body.status) ? req.body.status : null;
+  if (!status) return res.status(400).json({ success: false, error: 'Invalid status' });
+  try {
+    const { rows } = await pool.query('UPDATE tickets SET status=$2, updated_at=NOW() WHERE ticket_id=$1 RETURNING ticket_id, status', [req.params.ticketId, status]);
+    if (!rows[0]) return res.status(404).json({ success: false, error: 'Ticket not found' });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) { res.status(500).json({ success: false, error: 'Failed to update ticket' }); }
+});
+
 // GET /tickets/:ticketId
 router.get('/:ticketId', authenticateToken, async (req, res) => {
   try {

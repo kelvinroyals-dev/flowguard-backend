@@ -377,6 +377,32 @@ router.post('/invoices/:id/mark-paid', authenticateToken, requirePermission('bil
   } catch (err) { res.status(500).json({ success:false, error:'Failed to mark paid' }); }
 });
 
+// POST /billing/invoices/:id/notify-payment — a client tells us they've paid.
+// No payment gateway is wired, so rather than (wrongly) letting the client mark
+// their own invoice paid, we raise a billing ticket for finance to reconcile —
+// which surfaces in the ops Support inbox. Clients may only notify on their own.
+router.post('/invoices/:id/notify-payment', authenticateToken, async (req, res) => {
+  try {
+    const inv = (await pool.query(
+      'SELECT invoice_id, user_id, property_id, total_amount, balance_due FROM invoices WHERE invoice_id=$1',
+      [req.params.id])).rows[0];
+    if (!inv) return res.status(404).json({ success: false, error: 'Invoice not found' });
+    if (isClient(req) && inv.user_id !== req.user.id) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const note = String((req.body && req.body.note) || '').slice(0, 1000);
+    const ticketId = 'TKT-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
+    const desc = `Client reports payment for ${inv.invoice_id} (balance ₦${Number(inv.balance_due || 0).toLocaleString()}). Finance to confirm receipt and mark the invoice paid.${note ? ' Client note: ' + note : ''}`;
+    await pool.query(
+      `INSERT INTO tickets (ticket_id, title, description, priority, category, property_id, user_id, status, created_by)
+       VALUES ($1,$2,$3,'high','billing',$4,$5,'new',$6)`,
+      [ticketId, 'Payment notification — ' + inv.invoice_id, desc, inv.property_id, inv.user_id, req.user.email]);
+    logAction(req.user.id, 'notified a payment', 'invoice', inv.invoice_id, { ticket_id: ticketId });
+    res.status(201).json({ success: true, data: { ticket_id: ticketId } });
+  } catch (err) {
+    console.error('POST /billing/invoices/:id/notify-payment', err);
+    res.status(500).json({ success: false, error: 'Failed to send payment notification' });
+  }
+});
+
 // POST /billing/invoices/:id/send-reminder
 router.post('/invoices/:id/send-reminder', authenticateToken, async (req, res) => {
   try {
