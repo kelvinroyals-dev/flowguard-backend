@@ -193,9 +193,18 @@ router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
           RED_T = '#fbeceb', GREEN_T = '#eaf6ef';
 
     const doc = new PDFDocument({ size: 'A4', margin: 45 });
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${inv.invoice_id}.pdf"`);
-    doc.pipe(res);
+    // Buffer the whole PDF and send with an explicit Content-Length. Piping a
+    // chunked stream gets corrupted by some reverse proxies (nginx + gzip); a
+    // single buffered response with a known length is proxy-safe.
+    const chunks = [];
+    doc.on('data', c => chunks.push(c));
+    doc.on('end', () => {
+      const pdf = Buffer.concat(chunks);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Length', pdf.length);
+      res.setHeader('Content-Disposition', `attachment; filename="${inv.invoice_id}.pdf"`);
+      res.end(pdf);
+    });
 
     // Naira-capable font if the OS ships DejaVu (Ubuntu does); else Helvetica + "NGN".
     let F = { r: 'Helvetica', b: 'Helvetica-Bold' }, NG = 'NGN ';
