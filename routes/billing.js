@@ -3,6 +3,7 @@ const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { isClient } = require('../utils/scope');
+const { logAction } = require('../utils/audit');
 const router = express.Router();
 
 // GET /billing/summary — company-wide revenue/MRR. Ops only.
@@ -53,11 +54,61 @@ router.get('/invoices', authenticateToken, async (req, res) => {
   } catch (err) { console.error('GET /billing/invoices', err); res.status(500).json({ success:false, error:'Failed to load invoices' }); }
 });
 
+// POST /billing/invoices — create an invoice (ops-only). Client is derived from
+// the property (invoices carry user_id, resolved via property.user_id), not
+// entered by hand. line_items is a jsonb array of {description, qty, unit_price, amount}.
+router.post('/invoices', authenticateToken, requireRole('admin', 'super_admin', 'finance', 'operations_manager'), async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.property_id) return res.status(400).json({ success: false, error: 'property_id is required' });
+    const pr = await pool.query('SELECT user_id FROM properties WHERE property_id = $1', [b.property_id]);
+    if (!pr.rows[0]) return res.status(404).json({ success: false, error: 'Property not found' });
+    const userId = pr.rows[0].user_id;
+
+    const items = Array.isArray(b.line_items) ? b.line_items.filter(l => l && (l.description || l.amount)) : [];
+    const subtotal = items.reduce((s, l) => s + (Number(l.amount) || 0), 0);
+    const total = b.total_amount != null ? Number(b.total_amount) : subtotal;
+    // Normalise the form's status vocab to the values the rest of the app queries.
+    let payStatus = String(b.payment_status || 'pending').toLowerCase();
+    if (payStatus === 'unpaid') payStatus = 'pending';
+    const status = String(b.status || 'open').toLowerCase();
+    const balanceDue = payStatus === 'paid' ? 0
+      : (b.balance_due != null ? Number(b.balance_due) : total);
+    const invoiceId = 'INV-' + new Date().getFullYear() + '-' +
+      String(Math.floor(1000 + Math.random() * 9000));
+
+    const { rows } = await pool.query(
+      `INSERT INTO invoices
+         (invoice_id, property_id, user_id, invoice_type, subtotal, total_amount, balance_due,
+          amount_paid, payment_status, status, issue_date, due_date, line_items)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      [invoiceId, b.property_id, userId, b.invoice_type || 'maintenance',
+       subtotal, total, balanceDue, total - balanceDue, payStatus, status,
+       b.issue_date || new Date().toISOString().slice(0, 10),
+       b.due_date || null, JSON.stringify(items)]);
+
+    logAction(req.user.id, 'created an invoice', 'invoice', invoiceId, { total, property_id: b.property_id });
+    res.status(201).json({ success: true, data: rows[0] });
+  } catch (err) {
+    console.error('POST /billing/invoices', err);
+    res.status(500).json({ success: false, error: 'Failed to create invoice' });
+  }
+});
+
 // GET /billing/invoices/:id — a client may only fetch their own invoice.
 router.get('/invoices/:id', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT i.*, u.full_name AS client_name, p.property_name
+      SELECT i.*, u.full_name AS client_name, p.property_name, p.client_id AS prop_client_id,
+             (SELECT COUNT(*) FROM tickets t
+                WHERE t.property_id = i.property_id
+                  AND t.status NOT IN ('resolved','closed','cancelled')) AS open_tickets,
+             (SELECT json_build_object(
+                       'quote_id', q.quote_id, 'selected_packages', q.selected_packages,
+                       'is_latest', q.is_latest, 'total_monthly', q.total_monthly)
+                FROM service_quotes q WHERE q.property_id = i.property_id
+                ORDER BY q.is_latest DESC NULLS LAST, q.created_at DESC LIMIT 1) AS quote
       FROM invoices i LEFT JOIN users u ON i.user_id=u.id
       LEFT JOIN properties p ON i.property_id=p.property_id
       WHERE i.invoice_id = $1`, [req.params.id]);
