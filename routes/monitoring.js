@@ -19,12 +19,29 @@ async function clientIdsForUser(userId) {
   return rows.map(r => r.id);
 }
 
+// A client's sensors are the ones INSTALLED ON one of their own properties.
+// Scoping by sensors.client_id alone surfaced devices in the client portal that
+// aren't attached to any of their properties (ops, which scopes by property,
+// correctly showed none) — so a property still at "submitted" appeared to have
+// live nodes. This is the single source of truth for "this client's sensors".
+async function clientSensorIds(userId) {
+  const { propertyIdsForUser } = require('../utils/scope');
+  const pids = await propertyIdsForUser(userId);
+  if (!pids.length) return [];
+  const { rows } = await pool.query(
+    `SELECT s.sensor_id
+       FROM sensors s
+       JOIN properties pp ON pp.property_id = s.property_id
+      WHERE COALESCE(pp.parent_property_id, pp.property_id) = ANY($1)`, [pids]);
+  return rows.map(r => r.sensor_id);
+}
+
 // GET /monitoring/flood-risk  -> { has_data, risk_index, level, sensors_online, sensors_total, peak_level }
 router.get('/flood-risk', authenticateToken, async (req, res) => {
   try {
-    const ids = await clientIdsForUser(req.user.id);
-    if (!ids.length) {
-      return res.json({ success: true, data: { has_data: false, reason: 'no_client', sensors_total: 0 } });
+    const sids = await clientSensorIds(req.user.id);
+    if (!sids.length) {
+      return res.json({ success: true, data: { has_data: false, reason: 'no_sensors', sensors_total: 0, sensors_online: 0 } });
     }
 
     // "online" = active status AND telemetry within the last 6h, not status
@@ -32,7 +49,7 @@ router.get('/flood-risk', authenticateToken, async (req, res) => {
     const sensorCount = await pool.query(
       `SELECT COUNT(*) total,
               COUNT(*) FILTER (WHERE status='active' AND last_ping > NOW() - INTERVAL '6 hours') online
-         FROM sensors WHERE client_id = ANY($1)`, [ids]);
+         FROM sensors WHERE sensor_id = ANY($1)`, [sids]);
     const total = parseInt(sensorCount.rows[0].total) || 0;
     const online = parseInt(sensorCount.rows[0].online) || 0;
 
@@ -40,9 +57,8 @@ router.get('/flood-risk', authenticateToken, async (req, res) => {
     const latest = await pool.query(
       `SELECT DISTINCT ON (r.sensor_id) r.sensor_id, r.water_level_percent, r.time
          FROM sensor_readings r
-         JOIN sensors s ON s.sensor_id = r.sensor_id
-        WHERE s.client_id = ANY($1) AND r.time > NOW() - INTERVAL '6 hours'
-        ORDER BY r.sensor_id, r.time DESC`, [ids]);
+        WHERE r.sensor_id = ANY($1) AND r.time > NOW() - INTERVAL '6 hours'
+        ORDER BY r.sensor_id, r.time DESC`, [sids]);
 
     if (!latest.rows.length) {
       // Sensors may exist but none have reported yet — be honest
@@ -74,8 +90,8 @@ router.get('/flood-risk', authenticateToken, async (req, res) => {
 // GET /monitoring/sensors -> [{ sensor_id, name, zone, status, level, trend[] }]
 router.get('/sensors', authenticateToken, async (req, res) => {
   try {
-    const ids = await clientIdsForUser(req.user.id);
-    if (!ids.length) return res.json({ success: true, data: [] });
+    const sids = await clientSensorIds(req.user.id);
+    if (!sids.length) return res.json({ success: true, data: [] });
 
     const sensors = await pool.query(
       `SELECT s.sensor_id, s.name, s.zone, s.status, s.device_variant,
@@ -85,7 +101,7 @@ router.get('/sensors', authenticateToken, async (req, res) => {
               s.enzyme_installed_date, s.estimated_depletion_date, s.daily_dispense_ml
          FROM sensors s
          LEFT JOIN properties pp ON pp.property_id = s.property_id
-        WHERE s.client_id = ANY($1) ORDER BY s.name`, [ids]);
+        WHERE s.sensor_id = ANY($1) ORDER BY s.name`, [sids]);
 
     // Attach the latest reading + a small trend (last 7 readings) per sensor
     const out = [];
@@ -148,8 +164,8 @@ router.get('/sensors', authenticateToken, async (req, res) => {
 // GET /monitoring/history?hours=24 -> time-series readings for charts + log
 router.get('/history', authenticateToken, async (req, res) => {
   try {
-    const ids = await clientIdsForUser(req.user.id);
-    if (!ids.length) return res.json({ success: true, data: { series: [], log: [] } });
+    const sids = await clientSensorIds(req.user.id);
+    if (!sids.length) return res.json({ success: true, data: { series: [], log: [] } });
     const hours = Math.min(720, Math.max(1, parseInt(req.query.hours) || 24));
 
     // Raw log: recent readings across the client's sensors (newest first)
@@ -158,9 +174,9 @@ router.get('/history', authenticateToken, async (req, res) => {
               r.water_level_percent, r.inflow_rate, r.debris_detected
          FROM sensor_readings r
          JOIN sensors s ON s.sensor_id = r.sensor_id
-        WHERE s.client_id = ANY($1) AND r.time > NOW() - ($2 || ' hours')::interval
+        WHERE r.sensor_id = ANY($1) AND r.time > NOW() - ($2 || ' hours')::interval
         ORDER BY r.time DESC
-        LIMIT 200`, [ids, hours]);
+        LIMIT 200`, [sids, hours]);
 
     // Series: average water level per hour bucket for the trend chart
     const series = await pool.query(
@@ -168,9 +184,8 @@ router.get('/history', authenticateToken, async (req, res) => {
               ROUND(AVG(r.water_level_percent)::numeric, 1) AS avg_level,
               ROUND(MAX(r.water_level_percent)::numeric, 1) AS peak_level
          FROM sensor_readings r
-         JOIN sensors s ON s.sensor_id = r.sensor_id
-        WHERE s.client_id = ANY($1) AND r.time > NOW() - ($2 || ' hours')::interval
-        GROUP BY bucket ORDER BY bucket ASC`, [ids, hours]);
+        WHERE r.sensor_id = ANY($1) AND r.time > NOW() - ($2 || ' hours')::interval
+        GROUP BY bucket ORDER BY bucket ASC`, [sids, hours]);
 
     res.json({ success: true, data: {
       series: series.rows.map(r => ({ t: r.bucket, avg: parseFloat(r.avg_level), peak: parseFloat(r.peak_level) })),
@@ -191,8 +206,8 @@ router.get('/history', authenticateToken, async (req, res) => {
 // GET /monitoring/sensor/:sensorId?hours=24 -> one sensor's detail + history
 router.get('/sensor/:sensorId', authenticateToken, async (req, res) => {
   try {
-    const ids = await clientIdsForUser(req.user.id);
-    if (!ids.length) return res.status(404).json({ success: false, error: 'Not found' });
+    const sids = await clientSensorIds(req.user.id);
+    if (!sids.includes(req.params.sensorId)) return res.status(404).json({ success: false, error: 'Sensor not found' });
     const hours = Math.min(720, Math.max(1, parseInt(req.query.hours) || 24));
 
     const sres = await pool.query(
@@ -200,7 +215,7 @@ router.get('/sensor/:sensorId', authenticateToken, async (req, res) => {
               battery_voltage, signal_strength, last_ping,
               enzyme_level_percent, cartridge_status, enzyme_capacity_ml,
               enzyme_installed_date, estimated_depletion_date, daily_dispense_ml
-         FROM sensors WHERE sensor_id = $1 AND client_id = ANY($2)`, [req.params.sensorId, ids]);
+         FROM sensors WHERE sensor_id = $1`, [req.params.sensorId]);
     if (!sres.rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
     const s = sres.rows[0];
 
