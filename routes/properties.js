@@ -647,7 +647,7 @@ router.put('/:propertyId', authenticateToken, async (req, res) => {
     const { isClient } = require('../utils/scope');
 
     // ownership check
-    const { rows: own } = await pool.query('SELECT user_id FROM properties WHERE property_id=$1', [pid]);
+    const { rows: own } = await pool.query('SELECT user_id, status FROM properties WHERE property_id=$1', [pid]);
     if (!own[0]) return res.status(404).json({ success: false, error: 'Property not found' });
     if (isClient(req) && own[0].user_id !== req.user.id) {
       return res.status(403).json({ success: false, error: 'Not authorised to edit this property' });
@@ -668,6 +668,16 @@ router.put('/:propertyId', authenticateToken, async (req, res) => {
         vals.push(v);
       }
     }
+    // Pipeline status is edited by ops (it isn't in FIELD_MAP, so it was
+    // silently ignored before — the Edit dropdown did nothing). Ops only.
+    const STATUSES = ['submitted', 'inspection_scheduled', 'inspection_ongoing', 'report_ready', 'quote_sent',
+      'payment_pending', 'payment_completed', 'deployment_scheduled', 'active', 'suspended', 'cancelled'];
+    let newStatus = null;
+    if (!isClient(req) && body.status !== undefined && STATUSES.includes(String(body.status))) {
+      newStatus = String(body.status);
+      sets.push(`status=$${vals.length + 1}`); vals.push(newStatus);
+    }
+
     if (!sets.length) return res.status(400).json({ success: false, error: 'No fields to update' });
     // never allow clearing NOT NULL columns
     for (const nn of ['property_name','city','state','address_line1']) {
@@ -678,6 +688,25 @@ router.put('/:propertyId', authenticateToken, async (req, res) => {
     const { rows } = await pool.query(
       `UPDATE properties SET ${sets.join(', ')}, updated_at=NOW() WHERE property_id=$${vals.length} RETURNING *`, vals);
     logAction(req.user.id, 'updated property details', 'property', pid, { property_name: rows[0] && rows[0].property_name });
+
+    // Status changed → tell the client (email + in-app), same as the pipeline
+    // paths. 'submitted' is the initial state, so we don't announce it.
+    if (newStatus && newStatus !== own[0].status && newStatus !== 'submitted') {
+      (async () => {
+        try {
+          const info = await pool.query(
+            `SELECT p.property_name, p.user_id, u.email, u.full_name FROM properties p JOIN users u ON u.id=p.user_id WHERE p.property_id=$1`, [pid]);
+          const r = info.rows[0];
+          if (r) {
+            if (r.email) await require('../utils/mailer').sendStatusUpdate(r.email, r.full_name, r.property_name, newStatus, pid);
+            require('../utils/notify').notify(r.user_id, {
+              type: 'property', title: 'Property status updated',
+              message: `${r.property_name || 'Your property'}: ${newStatus.replace(/_/g, ' ')}.`, link: '#properties',
+            });
+          }
+        } catch (e) { console.error('[property status] notify error:', e.message); }
+      })();
+    }
     res.json({ success: true, data: rows[0] });
   } catch (err) {
     console.error('PUT /properties/:id', err);
