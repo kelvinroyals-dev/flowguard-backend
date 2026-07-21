@@ -657,8 +657,12 @@ router.put('/:propertyId', authenticateToken, async (req, res) => {
     const sets = [];
     const vals = [];
     for (const [camel, snake] of Object.entries(FIELD_MAP)) {
-      if (body[camel] !== undefined) {
-        let v = body[camel] === '' ? null : body[camel];
+      // Accept camelCase (client portal) OR snake_case (ops edit form). The ops
+      // form sends snake_case, which the camel-only check silently ignored —
+      // so editing a property name / urgency from ops saved nothing.
+      const key = body[camel] !== undefined ? camel : (body[snake] !== undefined ? snake : null);
+      if (key !== null) {
+        let v = body[key] === '' ? null : body[key];
         if (snake === 'property_type' && v) {
           const TYPE_VALUES = ['residential_estate','commercial_complex','industrial_park','mixed_use','individual_building'];
           v = v.toString().trim().toLowerCase().replace(/[\s-]+/g, '_');
