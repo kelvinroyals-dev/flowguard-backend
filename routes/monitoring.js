@@ -259,13 +259,20 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
              s.client_id, s.property_id, s.device_variant, s.firmware_version,
              s.capabilities, s.link_type, s.last_calibrated_at, s.calibration_due_at,
              s.enzyme_level_percent, s.cartridge_status,
-             c.name AS client_name,
+             -- The "client" is the customer (a portal user), not the estate
+             -- account. c.name is the estate name (which reads like a property);
+             -- resolve the actual person via the estate manager, and expose the
+             -- estate name separately as account_name.
+             COALESCE(cu.full_name, c.name) AS client_name,
+             cu.id AS client_user_id,
+             c.name AS account_name,
              r.water_level_percent, r.water_level_liters, r.inflow_rate, r.outflow_rate,
              r.temperature, r.debris_detected, r.silt_depth_mm, r.rainfall_mm,
              r.water_quality_ph, r.turbidity_ntu, r.time AS reading_time,
              cov.assets, cmd.pending_commands
         FROM sensors s
         LEFT JOIN clients c ON c.id = s.client_id
+        LEFT JOIN users cu ON LOWER(cu.email) = LOWER(c.estate_manager_email)
         LEFT JOIN LATERAL (
           SELECT water_level_percent, water_level_liters, inflow_rate, outflow_rate,
                  temperature, debris_detected, silt_depth_mm, rainfall_mm,
@@ -305,6 +312,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
       return {
         sensor_id: x.sensor_id, name: x.name, zone: x.zone, status: x.status,
         client_id: x.client_id, client_name: x.client_name,
+        client_user_id: x.client_user_id, account_name: x.account_name,
         // every asset this node monitors (many-to-many), primary first
         assets: x.assets || [],
         primary_asset: (x.assets || []).find(a => a.is_primary) || null,
