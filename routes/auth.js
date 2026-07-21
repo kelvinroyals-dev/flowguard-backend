@@ -159,6 +159,16 @@ router.post('/register', async (req, res) => {
     );
     const user = rows[0];
 
+    // Seed onboarding preferences so demo mode + the guided tour work on ANY
+    // device the new client signs in from (not just the browser they signed up
+    // in). show_demo_data starts on; onboarding_completed flips once they finish
+    // the tour, and the portal turns demo off once they have real properties.
+    try {
+      await client.query(
+        `INSERT INTO user_preferences (user_id, show_demo_data, onboarding_completed)
+         VALUES ($1, true, false) ON CONFLICT (user_id) DO NOTHING`, [user.id]);
+    } catch (_) { /* non-blocking — localStorage still drives same-device onboarding */ }
+
     // create the property the user submitted at signup (previously dropped on the floor)
     if (company && company.trim()) {
       const propertyId = 'PROP-' + Date.now().toString(36).toUpperCase() + '-' + Math.floor(Math.random()*1000);
