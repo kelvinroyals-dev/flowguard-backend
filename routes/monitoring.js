@@ -259,20 +259,24 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
              s.client_id, s.property_id, s.device_variant, s.firmware_version,
              s.capabilities, s.link_type, s.last_calibrated_at, s.calibration_due_at,
              s.enzyme_level_percent, s.cartridge_status,
-             -- The "client" is the customer (a portal user), not the estate
-             -- account. c.name is the estate name (which reads like a property);
-             -- resolve the actual person via the estate manager, and expose the
-             -- estate name separately as account_name.
-             COALESCE(cu.full_name, c.name) AS client_name,
-             cu.id AS client_user_id,
+             -- CANONICAL: a Sentinel attaches to a PROPERTY (via sensors.property_id
+             -- and sentinel_coverage), and the "client" is that property's OWNER
+             -- (a users row) — NOT the clients-account table. sensors.client_id /
+             -- the clients table (c.name = estate name, which reads like a
+             -- property) are only fallbacks. account_name exposes the estate name.
+             COALESCE(owner.full_name, cu.full_name, c.name) AS client_name,
+             COALESCE(owner.id, cu.id) AS client_user_id,
              c.name AS account_name,
              r.water_level_percent, r.water_level_liters, r.inflow_rate, r.outflow_rate,
              r.temperature, r.debris_detected, r.silt_depth_mm, r.rainfall_mm,
              r.water_quality_ph, r.turbidity_ntu, r.time AS reading_time,
              cov.assets, cmd.pending_commands
         FROM sensors s
-        LEFT JOIN clients c ON c.id = s.client_id
-        LEFT JOIN users cu ON LOWER(cu.email) = LOWER(c.estate_manager_email)
+        LEFT JOIN clients c  ON c.id = s.client_id
+        LEFT JOIN users cu   ON LOWER(cu.email) = LOWER(c.estate_manager_email)
+        LEFT JOIN properties sp ON sp.property_id = s.property_id
+        LEFT JOIN properties cp ON cp.property_id = COALESCE(sp.parent_property_id, sp.property_id)
+        LEFT JOIN users owner   ON owner.id = cp.user_id
         LEFT JOIN LATERAL (
           SELECT water_level_percent, water_level_liters, inflow_rate, outflow_rate,
                  temperature, debris_detected, silt_depth_mm, rainfall_mm,
