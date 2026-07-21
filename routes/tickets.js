@@ -215,6 +215,13 @@ router.post('/:ticketId/reply', authenticateToken, async (req, res) => {
       [req.params.ticketId, isClient(req) ? 'client' : 'ops', name, message.trim()]);
     // reopen ticket if it was resolved/closed
     await pool.query(`UPDATE tickets SET status = CASE WHEN status IN ('resolved','closed') THEN 'in_progress' ELSE status END, updated_at = NOW() WHERE ticket_id = $1`, [req.params.ticketId]);
+    // Notify the client when OPS replies (not on the client's own reply).
+    if (!isClient(req) && t.user_id) {
+      require('../utils/notify').notify(t.user_id, {
+        type: 'support', title: 'Support replied to your ticket',
+        message: message.trim().slice(0, 140), link: '#support',
+      });
+    }
     res.json({ success: true, data: rows[0] });
   } catch (err) {
     console.error('POST /tickets/:id/reply', err);

@@ -592,7 +592,12 @@ router.post('/:propertyId/schedule-inspection', authenticateToken, requirePermis
            FROM properties p JOIN users u ON u.id = p.user_id WHERE p.property_id=$1`, [pid]);
         const r = info.rows[0];
         if (r && r.email) await mailer.sendStatusUpdate(r.email, r.full_name, r.property_name, 'inspection_scheduled', pid);
-      } catch (e) { console.error('[schedule-inspection] email error:', e.message); }
+        const owner = await pool.query('SELECT user_id FROM properties WHERE property_id=$1', [pid]);
+        if (owner.rows[0]) require('../utils/notify').notify(owner.rows[0].user_id, {
+          type: 'property', title: 'Inspection scheduled',
+          message: (r && r.property_name ? r.property_name : 'Your property') + ' — our team will assess it shortly.', link: '#properties',
+        });
+      } catch (e) { console.error('[schedule-inspection] notify error:', e.message); }
     })();
 
     res.status(201).json({ success: true, data: inspection });

@@ -357,6 +357,9 @@ router.post('/invoices/:id/send', authenticateToken, requirePermission('billing.
          status = CASE WHEN status IN ('draft','open') THEN 'sent' ELSE status END, updated_at = NOW()
        WHERE invoice_id = $1 RETURNING sent_at, sent_count`, [req.params.id]);
     logAction(req.user.id, 'sent an invoice to the client', 'invoice', req.params.id, { to: inv.client_email });
+    if (inv.user_id) require('../utils/notify').notify(inv.user_id, {
+      type: 'invoice', title: 'New invoice ' + inv.invoice_id, message: 'A new invoice is ready to view and pay.', link: '#billing',
+    });
     res.json({ success: true, data: { emailed, to: inv.client_email, sent_at: rows[0].sent_at, sent_count: rows[0].sent_count } });
   } catch (err) {
     console.error('POST /billing/invoices/:id/send', err);

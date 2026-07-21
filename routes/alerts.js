@@ -103,6 +103,15 @@ router.put('/:id/resolve', authenticateToken, requirePermission('alerts.manage')
        WHERE alert_id=$1 RETURNING *`, [req.params.id]);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'Alert not found' });
     realtime.events.alertResolved(rows[0]);
+    // Notify the affected client that the incident is cleared.
+    if (rows[0].client_id) {
+      const nt = require('../utils/notify');
+      nt.userIdForClient(rows[0].client_id).then(uid => uid && nt.notify(uid, {
+        type: 'alert', title: 'Alert resolved',
+        message: (rows[0].alert_type ? String(rows[0].alert_type).replace(/_/g, ' ') : 'An alert') + ' has been resolved by our team.',
+        link: '#alerts',
+      }));
+    }
     res.json({ success: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to resolve alert' });

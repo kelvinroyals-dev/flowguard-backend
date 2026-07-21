@@ -100,6 +100,11 @@ router.post('/:id/send-to-client', authenticateToken, requirePermission('field-r
     realtime.events.reportSent(rows[0]);
     logAction(req.user.id, 'sent inspection report', 'report', rows[0].report_id, { property_id: rows[0].property_id });
     pool.query(`INSERT INTO property_events (property_id, event_type, description, created_by) VALUES ($1,'report_delivered','Inspection report delivered',$2)`, [rows[0].property_id, req.user.id]).catch(()=>{});
+    // In-app notification for the property owner.
+    pool.query('SELECT user_id FROM properties WHERE property_id=$1', [rows[0].property_id])
+      .then(pr => pr.rows[0] && require('../utils/notify').notify(pr.rows[0].user_id, {
+        type: 'report', title: 'Your inspection report is ready', message: 'Tap to review your assessment report.', link: '#reports',
+      })).catch(() => {});
     res.json({ success: true, data: { sent: true } });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to send report' }); }
 });
