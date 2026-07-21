@@ -9,20 +9,15 @@ async function notify(userId, opts = {}) {
   if (!userId) return;
   const { type = 'info', title, message = null, link = null } = opts;
   if (!title) return;
+  // notifications.notification_id is varchar NOT NULL with no default (verified
+  // via schema-introspect), so we always supply one.
+  const nid = 'NTF-' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
   try {
     await pool.query(
-      `INSERT INTO notifications (user_id, title, message, type, link, is_read, created_at)
-       VALUES ($1,$2,$3,$4,$5,false,NOW())`,
-      [userId, title, message, type, link]);
-  } catch (e1) {
-    // notification_id may be a non-default text PK — retry with a generated id.
-    try {
-      await pool.query(
-        `INSERT INTO notifications (notification_id, user_id, title, message, type, link, is_read, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6,false,NOW())`,
-        ['NTF-' + Date.now() + '-' + Math.floor(Math.random() * 1000), userId, title, message, type, link]);
-    } catch (e2) { console.error('[notify] failed:', e2.message); }
-  }
+      `INSERT INTO notifications (notification_id, user_id, title, message, type, link, is_read, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,false,NOW())`,
+      [nid, userId, title, message, type, link]);
+  } catch (e) { console.error('[notify] failed:', e.message); }
 }
 
 // Resolve a client_id (alerts/properties carry this) to the portal user's id.

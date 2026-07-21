@@ -5,10 +5,9 @@ holds it, how they relate, and what to call them in the UI.** Read this before
 touching any table, field, query, or label. It exists because "client",
 "property", "area", "estate" and "user" were used interchangeably and drifted.
 
-> **How to verify against the live database:** the base schema (CREATE TABLEs)
-> is not in the repo, so this document was derived from the code. To confirm the
-> real columns/foreign keys, run `backend/scripts/schema-introspect.sql` against
-> production and reconcile any differences here.
+> **Verified against production 2026‑07‑21** via `backend/scripts/schema-introspect.sql`
+> (36 tables; FK + CHECK constraints confirmed). Re-run that script and reconcile
+> here whenever the schema changes.
 
 ---
 
@@ -21,7 +20,12 @@ There are **two different "client" things**, and they are separate tables:
 | **Client** (the customer *person*) | `users` where `user_type = 'client'` | The human who signs up and logs into the **client portal**. Has `full_name`, `email`, `phone`. Owns properties. | `users.id` |
 | **Estate account** (the *account*) | `clients` | A commercial/billing account for an estate. Has `name` (the **estate name**, e.g. "Lekki Gardens Phase 2" — which reads like a property), `mrr`, `tier`, `estate_manager_email`. | `clients.id` |
 
-They are linked by `clients.estate_manager_email = users.email`.
+They are linked **two ways** (both exist in the schema):
+- `users.client_id` → `clients.id` (a person belongs to an estate account), and
+- `clients.estate_manager_email` = `users.email` (the account's manager contact).
+
+Counts on prod (2026‑07‑21): 7 client users, 7 internal users, 3 estate accounts,
+7 customer_property + 2 drainage_asset rows.
 
 **Rules:**
 - The word **"Client" in the UI means the customer *person*** (`users`, `user_type='client'`). The ops **Clients module** correctly lists `users`.
@@ -82,12 +86,16 @@ client the same way — do not read `clients.name` and call it "Client".
 
 ## 4. Roles (for `users.user_type = 'internal'`)
 
-`admin`, `super_admin`, `operations_manager`, `dispatcher`, `field_lead`,
-`analyst`, `finance`. Admins bypass all permission checks. Per-role module
-permissions are defined in `backend/utils/permissions.js` (`ROLE_DEFAULTS`) and
-overridable via the `role_permissions` table / Administration → User Management.
+`users.role` CHECK allows: `super_admin`, `operations_manager`, `dispatcher`,
+`field_lead`, `analyst`, `finance`, `admin`, `client`, plus two **legacy** values
+`field_team` and `operations` (avoid; not in the permission model). A customer
+person has `role='client'` **and** `user_type='client'`. Admins bypass all
+permission checks. Per-role module permissions live in
+`backend/utils/permissions.js` (`ROLE_DEFAULTS`) and are overridable via the
+`role_permissions` table / Administration → User Management. (Note: a separate
+`roles` table also exists but the app authorises off `users.role` + `role_permissions`.)
 
-`user_type` values: `'client'` (customer) and `'internal'` (staff).
+`user_type` CHECK values: `'client'` (customer) and `'internal'` (staff).
 
 ---
 
@@ -96,13 +104,22 @@ overridable via the `role_permissions` table / Administration → User Managemen
 | Field | Values |
 |---|---|
 | `properties.asset_class` | `customer_property`, `drainage_asset` |
-| `properties.property_type` | `residential_estate`, `commercial_complex`, `industrial_park`, `mixed_use`, `individual_building` |
+| `properties.property_type` | **Property types:** `residential_estate`, `commercial_complex`, `industrial_park`, `mixed_use`, `individual_building`, `shopping_mall`, `road`, `car_park`, `bridge`. **Drainage-asset types (same column):** `primary_canal`, `secondary_drain`, `box_culvert`, `storm_drain`, `catch_basin`, `manhole`, `retention_pond`, `pump_station`, `flood_gate`, `overflow_chamber`, `detention_tank`, `outfall`. (One `property_type` CHECK spans both — filter by `asset_class`.) |
 | `properties.status` (pipeline) | `submitted`, `inspection_scheduled`, `inspection_ongoing`, `report_ready`, `quote_sent`, `payment_pending`, `payment_completed`, `deployment_scheduled`, `active`, `suspended`, `cancelled` |
-| `invoices.status` | `draft`, `open`, `sent`, `closed`, `paid`, `partial`, `overdue`, `void`, `cancelled` (constraint expanded via migration) |
-| `invoices.payment_status` | `pending`/`unpaid`, `partial`, `paid`, `overdue` |
+| `properties.risk_level` / `urgency_level` | `low`, `moderate`, `high`, `critical` / `low`, `medium`, `high`, `critical` |
+| `invoices.status` | `draft`, `open`, `sent`, `closed`, `paid`, `partial`, `overdue`, `void`, `cancelled` (expanded via migration, **NOT VALID**) |
+| `invoices.payment_status` | `pending`, `partial`, `paid`, `overdue`, `cancelled` |
+| `invoices.invoice_type` | `monthly`, `maintenance`, `installation`, `subscription`, `one_time`, `deployment`, `quarterly`, `annual`, `service`, `adhoc` (**NOT VALID**) |
 | `tickets.status` | `new`, `assigned`, `scheduled`, `in_progress`, `resolved`, `closed`, `cancelled` |
 | `tickets` kind | **support** = `work_type IS NULL`; **maintenance** = has `work_type`/crew/date |
+| `alerts.status` | `active`, `acknowledged`, `dispatched`, `resolved`, `closed` |
+| `alerts.severity` | `critical`, `high`, `moderate`, `minor` |
+| `service_quotes.status` | `draft`, `sent`, `viewed`, `accepted`, `rejected`, `expired` |
+| `inspection_reports.status` | `draft`, `review`, `approved`, `sent_to_client` |
+| `clients.tier` | `premium`, `standard`, `basic` |
+| `sensors.status` | `active`, `offline`, `maintenance` |
 | `sensors.device_variant` | `basic`, `bio_dispenser` |
+| `sensors.link_type` | `cellular`, `lora`, `hybrid` |
 
 ---
 
@@ -121,5 +138,7 @@ overridable via the `role_permissions` table / Administration → User Managemen
 
 - `sensors.client_id`, `alerts.client_id`, `properties.client_id`, `sla_tracking.client_id` all point at the **estate-account** table. Reads that want the *person* must resolve through the property owner (see §3) or `estate_manager_email`.
 - `properties` mixes two concepts (`customer_property` vs `drainage_asset`) in one table via `asset_class`. This is intentional but must be filtered in every query.
+- **A `payments` table EXISTS** (`payments.invoice_id → invoices.id`, `payments.user_id → users.id`) — it is the real payment ledger. The billing UI currently ignores it and the invoice "Payments" section shows an empty state. This is a **real gap**, not a missing table: wire the invoice detail's Payments section to `payments` and derive `payment_status` from summed payments.
 - No file-storage table exists → Photos/Documents/attachments are placeholders everywhere.
 - The client portal's submission wording ("area") predates this doc; standardise on "Property" when next touched.
+- **Fixed 2026‑07‑21:** `notifications.notification_id` is `varchar NOT NULL` with no default; `utils/notify.js` now always generates one (previously every first insert fell into the error fallback and no notification was written).
