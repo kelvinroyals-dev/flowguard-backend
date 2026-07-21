@@ -261,10 +261,16 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
              s.enzyme_level_percent, s.cartridge_status,
              -- CANONICAL: a Sentinel attaches to a PROPERTY (via sensors.property_id
              -- and sentinel_coverage), and the "client" is that property's OWNER
-             -- (a users row) — NOT the clients-account table. sensors.client_id /
-             -- the clients table (c.name = estate name, which reads like a
-             -- property) are only fallbacks. account_name exposes the estate name.
-             COALESCE(owner.full_name, cu.full_name, c.name) AS client_name,
+             -- (a users row) — NOT the clients-account table. The client is ONLY
+             -- ever a person: resolve to the property owner, else the estate
+             -- manager. NEVER fall back to c.name (the estate name reads like a
+             -- property and must only appear under "Estate / account"). If no
+             -- person can be resolved, client_name is NULL and the UI shows "—".
+             -- The Property a Sentinel is installed on (its canonical parent):
+             -- the customer_property resolved from sensors.property_id.
+             cp.property_name AS property_name,
+             cp.property_id   AS property_ref,
+             COALESCE(owner.full_name, cu.full_name) AS client_name,
              COALESCE(owner.id, cu.id) AS client_user_id,
              c.name AS account_name,
              r.water_level_percent, r.water_level_liters, r.inflow_rate, r.outflow_rate,
@@ -317,6 +323,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
         sensor_id: x.sensor_id, name: x.name, zone: x.zone, status: x.status,
         client_id: x.client_id, client_name: x.client_name,
         client_user_id: x.client_user_id, account_name: x.account_name,
+        property_name: x.property_name, property_ref: x.property_ref,
         // every asset this node monitors (many-to-many), primary first
         assets: x.assets || [],
         primary_asset: (x.assets || []).find(a => a.is_primary) || null,

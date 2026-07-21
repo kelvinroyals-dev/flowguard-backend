@@ -125,11 +125,21 @@ permission checks. Per-role module permissions live in
 
 ## 6. UI labelling rules (to keep the two portals consistent)
 
+- **ONE word for the place: "Property."** Never "estate", never "area", never
+  "site" in the UI for a `customer_property`. Both portals use **"Property"**.
+  (The client portal's old "area" wording and the ops "estate" labels were
+  reconciled to "Property" on 2026‑07‑21.)
 - Customer person → **"Client"**. Never show `clients.name` under a "Client" label.
-- `clients` account / `clients.name` → **"Estate / account"**.
-- `customer_property` → **"Property"** (the client portal's "area" = a Property).
+- `clients` account / `clients.name` → **"Estate / account"** — only ever on the
+  Clients/billing surfaces, never on a device, property, or asset row.
+- `customer_property` → **"Property"**.
 - `drainage_asset` → **"Asset"** / **"Drainage asset"**.
-- `sensors` → **"Sentinel"** (device). Its client = the property owner.
+- `sensors` → **"Sentinel"** (device).
+- **A Sentinel attaches to a PROPERTY — show its Property, never a "Client".**
+  The device detail/list/quick-view show a **Property** row (linked to the
+  property), resolved from `sensors.property_id` → `COALESCE(parent_property_id,
+  property_id)`. Do NOT surface a Client/Customer or the estate name on a device;
+  if the customer is needed, click through the Property to its owner.
 - A relationship link to a Client must use a **`users.id`** (e.g. `client_user_id`), never a `clients.id`.
 
 ---
