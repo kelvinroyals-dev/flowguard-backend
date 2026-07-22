@@ -36,9 +36,8 @@ router.get('/', async (req, res) => {
   try {
     const mgr = await isManager(req.user);
     const base = `
-      SELECT i.inspection_id, i.property_id, i.status, i.assigned_team, i.assigned_agent_name,
-             i.scheduled_date, i.due_date, i.findings, i.recommendations,
-             i.drainage_condition_score, i.flood_risk_level, i.created_at, i.updated_at,
+      SELECT i.inspection_id, i.property_id, i.status, i.assigned_team,
+             i.scheduled_date, i.findings, i.recommendations, i.created_at, i.updated_at,
              p.property_name, p.address_line1, p.city, p.state,
              p.contact_person_name, p.contact_phone
         FROM inspections i
