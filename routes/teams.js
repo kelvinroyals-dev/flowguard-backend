@@ -24,10 +24,16 @@ router.use((req, res, next) => {
 });
 
 async function membersFor(teamId) {
+  // Include members recorded either way: in team_members OR via the denormalised
+  // users.team_id. Otherwise a technician assigned before team_members was kept
+  // in sync wouldn't show on the crew — and the field portal (which finds a
+  // technician's team through this list) would report "no team" for them.
   const { rows } = await pool.query(
-    `SELECT u.id, u.full_name, u.email, u.role, tm.role AS team_role
-     FROM team_members tm JOIN users u ON u.id = tm.user_id
-     WHERE tm.team_id = $1`, [teamId]);
+    `SELECT u.id, u.full_name, u.email, u.role,
+            (SELECT tm.role FROM team_members tm WHERE tm.user_id = u.id AND tm.team_id = $1 LIMIT 1) AS team_role
+       FROM users u
+      WHERE u.id IN (SELECT user_id FROM team_members WHERE team_id = $1)
+         OR u.team_id = $1`, [teamId]);
   return rows;
 }
 
