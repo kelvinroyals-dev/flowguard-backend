@@ -84,14 +84,48 @@ router.post('/invite', authenticateToken, canManageRoles, requirePermission('tea
     }
     const exists = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase().trim()]);
     if (exists.rows.length) return res.status(409).json({ success: false, error: 'User already exists' });
-    // crypto.randomBytes, not Math.random — this is a real credential, however temporary.
-    const temp = crypto.randomBytes(9).toString('base64url');
+    // A random placeholder password — the invitee never uses it; they set their
+    // own via the emailed link below. crypto, not Math.random: it's still a real
+    // credential until overwritten.
+    const temp = crypto.randomBytes(18).toString('base64url');
     const hash = await bcrypt.hash(temp, 10);
+    const finalRole = roleVal || 'analyst';
     const { rows } = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, role, user_type, is_active, email_verified)
        VALUES ($1,$2,$3,$4,'internal',true,false) RETURNING id, email, full_name, role`,
-      [email.toLowerCase().trim(), hash, full_name, roleVal || 'analyst']);
-    res.status(201).json({ success: true, data: { ...rows[0], tempPassword: temp } });
+      [email.toLowerCase().trim(), hash, full_name, finalRole]);
+    const newUser = rows[0];
+
+    // ── Role-based invite email ──────────────────────────────────────────
+    // Field technicians (field_lead) live in the Field Operations app; everyone
+    // else in the Operations Center. We mint a set-password link (same mechanism
+    // as password reset) valid for 7 days, so no plaintext credential is emailed.
+    const OPS_HOST = process.env.OPS_PORTAL_URL || 'https://neon.flowguard.ng';
+    const FIELD_ROLES = ['field_lead', 'field_team'];
+    const isField = FIELD_ROLES.includes(finalRole);
+    const portal = isField
+      ? { name: 'FlowGuard Field Operations', loginUrl: `${OPS_HOST}/field.html` }
+      : { name: 'FlowGuard Operations Center', loginUrl: `${OPS_HOST}/login.html` };
+    const roleLabel = String(finalRole).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+    const inviteToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(inviteToken).digest('hex');
+    const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days for invites
+    await pool.query('UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
+      [tokenHash, expires, newUser.id]);
+    const setupUrl = `${OPS_HOST}/reset-password.html?token=${inviteToken}`;
+
+    let emailed = false;
+    try {
+      await require('../utils/mailer').sendStaffInvite(newUser.email, {
+        fullName: newUser.full_name, roleLabel,
+        portalName: portal.name, portalUrl: portal.loginUrl, setupUrl,
+        inviterName: req.user.full_name || req.user.email,
+      });
+      emailed = true;
+    } catch (e) { console.error('[invite] email error:', e.message); }
+
+    res.status(201).json({ success: true, data: { ...newUser, invited: true, emailed } });
   } catch (err) {
     console.error('POST /users/invite', err);
     res.status(500).json({ success: false, error: 'Failed to invite user' });

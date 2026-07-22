@@ -221,11 +221,26 @@ async function sendEmailCode(to, code) {
   return sendEmail({ to, subject: `${code} is your FlowGuard verification code`, html: shell('Verify your email', body) });
 }
 
+// ── Staff invite (role-based) ──────────────────────────────────
+// Sent when an admin adds an internal team member. Portal + login URL are chosen
+// by role: field technicians (field_lead) land in the Field Operations app;
+// everyone else in the Operations Center.
+async function sendStaffInvite(to, { fullName, roleLabel, portalName, portalUrl, setupUrl, inviterName } = {}) {
+  const body = p(`Hi ${fullName || 'there'},`)
+    + p(`${inviterName || 'Your team'} has added you to FlowGuard as <strong>${roleLabel || 'a team member'}</strong>. Your workspace is the <strong>${portalName}</strong>.`)
+    + p('First, set your password:')
+    + btn(setupUrl, 'Set your password')
+    + p('Then sign in to your portal:')
+    + `<p style="margin:0 0 16px;font-size:14px;"><a href="${portalUrl}" style="color:#0891b2;font-weight:600;word-break:break-all;">${portalUrl}</a></p>`
+    + muted('This invite link expires in 7 days. If you weren’t expecting this, you can ignore this email.');
+  return sendEmail({ to, subject: `You’ve been added to ${portalName}`, html: shell(`Welcome to ${portalName}`, body), replyTo: OPS_EMAIL });
+}
+
 module.exports = {
   sendEmail, shell,
   sendPasswordReset, sendPasswordChanged,
   sendWelcome, sendVerification, sendEmailCode,
   sendPropertyReceived, sendStatusUpdate,
   sendOpsNewSignup, sendOpsNewProperty,
-  sendInvoice,
+  sendInvoice, sendStaffInvite,
 };
