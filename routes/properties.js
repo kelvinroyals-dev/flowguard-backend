@@ -454,6 +454,28 @@ router.get('/:propertyId/inspection', authenticateToken, async (req, res) => {
   } catch (err) { console.error('GET inspection', err); res.status(500).json({ success:false, error:'Failed to load inspection' }); }
 });
 
+// GET /properties/:propertyId/assets — the Sentinel nodes installed on this
+// property (or its drainage-asset children). Used by the field portal's on-site
+// sensor panel; previously 404'd (only a static /assets list route existed).
+router.get('/:propertyId/assets', authenticateToken, async (req, res) => {
+  try {
+    const owner = await assertPropertyAccess(req, res, req.params.propertyId);
+    if (!owner) return;
+    const { rows } = await pool.query(
+      `SELECT s.sensor_id, s.name, s.zone, s.status, s.device_variant,
+              s.battery_voltage, s.signal_strength, s.last_ping, s.property_id
+         FROM sensors s
+         JOIN properties sp ON sp.property_id = s.property_id
+        WHERE COALESCE(sp.parent_property_id, sp.property_id) = $1
+        ORDER BY s.name`,
+      [req.params.propertyId]);
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('GET /properties/:propertyId/assets', err);
+    res.status(500).json({ success: false, error: 'Failed to load sensors' });
+  }
+});
+
 // GET /properties/:propertyId/invoices
 router.get('/:propertyId/invoices', authenticateToken, async (req, res) => {
   try {
