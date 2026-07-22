@@ -148,16 +148,23 @@ router.put('/:id', authenticateToken, requireIntParam('id'), requirePermission('
         return res.status(400).json({ success: false, error: `role must be one of: ${INTERNAL_ROLES.join(', ')}` });
       }
     }
-    const map = { full_name:'full_name', role:'role', role_id:'role', status:null, is_active:'is_active', phone:'phone', team_id:'team_id' };
-    const sets = [], vals = []; let i = 1;
+    const map = { full_name:'full_name', role:'role', role_id:'role', is_active:'is_active', phone:'phone', team_id:'team_id' };
+    // Collect column→value in a map so aliases that target the SAME column
+    // (status + is_active, role + role_id) collapse to one SET clause. Sending
+    // both — as the Deactivate button does ({is_active:false, status:'inactive'})
+    // — previously produced "SET is_active=$1, is_active=$2" → a 500.
+    const cols = {};
     for (const [k, v] of Object.entries(body)) {
-      if (k === 'status') { sets.push(`is_active = $${i++}`); vals.push(v === 'active'); continue; }
-      if (map[k]) { sets.push(`${map[k]} = $${i++}`); vals.push(v); }
+      if (k === 'status') { cols.is_active = (v === 'active'); continue; }
+      if (map[k]) cols[map[k]] = v;
     }
-    if (!sets.length) return res.status(400).json({ success: false, error: 'No valid fields' });
+    const entries = Object.entries(cols);
+    if (!entries.length) return res.status(400).json({ success: false, error: 'No valid fields' });
+    const sets = entries.map(([c], idx) => `${c} = $${idx + 1}`);
+    const vals = entries.map(([, v]) => v);
     vals.push(req.params.id);
     const { rows } = await pool.query(
-      `UPDATE users SET ${sets.join(', ')}, updated_at=NOW() WHERE id=$${i} RETURNING id, email, full_name, role`, vals);
+      `UPDATE users SET ${sets.join(', ')}, updated_at=NOW() WHERE id=$${vals.length} RETURNING id, email, full_name, role`, vals);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'User not found' });
     res.json({ success: true, data: rows[0] });
   } catch (err) {
@@ -167,13 +174,37 @@ router.put('/:id', authenticateToken, requireIntParam('id'), requirePermission('
 });
 
 // DELETE /users/:id — admin/super_admin only.
+// A staff account is referenced across the app (reports authored, tickets,
+// inspections, assignments, audit trail). A bare DELETE hit those foreign keys
+// and 500'd. We remove the app-owned dependents that shouldn't block removal,
+// then delete; if history still references the account we surface a clean 409
+// telling the admin to deactivate instead — never a 500.
 router.delete('/:id', authenticateToken, canManageRoles, requireIntParam('id'), requirePermission('team-members.manage'), async (req, res) => {
+  const id = req.params.id;
+  if (String(req.user.id) === String(id)) {
+    return res.status(400).json({ success: false, error: 'You cannot delete your own account' });
+  }
+  const client = await pool.connect();
   try {
-    const { rowCount } = await pool.query('DELETE FROM users WHERE id = $1', [req.params.id]);
-    if (!rowCount) return res.status(404).json({ success: false, error: 'User not found' });
+    await client.query('BEGIN');
+    // dependents the app owns and that carry no historical value
+    await client.query('DELETE FROM team_members   WHERE user_id = $1', [id]);
+    await client.query('DELETE FROM notifications   WHERE user_id = $1', [id]);
+    await client.query('DELETE FROM user_preferences WHERE user_id = $1', [id]);
+    const { rowCount } = await client.query('DELETE FROM users WHERE id = $1', [id]);
+    if (!rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, error: 'User not found' }); }
+    await client.query('COMMIT');
     res.json({ success: true, data: { deleted: true } });
   } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.code === '23503') {   // FK violation — account has historical records
+      return res.status(409).json({ success: false,
+        error: 'This member has linked records (reports, tickets or assignments) and can\'t be deleted. Deactivate them instead.' });
+    }
+    console.error('DELETE /users/:id', err);
     res.status(500).json({ success: false, error: 'Failed to delete user' });
+  } finally {
+    client.release();
   }
 });
 
