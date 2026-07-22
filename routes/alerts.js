@@ -14,7 +14,7 @@ async function canActOnAlert(user, alertRow) {
   if (await hasPermission(user.role, 'alerts.manage')) return true;
   if (!alertRow || !alertRow.assigned_team_id) return false;
   const ids = await teamIdsForUser(user.id);
-  return ids.includes(alertRow.assigned_team_id);
+  return ids.includes(String(alertRow.assigned_team_id));
 }
 
 // GET /alerts

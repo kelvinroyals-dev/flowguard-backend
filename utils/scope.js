@@ -34,10 +34,13 @@ async function teamIdsForUser(userId) {
   // Union both representations: the team_members link table AND the denormalised
   // users.team_id. Members assigned before team_members was kept in sync only
   // have users.team_id, and would otherwise see none of their team's work.
+  // Cast to text on both sides: team_members.team_id and users.team_id may be
+  // declared with different types, which makes a raw UNION throw. Returning text
+  // also lets callers match against string route params consistently.
   const { rows } = await pool.query(
-    `SELECT team_id FROM team_members WHERE user_id = $1
+    `SELECT team_id::text AS team_id FROM team_members WHERE user_id = $1
      UNION
-     SELECT team_id FROM users WHERE id = $1 AND team_id IS NOT NULL`, [userId]);
+     SELECT team_id::text FROM users WHERE id = $1 AND team_id IS NOT NULL`, [userId]);
   return rows.map(r => r.team_id);
 }
 

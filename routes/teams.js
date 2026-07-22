@@ -11,7 +11,7 @@ async function canManageTeam(user, teamId) {
   if (['admin', 'super_admin'].includes(user.role)) return true;
   if (await hasPermission(user.role, 'teams.manage')) return true;
   const ids = await teamIdsForUser(user.id);
-  return ids.includes(teamId);
+  return ids.includes(String(teamId));
 }
 const router = express.Router();
 
@@ -32,8 +32,8 @@ async function membersFor(teamId) {
     `SELECT u.id, u.full_name, u.email, u.role,
             (SELECT tm.role FROM team_members tm WHERE tm.user_id = u.id AND tm.team_id = $1 LIMIT 1) AS team_role
        FROM users u
-      WHERE u.id IN (SELECT user_id FROM team_members WHERE team_id = $1)
-         OR u.team_id = $1`, [teamId]);
+      WHERE u.id IN (SELECT user_id FROM team_members WHERE team_id::text = $1::text)
+         OR u.team_id::text = $1::text`, [teamId]);
   return rows;
 }
 

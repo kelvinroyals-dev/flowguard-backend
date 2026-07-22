@@ -23,7 +23,7 @@ async function callerTeams(userId) {
   const ids = await teamIdsForUser(userId);
   if (!ids.length) return { ids: [], names: [] };
   const { rows } = await pool.query(
-    `SELECT team_id, team_name FROM field_teams WHERE team_id = ANY($1)`, [ids]);
+    `SELECT team_id, team_name FROM field_teams WHERE team_id::text = ANY($1)`, [ids]);
   return { ids, names: rows.map(r => r.team_name).filter(Boolean) };
 }
 
@@ -50,7 +50,7 @@ router.get('/', async (req, res) => {
       const { ids, names } = await callerTeams(req.user.id);
       if (!ids.length) return res.json({ success: true, data: [] });
       ({ rows } = await pool.query(
-        base + ` WHERE i.assigned_team = ANY($1) OR i.assigned_team = ANY($2)
+        base + ` WHERE i.assigned_team::text = ANY($1) OR i.assigned_team::text = ANY($2)
                  ORDER BY i.scheduled_date NULLS LAST, i.created_at DESC`,
         [ids, names]));
     }
@@ -71,7 +71,7 @@ router.put('/:id', async (req, res) => {
 
     if (!(await isManager(req.user))) {
       const { ids, names } = await callerTeams(req.user.id);
-      const at = found[0].assigned_team;
+      const at = found[0].assigned_team != null ? String(found[0].assigned_team) : null;
       const mine = at && (ids.includes(at) || names.includes(at));
       if (!mine) return res.status(403).json({ success: false, error: 'This inspection is not assigned to your team' });
     }
