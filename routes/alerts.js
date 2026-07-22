@@ -2,10 +2,20 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
-const { requirePermission } = require('../utils/permissions');
-const { isClient } = require('../utils/scope');
+const { requirePermission, hasPermission } = require('../utils/permissions');
+const { isClient, teamIdsForUser } = require('../utils/scope');
 const realtime = require('../realtime/io');
 const router = express.Router();
+
+// A field technician may act on an alert ASSIGNED TO THEIR TEAM (resolve it,
+// request backup) without the broad alerts.manage permission.
+async function canActOnAlert(user, alertRow) {
+  if (['admin', 'super_admin'].includes(user.role)) return true;
+  if (await hasPermission(user.role, 'alerts.manage')) return true;
+  if (!alertRow || !alertRow.assigned_team_id) return false;
+  const ids = await teamIdsForUser(user.id);
+  return ids.includes(alertRow.assigned_team_id);
+}
 
 // GET /alerts
 router.get('/', authenticateToken, async (req, res) => {
@@ -95,9 +105,15 @@ router.put('/:id/assign', authenticateToken, requirePermission('alerts.manage'),
 });
 
 // PUT /alerts/:id/resolve
-router.put('/:id/resolve', authenticateToken, requirePermission('alerts.manage'), async (req, res) => {
+router.put('/:id/resolve', authenticateToken, async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
+    const { rows: found } = await pool.query(
+      `SELECT alert_id, assigned_team_id FROM alerts WHERE alert_id=$1`, [req.params.id]);
+    if (!found[0]) return res.status(404).json({ success: false, error: 'Alert not found' });
+    if (!(await canActOnAlert(req.user, found[0]))) {
+      return res.status(403).json({ success: false, error: 'This alert is not assigned to your team' });
+    }
     const { rows } = await pool.query(
       `UPDATE alerts SET status='resolved', resolved_at=NOW()
        WHERE alert_id=$1 RETURNING *`, [req.params.id]);
@@ -115,6 +131,32 @@ router.put('/:id/resolve', authenticateToken, requirePermission('alerts.manage')
     res.json({ success: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to resolve alert' });
+  }
+});
+
+// POST /alerts/:id/backup — a field technician on scene requests backup. Records
+// the request on the alert (so ops see it in context) and broadcasts it live to
+// the operations center. Allowed for the assigned team or alerts.manage.
+router.post('/:id/backup', authenticateToken, async (req, res) => {
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  try {
+    const { rows: found } = await pool.query(
+      `SELECT alert_id, assigned_team_id FROM alerts WHERE alert_id=$1`, [req.params.id]);
+    if (!found[0]) return res.status(404).json({ success: false, error: 'Alert not found' });
+    if (!(await canActOnAlert(req.user, found[0]))) {
+      return res.status(403).json({ success: false, error: 'This alert is not assigned to your team' });
+    }
+    const notes = (req.body && req.body.notes ? String(req.body.notes) : '').slice(0, 500);
+    const who = req.user.email || req.user.id;
+    const stamp = `\n[${new Date().toISOString()}] BACKUP REQUESTED by ${who}${notes ? ': ' + notes : ''}`;
+    const { rows } = await pool.query(
+      `UPDATE alerts SET description = COALESCE(description,'') || $2, updated_at = NOW()
+       WHERE alert_id=$1 RETURNING *`, [req.params.id, stamp]);
+    try { realtime.emit('alert:backup', { alert_id: req.params.id, team_id: found[0].assigned_team_id, notes, by: who }, 'alerts'); } catch (_) {}
+    res.json({ success: true, data: rows[0] });
+  } catch (err) {
+    console.error('POST /alerts/:id/backup', err);
+    res.status(500).json({ success: false, error: 'Failed to send backup request' });
   }
 });
 

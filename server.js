@@ -100,6 +100,7 @@ app.use(`${API_PREFIX}/audit-logs`, require('./routes/audit'));
 app.use(`${API_PREFIX}/reports`, require('./routes/reports'));
 app.use(`${API_PREFIX}/field-reports`, require('./routes/fieldReports'));
 app.use(`${API_PREFIX}/tickets`, require('./routes/tickets'));
+app.use(`${API_PREFIX}/inspections`, require('./routes/inspections'));
 app.use(`${API_PREFIX}/settings`, require('./routes/settings'));
 app.use(`${API_PREFIX}/monitoring`, require('./routes/monitoring'));
 app.use(`${API_PREFIX}/forecast`, require('./routes/forecast'));

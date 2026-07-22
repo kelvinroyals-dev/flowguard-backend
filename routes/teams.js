@@ -2,8 +2,17 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
-const { requirePermission } = require('../utils/permissions');
-const { isClient } = require('../utils/scope');
+const { requirePermission, hasPermission } = require('../utils/permissions');
+const { isClient, teamIdsForUser } = require('../utils/scope');
+
+// A field technician may update the status of THEIR OWN team (en route / on site /
+// returning) without the broad teams.manage permission ops managers hold.
+async function canManageTeam(user, teamId) {
+  if (['admin', 'super_admin'].includes(user.role)) return true;
+  if (await hasPermission(user.role, 'teams.manage')) return true;
+  const ids = await teamIdsForUser(user.id);
+  return ids.includes(teamId);
+}
 const router = express.Router();
 
 // This entire router manages internal field-crew assignment and live
@@ -53,9 +62,12 @@ router.get('/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// PUT /teams/:id/status
-router.put('/:id/status', authenticateToken, requirePermission('teams.manage'), async (req, res) => {
+// PUT /teams/:id/status  — ops managers, or a member of this team (field tech)
+router.put('/:id/status', authenticateToken, async (req, res) => {
   try {
+    if (!(await canManageTeam(req.user, req.params.id))) {
+      return res.status(403).json({ success: false, error: 'Not authorised for this team' });
+    }
     const { status, location } = req.body || {};
     const { rows } = await pool.query(
       `UPDATE field_teams SET status = COALESCE($1,status),

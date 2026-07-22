@@ -25,4 +25,15 @@ async function propertyIdsForUser(userId) {
   return rows.map(r => r.property_id);
 }
 
-module.exports = { isClient, clientIdsForUser, propertyIdsForUser };
+// The field team_id(s) the user is a member of (team_members link). Used to let
+// a field technician act on their OWN team's assignments (status, alert resolve,
+// inspection completion) without granting the broad teams.manage/alerts.manage
+// permission that ops managers hold.
+async function teamIdsForUser(userId) {
+  if (!userId) return [];
+  const { rows } = await pool.query(
+    `SELECT team_id FROM team_members WHERE user_id = $1`, [userId]);
+  return rows.map(r => r.team_id);
+}
+
+module.exports = { isClient, clientIdsForUser, propertyIdsForUser, teamIdsForUser };
