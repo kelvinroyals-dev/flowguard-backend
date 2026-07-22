@@ -208,10 +208,23 @@ async function sendInvoice(to, name, inv, pdfBuffer) {
   });
 }
 
+// ── Email verification code (multi-step signup, before account exists) ──
+async function sendEmailCode(to, code) {
+  const codeHtml = `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:22px 0;"><tr>
+    <td style="background:#f0fdfa;border:1px solid #cdeee9;border-radius:14px;padding:18px 28px;">
+      <div style="font-family:'JetBrains Mono',Menlo,monospace;font-size:34px;font-weight:700;letter-spacing:10px;color:#0d9488;text-align:center;">${code}</div>
+    </td></tr></table>`;
+  const body = p('Use the code below to confirm your email address and continue creating your FlowGuard account.')
+    + codeHtml
+    + p('This code expires in <strong>10 minutes</strong>.')
+    + muted("If you didn't start a FlowGuard signup, you can safely ignore this email.");
+  return sendEmail({ to, subject: `${code} is your FlowGuard verification code`, html: shell('Verify your email', body) });
+}
+
 module.exports = {
   sendEmail, shell,
   sendPasswordReset, sendPasswordChanged,
-  sendWelcome, sendVerification,
+  sendWelcome, sendVerification, sendEmailCode,
   sendPropertyReceived, sendStatusUpdate,
   sendOpsNewSignup, sendOpsNewProperty,
   sendInvoice,

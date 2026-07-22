@@ -29,6 +29,27 @@ function signVerifyToken(user) {
   );
 }
 
+// Email verification by 6-digit code, used by the multi-step signup BEFORE the
+// account exists. Stateless: we email the code and hand the client a 10-minute
+// token carrying only a HASH of the code + the email — the code itself is never
+// stored server-side and never leaves via the token. On success the client gets
+// a separate 30-minute 'email_verified' token that /register trusts to mark the
+// new account verified without the emailed link round-trip.
+function signEmailCodeToken(email, code) {
+  return jwt.sign(
+    { email: email.toLowerCase().trim(), codeHash: hashToken(code), purpose: 'email_code' },
+    process.env.JWT_SECRET,
+    { expiresIn: '10m' }
+  );
+}
+function signEmailVerifiedToken(email) {
+  return jwt.sign(
+    { email: email.toLowerCase().trim(), purpose: 'email_verified' },
+    process.env.JWT_SECRET,
+    { expiresIn: '30m' }
+  );
+}
+
 // Shape the user object the frontend expects (both fullName and full_name)
 function publicUser(u) {
   return {
@@ -120,23 +141,79 @@ router.post('/login', async (req, res) => {
 });
 
 // POST /api/v1/auth/register
-// body: { firstName, lastName, email, phone, company, location, plan, password, marketing }
+// POST /auth/send-email-code  body: { email }  -> emails a 6-digit code, returns { token }
+router.post('/send-email-code', async (req, res) => {
+  try {
+    const email = (req.body.email || '').toLowerCase().trim();
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return res.status(400).json({ success: false, error: 'Enter a valid email address' });
+    }
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existing.rows.length) {
+      return res.status(409).json({ success: false, error: 'An account with this email already exists' });
+    }
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const token = signEmailCodeToken(email, code);
+    // fire-and-forget: still return the token so the flow proceeds even if mail is slow
+    (async () => {
+      try { await require('../utils/mailer').sendEmailCode(email, code); }
+      catch (e) { console.error('[send-email-code] mail error:', e.message); }
+    })();
+    return res.json({ success: true, data: { token } });
+  } catch (err) {
+    console.error('send-email-code error:', err);
+    return res.status(500).json({ success: false, error: 'Could not send verification code' });
+  }
+});
+
+// POST /auth/verify-email-code  body: { token, code }  -> { verifyToken, email }
+router.post('/verify-email-code', async (req, res) => {
+  try {
+    const { token, code } = req.body || {};
+    if (!token || !code) return res.status(400).json({ success: false, error: 'Enter the 6-digit code' });
+    let payload;
+    try { payload = jwt.verify(token, process.env.JWT_SECRET); }
+    catch (_) { return res.status(400).json({ success: false, error: 'Your code expired — request a new one' }); }
+    if (payload.purpose !== 'email_code' || payload.codeHash !== hashToken(String(code).trim())) {
+      return res.status(400).json({ success: false, error: 'That code is incorrect' });
+    }
+    return res.json({ success: true, data: { verifyToken: signEmailVerifiedToken(payload.email), email: payload.email } });
+  } catch (err) {
+    console.error('verify-email-code error:', err);
+    return res.status(500).json({ success: false, error: 'Verification failed' });
+  }
+});
+
+// body: { fullName|firstName+lastName, email, phone, company, jobTitle, password, emailVerifyToken, location?, plan?, marketing? }
 router.post('/register', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { firstName, lastName, email, phone, password, company, location, plan, marketing } = req.body || {};
-    if (!email || !password || !firstName) {
+    const { firstName, lastName, fullName: fullNameIn, email, phone, password,
+            company, jobTitle, location, plan, marketing, emailVerifyToken } = req.body || {};
+    const fullName = (fullNameIn && fullNameIn.trim())
+      || [firstName, lastName].filter(Boolean).join(' ').trim();
+    if (!email || !password || !fullName) {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
     if (password.length < 8) {
       return res.status(400).json({ success: false, error: 'Password must be at least 8 characters' });
     }
     const cleanEmail = email.toLowerCase().trim();
+
+    // If the client verified their email via the 6-digit code, they hand us a
+    // short-lived 'email_verified' token for this exact address — trust it to
+    // mark the account verified and skip the emailed verification link.
+    let emailVerified = false;
+    if (emailVerifyToken) {
+      try {
+        const vp = jwt.verify(emailVerifyToken, process.env.JWT_SECRET);
+        if (vp.purpose === 'email_verified' && vp.email === cleanEmail) emailVerified = true;
+      } catch (_) { /* invalid/expired -> just treat as unverified */ }
+    }
     const existing = await client.query('SELECT id FROM users WHERE email = $1', [cleanEmail]);
     if (existing.rows.length) {
       return res.status(409).json({ success: false, error: 'An account with this email already exists' });
     }
-    const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
     const hash = await bcrypt.hash(password, 10);
 
     // map the signup corridor dropdown to city / state
@@ -152,10 +229,11 @@ router.post('/register', async (req, res) => {
     await client.query('BEGIN');
 
     const { rows } = await client.query(
-      `INSERT INTO users (email, password_hash, role, user_type, full_name, phone, is_active, email_verified)
-       VALUES ($1, $2, 'client', 'client', $3, $4, true, false)
+      `INSERT INTO users (email, password_hash, role, user_type, full_name, phone, company, job_title, is_active, email_verified)
+       VALUES ($1, $2, 'client', 'client', $3, $4, $5, $6, true, $7)
        RETURNING *`,
-      [cleanEmail, hash, fullName, phone || null]
+      [cleanEmail, hash, fullName, phone || null,
+       (company && company.trim()) || null, (jobTitle && jobTitle.trim()) || null, emailVerified]
     );
     const user = rows[0];
 
@@ -169,9 +247,13 @@ router.post('/register', async (req, res) => {
          VALUES ($1, true, false) ON CONFLICT (user_id) DO NOTHING`, [user.id]);
     } catch (_) { /* non-blocking — localStorage still drives same-device onboarding */ }
 
-    // create the property the user submitted at signup (previously dropped on the floor)
-    if (company && company.trim()) {
-      const propertyId = 'PROP-' + Date.now().toString(36).toUpperCase() + '-' + Math.floor(Math.random()*1000);
+    // Create a property only when a location was submitted (the legacy single-page
+    // signup). The multi-step signup collects the ORG here, not a property — the
+    // client adds properties in-app afterwards — so org name must NOT become a
+    // property. `location` is the discriminator between the two flows.
+    let propertyId = null;
+    if (location && company && company.trim()) {
+      propertyId = 'PROP-' + Date.now().toString(36).toUpperCase() + '-' + Math.floor(Math.random()*1000);
       const meta = { corridor: location || null, service_tier_interest: plan || null, marketing_opt_in: !!marketing };
       await client.query(
         `INSERT INTO properties
@@ -196,12 +278,15 @@ router.post('/register', async (req, res) => {
       try {
         const mailer = require('../utils/mailer');
         await mailer.sendWelcome(user.email, user.full_name);
-        // email verification link — purpose-scoped, 24h token (not a full login session)
-        const verifyToken = signVerifyToken(user);
-        const verifyUrl = `https://app.flowguard.ng/verify-email.html?token=${verifyToken}`;
-        await mailer.sendVerification(user.email, verifyUrl);
+        // Only send the verification link if they did NOT already verify via the
+        // in-flow 6-digit code — otherwise it's a confusing second ask.
+        if (!user.email_verified) {
+          const verifyToken = signVerifyToken(user);
+          const verifyUrl = `https://app.flowguard.ng/verify-email.html?token=${verifyToken}`;
+          await mailer.sendVerification(user.email, verifyUrl);
+        }
         await mailer.sendOpsNewSignup(user);
-        if (company && company.trim()) {
+        if (propertyId) {
           await mailer.sendPropertyReceived(user.email, user.full_name, company.trim(), propertyId);
           await mailer.sendOpsNewProperty({ property_name: company.trim(), city: corridor.city, state: corridor.state }, user.full_name);
         }
