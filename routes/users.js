@@ -84,6 +84,12 @@ router.post('/invite', authenticateToken, canManageRoles, requirePermission('tea
     }
     const exists = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase().trim()]);
     if (exists.rows.length) return res.status(409).json({ success: false, error: 'User already exists' });
+    // Team assignment from the create form — was being dropped entirely.
+    const teamId = req.body.team_id ? String(req.body.team_id).trim() : null;
+    if (teamId) {
+      const t = await pool.query('SELECT team_id FROM field_teams WHERE team_id = $1', [teamId]);
+      if (!t.rows.length) return res.status(400).json({ success: false, error: 'Selected team not found' });
+    }
     // A random placeholder password — the invitee never uses it; they set their
     // own via the emailed link below. crypto, not Math.random: it's still a real
     // credential until overwritten.
@@ -95,6 +101,17 @@ router.post('/invite', authenticateToken, canManageRoles, requirePermission('tea
        VALUES ($1,$2,$3,$4,'internal',true,false) RETURNING id, email, full_name, role`,
       [email.toLowerCase().trim(), hash, full_name, finalRole]);
     const newUser = rows[0];
+
+    // Persist the team assignment in BOTH places it's read from: users.team_id
+    // (ops directory) and the team_members link table (what the field portal
+    // uses to know which crew a technician belongs to).
+    if (teamId) {
+      await pool.query('UPDATE users SET team_id = $1 WHERE id = $2', [teamId, newUser.id]);
+      await pool.query(
+        `INSERT INTO team_members (team_id, user_id, role) VALUES ($1,$2,$3)
+         ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+        [teamId, newUser.id, finalRole === 'field_lead' ? 'lead' : 'member']);
+    }
 
     // ── Role-based invite email ──────────────────────────────────────────
     // Field technicians (field_lead) live in the Field Operations app; everyone
@@ -148,6 +165,10 @@ router.put('/:id', authenticateToken, requireIntParam('id'), requirePermission('
         return res.status(400).json({ success: false, error: `role must be one of: ${INTERNAL_ROLES.join(', ')}` });
       }
     }
+    if ('team_id' in body && body.team_id) {
+      const t = await pool.query('SELECT team_id FROM field_teams WHERE team_id = $1', [String(body.team_id).trim()]);
+      if (!t.rows.length) return res.status(400).json({ success: false, error: 'Selected team not found' });
+    }
     const map = { full_name:'full_name', role:'role', role_id:'role', is_active:'is_active', phone:'phone', team_id:'team_id' };
     // Collect column→value in a map so aliases that target the SAME column
     // (status + is_active, role + role_id) collapse to one SET clause. Sending
@@ -166,6 +187,19 @@ router.put('/:id', authenticateToken, requireIntParam('id'), requirePermission('
     const { rows } = await pool.query(
       `UPDATE users SET ${sets.join(', ')}, updated_at=NOW() WHERE id=$${vals.length} RETURNING id, email, full_name, role`, vals);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'User not found' });
+
+    // Keep the team_members link table in step with users.team_id so the field
+    // portal (which reads team_members) sees reassignments. One team per user.
+    if ('team_id' in body) {
+      const tid = body.team_id ? String(body.team_id).trim() : null;
+      await pool.query('DELETE FROM team_members WHERE user_id = $1', [req.params.id]);
+      if (tid) {
+        await pool.query(
+          `INSERT INTO team_members (team_id, user_id, role) VALUES ($1,$2,$3)
+           ON CONFLICT (team_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+          [tid, req.params.id, rows[0].role === 'field_lead' ? 'lead' : 'member']);
+      }
+    }
     res.json({ success: true, data: rows[0] });
   } catch (err) {
     console.error('PUT /users/:id', err);
