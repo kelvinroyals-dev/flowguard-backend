@@ -245,11 +245,24 @@ async function sendReportNote(to, name, reportTitle, note) {
   return sendEmail({ to, subject: `Notes added to your report${reportTitle ? ` — ${reportTitle}` : ''}`, html: shell('Notes on your report', body), replyTo: OPS_EMAIL });
 }
 
+// ── Client teammate invite (client portal) ───────────────────
+async function sendClientInvite(to, { fullName, roleLabel, orgName, setupUrl, inviterName } = {}) {
+  const portalUrl = 'https://app.flowguard.ng';
+  const body = p(`Hi ${fullName || 'there'},`)
+    + p(`${inviterName || 'An account admin'} has invited you to join <strong>${orgName || 'their FlowGuard account'}</strong> as <strong>${roleLabel || 'a member'}</strong>.`)
+    + p('Set your password to activate your access:')
+    + btn(setupUrl, 'Set your password')
+    + p('Then sign in here:')
+    + `<p style="margin:0 0 16px;font-size:14px;"><a href="${portalUrl}" style="color:#0891b2;font-weight:600;word-break:break-all;">${portalUrl}</a></p>`
+    + muted('This invite link expires in 7 days. If you weren’t expecting this, you can ignore this email.');
+  return sendEmail({ to, subject: `You’ve been invited to ${orgName || 'FlowGuard'}`, html: shell('Join your team on FlowGuard', body), replyTo: OPS_EMAIL });
+}
+
 module.exports = {
   sendEmail, shell,
   sendPasswordReset, sendPasswordChanged,
   sendWelcome, sendVerification, sendEmailCode,
   sendPropertyReceived, sendStatusUpdate,
   sendOpsNewSignup, sendOpsNewProperty,
-  sendInvoice, sendStaffInvite, sendReportNote,
+  sendInvoice, sendStaffInvite, sendReportNote, sendClientInvite,
 };

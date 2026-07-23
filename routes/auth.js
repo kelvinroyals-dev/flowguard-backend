@@ -51,6 +51,7 @@ function signEmailVerifiedToken(email) {
 }
 
 // Shape the user object the frontend expects (both fullName and full_name)
+const { clientRoleInfo } = require('../utils/clientPermissions');
 function publicUser(u) {
   return {
     id: u.id,
@@ -61,6 +62,8 @@ function publicUser(u) {
     full_name: u.full_name,
     phone: u.phone,
     client_id: u.client_id,
+    account_owner_id: u.account_owner_id,
+    ...clientRoleInfo(u),   // client_role, client_role_label, is_account_owner, permissions
   };
 }
 

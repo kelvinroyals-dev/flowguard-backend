@@ -3,11 +3,14 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { clientRoleInfo } = require('../utils/clientPermissions');
 const router = express.Router();
 
 function publicUser(u) {
   return { id:u.id, email:u.email, role:u.role, user_type:u.user_type,
-           fullName:u.full_name, full_name:u.full_name, phone:u.phone, client_id:u.client_id };
+           fullName:u.full_name, full_name:u.full_name, phone:u.phone, client_id:u.client_id,
+           account_owner_id:u.account_owner_id,
+           ...clientRoleInfo(u) };   // client_role, client_role_label, is_account_owner, permissions
 }
 
 // GET /profile
