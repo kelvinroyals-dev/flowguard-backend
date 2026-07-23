@@ -63,6 +63,11 @@ router.post('/', authenticateToken, async (req, res) => {
       [ticketId, b.subject, b.description, b.priority || 'normal', b.category || null,
        b.property_id || null, req.user.id, req.user.email]);
     logAction(req.user.id, 'opened a support ticket', 'ticket', rows[0] && rows[0].ticket_id, { subject: rows[0] && rows[0].title });
+    // A client raising a ticket lands in the ops notification center.
+    if (isClient(req)) {
+      const { notifyInternal } = require('../utils/notify');
+      notifyInternal({ type: 'support', title: 'New support ticket', message: (b.subject || 'A client opened a ticket'), link: '#support' }, { roles: notifyInternal.SUPPORT });
+    }
     res.status(201).json({ success: true, data: shape(rows[0]) });
   } catch (err) {
     console.error('POST /tickets', err);
@@ -215,12 +220,17 @@ router.post('/:ticketId/reply', authenticateToken, async (req, res) => {
       [req.params.ticketId, isClient(req) ? 'client' : 'support', name, message.trim()]);
     // reopen ticket if it was resolved/closed
     await pool.query(`UPDATE tickets SET status = CASE WHEN status IN ('resolved','closed') THEN 'in_progress' ELSE status END, updated_at = NOW() WHERE ticket_id = $1`, [req.params.ticketId]);
-    // Notify the client when OPS replies (not on the client's own reply).
+    // Notify the client when OPS replies (not on the client's own reply)…
     if (!isClient(req) && t.user_id) {
       require('../utils/notify').notify(t.user_id, {
         type: 'support', title: 'Support replied to your ticket',
         message: message.trim().slice(0, 140), link: '#support',
       });
+    }
+    // …and notify the ops support team when the CLIENT replies.
+    if (isClient(req)) {
+      const { notifyInternal } = require('../utils/notify');
+      notifyInternal({ type: 'support', title: 'Client replied to a ticket', message: message.trim().slice(0, 140), link: '#support' }, { roles: notifyInternal.SUPPORT });
     }
     res.json({ success: true, data: rows[0] });
   } catch (err) {

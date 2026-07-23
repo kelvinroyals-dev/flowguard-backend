@@ -20,6 +20,18 @@ async function notify(userId, opts = {}) {
   } catch (e) { console.error('[notify] failed:', e.message); }
 }
 
+// Fan a notification out to internal (ops) staff — the ops notification center.
+// Optionally scope to specific roles; otherwise every active internal user.
+async function notifyInternal(opts = {}, { roles } = {}) {
+  try {
+    let q = `SELECT id FROM users WHERE user_type = 'internal' AND is_active = true`;
+    const params = [];
+    if (roles && roles.length) { q += ` AND role = ANY($1)`; params.push(roles); }
+    const { rows } = await pool.query(q, params);
+    await Promise.all(rows.map(r => notify(r.id, opts)));
+  } catch (e) { console.error('[notifyInternal] failed:', e.message); }
+}
+
 // Resolve a client_id (alerts/properties carry this) to the portal user's id.
 async function userIdForClient(clientId) {
   if (!clientId) return null;
@@ -31,4 +43,9 @@ async function userIdForClient(clientId) {
   } catch (_) { return null; }
 }
 
-module.exports = { notify, userIdForClient };
+// Role sets for common ops notifications.
+notifyInternal.SUPPORT = ['dispatcher', 'operations_manager', 'admin', 'super_admin'];
+notifyInternal.REPORTS = ['operations_manager', 'admin', 'super_admin', 'analyst', 'dispatcher'];
+notifyInternal.ADMIN   = ['operations_manager', 'admin', 'super_admin'];
+
+module.exports = { notify, notifyInternal, userIdForClient };

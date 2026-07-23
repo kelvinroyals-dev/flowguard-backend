@@ -85,6 +85,11 @@ router.post('/', authenticateToken, requirePermission('field-reports.manage'), a
        b.title || null, b.summary || null, b.summary || b.title || null, b.findings || null, b.recommendations || null,
        b.materials_used || null, (parseInt(b.work_duration_min) || null), dbStatus, String(req.user.id), name]);
     logAction(req.user.id, 'submitted a field report', 'report', reportId, { status: dbStatus });
+    // Surface submitted reports in the ops notification center for review.
+    if (dbStatus === 'review') {
+      const { notifyInternal } = require('../utils/notify');
+      notifyInternal({ type: 'report', title: 'Field report submitted', message: (b.title || 'A field report is ready for review'), link: '#field-reports' }, { roles: notifyInternal.REPORTS });
+    }
     // mirror findings/recs onto the linked inspection so the ops property view
     // (which reads i.findings/i.recommendations) stays in step.
     if (b.inspection_id && (b.findings || b.recommendations)) {
