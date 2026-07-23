@@ -221,7 +221,7 @@ router.get('/:id/pdf', authenticateToken, async (req, res) => {
              p.property_name, p.address_line1, p.city, p.state, p.property_type,
              p.total_area_sqm, p.contact_person_name,
              COALESCE(ir.submitted_by_name, i.assigned_agent_name) AS submitted_by_name,
-             i.assigned_team AS team_name, i.scheduled_date, i.due_date,
+             i.assigned_team AS team_name, i.scheduled_date,
              COALESCE(ir.findings, i.findings) AS findings,
              COALESCE(ir.recommendations, i.recommendations) AS recommendations,
              i.flood_risk_level, i.drainage_condition_score
