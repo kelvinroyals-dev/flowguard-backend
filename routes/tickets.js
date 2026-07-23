@@ -212,7 +212,7 @@ router.post('/:ticketId/reply', authenticateToken, async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO ticket_messages (ticket_id, author_type, author_name, message)
        VALUES ($1, $2, $3, $4) RETURNING author_type, author_name, message, created_at`,
-      [req.params.ticketId, isClient(req) ? 'client' : 'ops', name, message.trim()]);
+      [req.params.ticketId, isClient(req) ? 'client' : 'support', name, message.trim()]);
     // reopen ticket if it was resolved/closed
     await pool.query(`UPDATE tickets SET status = CASE WHEN status IN ('resolved','closed') THEN 'in_progress' ELSE status END, updated_at = NOW() WHERE ticket_id = $1`, [req.params.ticketId]);
     // Notify the client when OPS replies (not on the client's own reply).

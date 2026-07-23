@@ -22,9 +22,10 @@ router.get('/', authenticateToken, async (req, res) => {
     if (isClient(req)) {
       const pids = await propertyIdsForUser(req.user.id);
       if (!pids.length) return res.json({ success: true, data: [] });
-      // Clients see reports for their own properties AND only once ops has sent
-      // them — drafts/unapproved reports must not leak before the send action.
-      clientFilter = ` AND ir.property_id = ANY($2) AND ir.sent_to_client_at IS NOT NULL`;
+      // Clients see reports for their own properties, once ops has approved or
+      // sent them. (Approval is the client-ready milestone; sent_to_client_at
+      // may not be set on older approved reports, so accept either.)
+      clientFilter = ` AND ir.property_id = ANY($2) AND (ir.sent_to_client_at IS NOT NULL OR ir.status IN ('approved','sent_to_client'))`;
       params = [limit, pids];
     }
     // ?mine=1 — a field agent reviewing their own submitted reports (job history).
@@ -110,7 +111,8 @@ router.get('/:id', authenticateToken, async (req, res) => {
     if (!rows[0]) return res.status(404).json({ success:false, error:'Report not found' });
     if (isClient(req)) {
       const pids = await propertyIdsForUser(req.user.id);
-      if (!pids.includes(rows[0].property_id) || !rows[0].sent_to_client_at) {
+      const clientReady = rows[0].sent_to_client_at || ['approved', 'sent_to_client'].includes(rows[0].status);
+      if (!pids.includes(rows[0].property_id) || !clientReady) {
         return res.status(403).json({ success: false, error: 'Not authorised' });
       }
       delete rows[0].internal_notes;   // internal notes never leave to clients
@@ -221,10 +223,12 @@ router.get('/:id/pdf', authenticateToken, async (req, res) => {
     const report = rows[0];
     if (!report) return res.status(404).json({ success: false, error: 'Report not found' });
 
-    // scope: client can only fetch reports for their own properties
+    // scope: client can only download their own properties' reports, and only
+    // once approved/sent (never an unapproved draft).
     if (isClient(req)) {
       const pids = await propertyIdsForUser(req.user.id);
-      if (!pids.includes(report.property_id)) {
+      const clientReady = report.sent_to_client_at || ['approved', 'sent_to_client'].includes(report.status);
+      if (!pids.includes(report.property_id) || !clientReady) {
         return res.status(403).json({ success: false, error: 'Not authorised to access this report' });
       }
     }
