@@ -236,11 +236,20 @@ async function sendStaffInvite(to, { fullName, roleLabel, portalName, portalUrl,
   return sendEmail({ to, subject: `You’ve been added to ${portalName}`, html: shell(`Welcome to ${portalName}`, body), replyTo: OPS_EMAIL });
 }
 
+// ── Internal note added to a field agent's report ─────────────
+async function sendReportNote(to, name, reportTitle, note) {
+  const body = p(`Hi ${name || 'there'},`)
+    + p(`A reviewer added internal notes to your report${reportTitle ? ` — <strong>${reportTitle}</strong>` : ''}:`)
+    + `<div style="background:#f0fdfa;border:1px solid #cdeee9;border-radius:12px;padding:14px 16px;margin:0 0 16px;font-size:14px;color:#12222b;white-space:pre-wrap;">${String(note || '').slice(0, 1500)}</div>`
+    + muted('These notes are internal and are not shown to the client.');
+  return sendEmail({ to, subject: `Notes added to your report${reportTitle ? ` — ${reportTitle}` : ''}`, html: shell('Notes on your report', body), replyTo: OPS_EMAIL });
+}
+
 module.exports = {
   sendEmail, shell,
   sendPasswordReset, sendPasswordChanged,
   sendWelcome, sendVerification, sendEmailCode,
   sendPropertyReceived, sendStatusUpdate,
   sendOpsNewSignup, sendOpsNewProperty,
-  sendInvoice, sendStaffInvite,
+  sendInvoice, sendStaffInvite, sendReportNote,
 };

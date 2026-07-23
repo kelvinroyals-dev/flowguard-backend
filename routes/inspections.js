@@ -85,13 +85,11 @@ router.put('/:id', async (req, res) => {
         WHERE inspection_id = $4 RETURNING *`,
       [status || null, findings || null, recommendations || null, req.params.id]);
 
-    // keep the property pipeline in step when an inspection is completed
-    if (status === 'completed') {
-      await pool.query(
-        `UPDATE properties SET status = 'report_ready', updated_at = NOW()
-          WHERE property_id = $1 AND status IN ('inspection_scheduled','inspection_ongoing')`,
-        [rows[0].property_id]).catch(() => {});
-    }
+    // A completed inspection does NOT make the property "report ready" — the
+    // agent's report still has to be reviewed and APPROVED by ops. The property
+    // only advances to report_ready on approval (see PUT /field-reports/:id).
+    // The client shows "Awaiting approval" in the meantime (driven by the
+    // inspection being 'completed').
     if (realtime.events && realtime.events.inspectionUpdated) realtime.events.inspectionUpdated(rows[0]);
     res.json({ success: true, data: rows[0] });
   } catch (err) {

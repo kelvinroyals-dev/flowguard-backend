@@ -143,6 +143,41 @@ router.put('/:id', authenticateToken, requirePermission('field-reports.manage'),
       pool.query(`UPDATE inspections SET findings=COALESCE($1,findings), recommendations=COALESCE($2,recommendations), updated_at=NOW() WHERE inspection_id=$3`,
         [req.body.findings ?? null, req.body.recommendations ?? null, rows[0].inspection_id]).catch(() => {});
     }
+
+    // ── APPROVED → the report is now the client's: advance the property to
+    // report_ready, make the report available to download, and email + notify
+    // the owner. (Before approval the client only ever sees "Awaiting approval".)
+    if (toDb(req.body.status) === 'approved' && rows[0].property_id) {
+      await pool.query(`UPDATE properties SET status='report_ready', updated_at=NOW() WHERE property_id=$1`, [rows[0].property_id]).catch(() => {});
+      await pool.query(`UPDATE inspection_reports SET sent_to_client_at = COALESCE(sent_to_client_at, NOW()) WHERE report_id=$1`, [rows[0].report_id]).catch(() => {});
+      (async () => {
+        try {
+          const info = await pool.query(`SELECT p.property_name, u.id AS uid, u.email, u.full_name FROM properties p JOIN users u ON u.id = p.user_id WHERE p.property_id=$1`, [rows[0].property_id]);
+          const o = info.rows[0];
+          if (o) {
+            const mailer = require('../utils/mailer');
+            if (o.email) await mailer.sendStatusUpdate(o.email, o.full_name, o.property_name, 'report_ready', rows[0].property_id);
+            require('../utils/notify').notify(o.uid, { type: 'report', title: 'Your inspection report is ready', message: 'Your assessment report has been approved and is ready to download.', link: '#reports' });
+          }
+        } catch (e) { console.error('[report approve] notify error:', e.message); }
+      })();
+    }
+
+    // ── Internal notes added/changed → email + notify the engineer who filed it.
+    if ('internal_notes' in req.body && req.body.internal_notes && req.body.internal_notes.trim() && rows[0].submitted_by) {
+      (async () => {
+        try {
+          const eng = await pool.query('SELECT id, email, full_name FROM users WHERE id::text = $1', [String(rows[0].submitted_by)]);
+          const e = eng.rows[0];
+          if (e) {
+            require('../utils/notify').notify(e.id, { type: 'report', title: 'Ops added notes to your report', message: 'A reviewer left internal notes on ' + (rows[0].title || 'your report') + '.', link: '#reports' });
+            const mailer = require('../utils/mailer');
+            if (e.email && mailer.sendReportNote) await mailer.sendReportNote(e.email, e.full_name, rows[0].title, req.body.internal_notes);
+          }
+        } catch (e) { console.error('[report note] notify error:', e.message); }
+      })();
+    }
+
     rows[0].status = toFe(rows[0].status);
     res.json({ success: true, data: rows[0] });
   } catch (err) { console.error('PUT /field-reports/:id', err); res.status(500).json({ success:false, error:'Failed to update report' }); }
