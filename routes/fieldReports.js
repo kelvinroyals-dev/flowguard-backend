@@ -37,7 +37,7 @@ router.get('/', authenticateToken, async (req, res) => {
       SELECT ir.report_id, ir.inspection_id, ir.property_id, ir.status,
              ir.title, COALESCE(ir.summary, ir.executive_summary) AS summary, ir.executive_summary,
              ir.report_type, ir.alert_id, ir.materials_used, ir.work_duration_min,
-             ir.submitted_by, ir.created_at, ir.updated_at, ir.approved_by, ir.sent_to_client_at,
+             ir.internal_notes, ir.submitted_by, ir.created_at, ir.updated_at, ir.approved_by, ir.sent_to_client_at,
              COALESCE(ir.submitted_by_name, i.assigned_agent_name) AS submitted_by_name,
              p.property_name, p.city, p.state,
              i.assigned_team AS team_name,
@@ -49,7 +49,11 @@ router.get('/', authenticateToken, async (req, res) => {
       LEFT JOIN inspections i ON ir.inspection_id = i.inspection_id
       WHERE 1=1${clientFilter}${mineFilter}
       ORDER BY ir.created_at DESC LIMIT $1`, params);
-    const data = rows.map(r => ({ ...r, status: toFe(r.status) }));
+    const data = rows.map(r => {
+      const o = { ...r, status: toFe(r.status) };
+      if (isClient(req)) delete o.internal_notes;   // internal notes never leave to clients
+      return o;
+    });
     res.json({ success: true, data });
   } catch (err) { console.error('GET /field-reports', err); res.status(500).json({ success:false, error:'Failed to load field reports' }); }
 });
@@ -109,6 +113,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
       if (!pids.includes(rows[0].property_id) || !rows[0].sent_to_client_at) {
         return res.status(403).json({ success: false, error: 'Not authorised' });
       }
+      delete rows[0].internal_notes;   // internal notes never leave to clients
     }
     rows[0].status = toFe(rows[0].status);
     res.json({ success: true, data: rows[0] });
@@ -123,7 +128,7 @@ router.put('/:id', authenticateToken, requirePermission('field-reports.manage'),
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const sets = [], vals = []; let i = 1;
-    const FIELDS = ['title', 'summary', 'findings', 'recommendations', 'materials_used', 'work_duration_min', 'executive_summary'];
+    const FIELDS = ['title', 'summary', 'findings', 'recommendations', 'materials_used', 'work_duration_min', 'executive_summary', 'internal_notes'];
     for (const f of FIELDS) {
       if (f in req.body) { sets.push(`${f}=$${i++}`); vals.push(f === 'work_duration_min' ? (parseInt(req.body[f]) || null) : req.body[f]); }
     }
