@@ -26,10 +26,15 @@ until it is `approved`/`sent_to_client`.
 | Canonical (API) | Ops | Field | Client |
 |---|---|---|---|
 | `draft` | Draft | Draft | *(hidden)* |
-| `under_review` | Awaiting approval | Submitted | Awaiting approval |
+| `under_review` | Under review | Submitted | Awaiting approval |
 | `approved` | Approved | Approved | Report ready |
 | `sent_to_client` | Sent to client | Sent | Report ready |
-| `rejected` | Returned | Needs changes | Awaiting approval |
+| `rejected` | Rejected | Needs changes | Awaiting approval |
+
+These are the labels each portal renders today (verified in code), not aspirational —
+so this table is a reliable reference. They differ in wording but every row maps to the
+same DB status. Full runtime enforcement (all portals fetching `/meta/status-vocab`
+instead of local maps) is the remaining hardening step.
 
 ## Alert / incident (`alerts.status`)
 

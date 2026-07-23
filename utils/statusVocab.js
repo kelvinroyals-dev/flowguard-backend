@@ -22,12 +22,15 @@ const VOCAB = {
 
   // Field report lifecycle (inspection_reports.status). A field "Submit" writes
   // `under_review`; the client only ever sees a report once it is approved.
+  // Labels below match what each portal actually renders today — verified against
+  // ops-field-reports.js, the field portal, and client screens.js. Different words,
+  // same underlying record.
   report: {
-    draft:          { ops: 'Draft',             field: 'Draft',         client: null },
-    under_review:   { ops: 'Awaiting approval', field: 'Submitted',     client: 'Awaiting approval' },
-    approved:       { ops: 'Approved',          field: 'Approved',      client: 'Report ready' },
-    sent_to_client: { ops: 'Sent to client',    field: 'Sent',          client: 'Report ready' },
-    rejected:       { ops: 'Returned',          field: 'Needs changes', client: 'Awaiting approval' },
+    draft:          { ops: 'Draft',        field: 'Draft',         client: null },
+    under_review:   { ops: 'Under review', field: 'Submitted',     client: 'Awaiting approval' },
+    approved:       { ops: 'Approved',     field: 'Approved',      client: 'Report ready' },
+    sent_to_client: { ops: 'Sent to client', field: 'Sent',       client: 'Report ready' },
+    rejected:       { ops: 'Rejected',     field: 'Needs changes', client: 'Awaiting approval' },
   },
 
   // Alert / incident lifecycle (alerts.status)
