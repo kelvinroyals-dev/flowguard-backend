@@ -176,7 +176,15 @@ async function fetchInvoiceFull(id) {
               FROM sensors s
              WHERE s.property_id = i.property_id
                 OR s.property_id IN (SELECT property_id FROM properties WHERE parent_property_id = i.property_id)
-           ) AS sensor_ids
+           ) AS sensor_ids,
+           (SELECT COALESCE(json_agg(json_build_object(
+                     'payment_id', pay.payment_id, 'amount', pay.amount, 'currency', pay.currency,
+                     'payment_method', pay.payment_method, 'transaction_reference', pay.transaction_reference,
+                     'status', pay.status, 'payment_date', pay.payment_date, 'created_at', pay.created_at)
+                     ORDER BY COALESCE(pay.payment_date, pay.created_at) DESC), '[]'::json)
+              FROM payments pay WHERE pay.invoice_id = i.invoice_id) AS payments,
+           (SELECT COALESCE(SUM(pay.amount), 0) FROM payments pay
+             WHERE pay.invoice_id = i.invoice_id AND pay.status = 'successful') AS paid_total
       FROM invoices i
       LEFT JOIN users u ON i.user_id = u.id
       LEFT JOIN properties p ON i.property_id = p.property_id
@@ -378,6 +386,56 @@ router.post('/invoices/:id/mark-paid', authenticateToken, requirePermission('bil
     if (!rows[0]) return res.status(404).json({ success:false, error:'Invoice not found' });
     res.json({ success: true, data: rows[0] });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to mark paid' }); }
+});
+
+// POST /billing/invoices/:id/payments — record a real payment against the
+// `payments` ledger, then recompute the invoice snapshot from the ledger.
+// Supports partial payments: balance_due and payment_status are derived from
+// SUM(successful payments), never guessed. Restricted to money-handling roles.
+router.post('/invoices/:id/payments', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const inv = (await client.query(
+      'SELECT invoice_id, user_id, total_amount FROM invoices WHERE invoice_id=$1', [req.params.id])).rows[0];
+    if (!inv) { client.release(); return res.status(404).json({ success: false, error: 'Invoice not found' }); }
+
+    const amount = Number(req.body && req.body.amount);
+    if (!(amount > 0)) { client.release(); return res.status(400).json({ success: false, error: 'A positive amount is required' }); }
+    const method = String((req.body && req.body.payment_method) || '').trim() || 'bank_transfer';
+    const ref = String((req.body && req.body.transaction_reference) || '').trim() || null;
+    const when = (req.body && req.body.payment_date) ? new Date(req.body.payment_date) : new Date();
+    if (isNaN(when.getTime())) { client.release(); return res.status(400).json({ success: false, error: 'Invalid payment date' }); }
+    const payId = 'PAY-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
+
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO payments (payment_id, invoice_id, user_id, amount, currency, payment_method, transaction_reference, status, payment_date)
+       VALUES ($1,$2,$3,$4,'NGN',$5,$6,'successful',$7)`,
+      [payId, inv.invoice_id, inv.user_id, amount, method, ref, when]);
+
+    const paid = Number((await client.query(
+      `SELECT COALESCE(SUM(amount),0) s FROM payments WHERE invoice_id=$1 AND status='successful'`,
+      [inv.invoice_id])).rows[0].s);
+    const total = Number(inv.total_amount) || 0;
+    const bal = Math.max(0, +(total - paid).toFixed(2));
+    const pstatus = bal <= 0 ? 'paid' : (paid > 0 ? 'partial' : 'pending');
+    await client.query(
+      `UPDATE invoices SET amount_paid=$1, balance_due=$2, payment_status=$3,
+         status=CASE WHEN $3='paid' THEN 'paid' ELSE status END,
+         paid_date=CASE WHEN $3='paid' THEN CURRENT_DATE ELSE paid_date END,
+         updated_at=NOW() WHERE invoice_id=$4`,
+      [paid, bal, pstatus, inv.invoice_id]);
+    await client.query('COMMIT');
+
+    logAction(req.user.id, 'recorded a payment', 'invoice', inv.invoice_id, { payment_id: payId, amount, method });
+    res.json({ success: true, data: { payment_id: payId, paid_total: paid, balance_due: bal, payment_status: pstatus } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /billing/invoices/:id/payments', err);
+    res.status(500).json({ success: false, error: 'Failed to record payment' });
+  } finally {
+    client.release();
+  }
 });
 
 // POST /billing/invoices/:id/notify-payment — a client tells us they've paid.
