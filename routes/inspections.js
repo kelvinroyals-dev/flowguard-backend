@@ -39,6 +39,7 @@ router.get('/', async (req, res) => {
       SELECT i.inspection_id, i.property_id, i.status, i.assigned_team,
              i.scheduled_date, i.findings, i.recommendations, i.created_at, i.updated_at,
              p.property_name, p.address_line1, p.city, p.state,
+             p.latitude, p.longitude,
              p.contact_person_name, p.contact_phone
         FROM inspections i
         LEFT JOIN properties p ON p.property_id = i.property_id`;

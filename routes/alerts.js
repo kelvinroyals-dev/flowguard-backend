@@ -39,6 +39,8 @@ router.get('/', authenticateToken, async (req, res) => {
              COALESCE(p.property_name, c.name) AS property,
              COALESCE(p.property_name, c.name) AS property_name,
              c.name AS site_name,
+             COALESCE(p.latitude, s.latitude) AS latitude,
+             COALESCE(p.longitude, s.longitude) AS longitude,
              s.name AS sensor_name,
              ft.team_name AS assigned_team,
              (SELECT t.ticket_id FROM tickets t
