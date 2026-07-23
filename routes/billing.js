@@ -399,6 +399,10 @@ router.post('/invoices/:id/notify-payment', authenticateToken, async (req, res) 
        VALUES ($1,$2,$3,'high','billing',$4,$5,'new',$6)`,
       [ticketId, 'Payment notification — ' + inv.invoice_id, desc, inv.property_id, inv.user_id, req.user.email]);
     logAction(req.user.id, 'notified a payment', 'invoice', inv.invoice_id, { ticket_id: ticketId });
+    // Surface it in the ops notification center for finance/ops to reconcile.
+    require('../utils/notify').notifyInternal(
+      { type: 'billing', title: 'Payment reported', message: 'A client reported payment for ' + inv.invoice_id + ' — finance to confirm receipt.', link: '#support/' + ticketId },
+      { roles: ['finance', 'operations_manager', 'admin', 'super_admin'] });
     res.status(201).json({ success: true, data: { ticket_id: ticketId } });
   } catch (err) {
     console.error('POST /billing/invoices/:id/notify-payment', err);
