@@ -162,14 +162,22 @@ router.get('/support', authenticateToken, requirePermission('support.view'), asy
              u.full_name AS client_name, u.email AS client_email,
              p.property_name,
              (SELECT COUNT(*) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id) AS message_count,
-             (SELECT MAX(created_at) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id) AS last_message_at
+             (SELECT MAX(created_at) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id) AS last_message_at,
+             (SELECT author_type FROM ticket_messages m WHERE m.ticket_id = t.ticket_id ORDER BY created_at DESC LIMIT 1) AS last_author
         FROM tickets t
         LEFT JOIN users u ON u.id = t.user_id
         LEFT JOIN properties p ON p.property_id = t.property_id
        WHERE t.work_type IS NULL AND t.assigned_team IS NULL
        ORDER BY (t.status NOT IN ('resolved','closed')) DESC,
                 COALESCE((SELECT MAX(created_at) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id), t.created_at) DESC`);
-    res.json({ success: true, data: rows });
+    // "unread" = open AND waiting on ops: a brand-new ticket (no messages) or the
+    // client sent the last message. Once ops replies (last_author = 'support'),
+    // it's no longer flagged.
+    const data = rows.map(r => ({
+      ...r,
+      needs_response: !['resolved', 'closed'].includes(r.status) && (r.last_author == null || r.last_author === 'client'),
+    }));
+    res.json({ success: true, data });
   } catch (err) {
     console.error('GET /tickets/support', err);
     res.status(500).json({ success: false, error: 'Failed to load support tickets' });
