@@ -105,7 +105,7 @@ router.post('/invite', requireClientPermission('manage_team'), async (req, res) 
         fullName,
         roleLabel: (CLIENT_ROLES[role] || {}).label || role,
         orgName: orgRow.company || orgRow.full_name || 'your FlowGuard account',
-        setupUrl: `${APP_HOST}/reset-password.html?token=${token}`,
+        setupUrl: `${APP_HOST}/reset-password.html?token=${token}&invite=1`,
         inviterName: req.user.full_name || req.user.email,
       });
       emailed = true;

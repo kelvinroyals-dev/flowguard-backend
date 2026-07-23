@@ -367,8 +367,14 @@ router.post('/reset-password', async (req, res) => {
     if (!rows[0]) return res.status(400).json({ success: false, error: 'This reset link is invalid or has expired.' });
 
     const hash = await bcrypt.hash(password, 10);
+    // Setting a password via an emailed token proves the person controls that inbox,
+    // so mark them email-verified (this is how an invited colleague completes onboarding)
+    // and clear any failed-attempt lockout. We deliberately do NOT touch is_active, so a
+    // deactivated account can't silently reactivate itself through a reset.
     await pool.query(
-      'UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2',
+      `UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL,
+              email_verified = true, failed_attempts = 0, locked_until = NULL, updated_at = NOW()
+        WHERE id = $2`,
       [hash, rows[0].id]);
 
     // security confirmation email (fire-and-forget)
