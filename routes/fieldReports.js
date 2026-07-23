@@ -27,21 +27,68 @@ router.get('/', authenticateToken, async (req, res) => {
       clientFilter = ` AND ir.property_id = ANY($2) AND ir.sent_to_client_at IS NOT NULL`;
       params = [limit, pids];
     }
+    // ?mine=1 — a field agent reviewing their own submitted reports (job history).
+    let mineFilter = '';
+    if (!isClient(req) && (req.query.mine === '1' || req.query.mine === 'true')) {
+      params.push(String(req.user.id));
+      mineFilter = ` AND ir.submitted_by = $${params.length}`;
+    }
     const { rows } = await pool.query(`
       SELECT ir.report_id, ir.inspection_id, ir.property_id, ir.status,
-             ir.executive_summary, ir.created_at, ir.updated_at,
-             ir.approved_by, ir.sent_to_client_at,
+             ir.title, COALESCE(ir.summary, ir.executive_summary) AS summary, ir.executive_summary,
+             ir.report_type, ir.alert_id, ir.materials_used, ir.work_duration_min,
+             ir.submitted_by, ir.created_at, ir.updated_at, ir.approved_by, ir.sent_to_client_at,
+             COALESCE(ir.submitted_by_name, i.assigned_agent_name) AS submitted_by_name,
              p.property_name, p.city, p.state,
-             i.assigned_agent_name AS submitted_by_name, i.assigned_team AS team_name,
-             i.findings, i.recommendations, i.flood_risk_level, i.drainage_condition_score
+             i.assigned_team AS team_name,
+             COALESCE(ir.findings, i.findings) AS findings,
+             COALESCE(ir.recommendations, i.recommendations) AS recommendations,
+             i.flood_risk_level, i.drainage_condition_score
       FROM inspection_reports ir
       LEFT JOIN properties p ON ir.property_id = p.property_id
       LEFT JOIN inspections i ON ir.inspection_id = i.inspection_id
-      WHERE 1=1${clientFilter}
+      WHERE 1=1${clientFilter}${mineFilter}
       ORDER BY ir.created_at DESC LIMIT $1`, params);
     const data = rows.map(r => ({ ...r, status: toFe(r.status) }));
     res.json({ success: true, data });
   } catch (err) { console.error('GET /field-reports', err); res.status(500).json({ success:false, error:'Failed to load field reports' }); }
+});
+
+// POST /field-reports — a field agent (or ops) files a report from the field
+// portal. Stores the full report the agent typed (previously there was no create
+// route at all → "Not found: POST /api/v1/field-reports").
+router.post('/', authenticateToken, requirePermission('field-reports.manage'), async (req, res) => {
+  const { isClient } = require('../utils/scope');
+  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  try {
+    const b = req.body || {};
+    const reportId = 'FR-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
+    // Field portal sends 'submitted' or 'draft'; DB allows draft/review/approved/
+    // sent_to_client. A submitted field report enters ops review.
+    const dbStatus = (b.status === 'draft') ? 'draft' : 'review';
+    let name = req.user.email;
+    try { const u = await pool.query('SELECT full_name FROM users WHERE id=$1', [req.user.id]); if (u.rows[0] && u.rows[0].full_name) name = u.rows[0].full_name; } catch (_) {}
+    const { rows } = await pool.query(
+      `INSERT INTO inspection_reports
+         (report_id, inspection_id, property_id, report_type, alert_id,
+          title, summary, executive_summary, findings, recommendations,
+          materials_used, work_duration_min, status, submitted_by, submitted_by_name,
+          created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW(),NOW())
+       RETURNING *`,
+      [reportId, b.inspection_id || null, b.property_id || null, b.report_type || null, b.alert_id || null,
+       b.title || null, b.summary || null, b.summary || b.title || null, b.findings || null, b.recommendations || null,
+       b.materials_used || null, (parseInt(b.work_duration_min) || null), dbStatus, String(req.user.id), name]);
+    logAction(req.user.id, 'submitted a field report', 'report', reportId, { status: dbStatus });
+    // mirror findings/recs onto the linked inspection so the ops property view
+    // (which reads i.findings/i.recommendations) stays in step.
+    if (b.inspection_id && (b.findings || b.recommendations)) {
+      pool.query(`UPDATE inspections SET findings=COALESCE($1,findings), recommendations=COALESCE($2,recommendations), updated_at=NOW() WHERE inspection_id=$3`,
+        [b.findings || null, b.recommendations || null, b.inspection_id]).catch(() => {});
+    }
+    const out = rows[0]; out.status = toFe(out.status);
+    res.status(201).json({ success: true, data: out });
+  } catch (err) { console.error('POST /field-reports', err); res.status(500).json({ success: false, error: 'Failed to submit report' }); }
 });
 
 // GET /field-reports/:id
@@ -76,13 +123,21 @@ router.put('/:id', authenticateToken, requirePermission('field-reports.manage'),
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const sets = [], vals = []; let i = 1;
-    if ('executive_summary' in req.body) { sets.push(`executive_summary=$${i++}`); vals.push(req.body.executive_summary); }
+    const FIELDS = ['title', 'summary', 'findings', 'recommendations', 'materials_used', 'work_duration_min', 'executive_summary'];
+    for (const f of FIELDS) {
+      if (f in req.body) { sets.push(`${f}=$${i++}`); vals.push(f === 'work_duration_min' ? (parseInt(req.body[f]) || null) : req.body[f]); }
+    }
     if ('status' in req.body) { sets.push(`status=$${i++}`); vals.push(toDb(req.body.status)); }
     if (!sets.length) return res.status(400).json({ success:false, error:'No valid fields' });
     vals.push(req.params.id);
     const { rows } = await pool.query(
       `UPDATE inspection_reports SET ${sets.join(', ')}, updated_at=NOW() WHERE report_id=$${i} RETURNING *`, vals);
     if (!rows[0]) return res.status(404).json({ success:false, error:'Report not found' });
+    // keep the linked inspection in step with edited findings/recommendations
+    if (rows[0].inspection_id && ('findings' in req.body || 'recommendations' in req.body)) {
+      pool.query(`UPDATE inspections SET findings=COALESCE($1,findings), recommendations=COALESCE($2,recommendations), updated_at=NOW() WHERE inspection_id=$3`,
+        [req.body.findings ?? null, req.body.recommendations ?? null, rows[0].inspection_id]).catch(() => {});
+    }
     rows[0].status = toFe(rows[0].status);
     res.json({ success: true, data: rows[0] });
   } catch (err) { console.error('PUT /field-reports/:id', err); res.status(500).json({ success:false, error:'Failed to update report' }); }
