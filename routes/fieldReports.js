@@ -88,7 +88,7 @@ router.post('/', authenticateToken, requirePermission('field-reports.manage'), a
     // Surface submitted reports in the ops notification center for review.
     if (dbStatus === 'review') {
       const { notifyInternal } = require('../utils/notify');
-      notifyInternal({ type: 'report', title: 'Field report submitted', message: (b.title || 'A field report is ready for review'), link: '#field-reports' }, { roles: notifyInternal.REPORTS });
+      notifyInternal({ type: 'report', title: 'Field report submitted', message: (b.title || 'A field report is ready for review'), link: '#field-reports/' + reportId }, { roles: notifyInternal.REPORTS });
     }
     // mirror findings/recs onto the linked inspection so the ops property view
     // (which reads i.findings/i.recommendations) stays in step.

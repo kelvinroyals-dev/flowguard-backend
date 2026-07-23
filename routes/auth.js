@@ -287,7 +287,7 @@ router.post('/register', async (req, res) => {
         }
         await mailer.sendOpsNewSignup(user);
         const { notifyInternal } = require('../utils/notify');
-        notifyInternal({ type: 'client', title: 'New client signup', message: (user.full_name || user.email) + ' created an account', link: '#clients' }, { roles: notifyInternal.ADMIN });
+        notifyInternal({ type: 'client', title: 'New client signup', message: (user.full_name || user.email) + ' created an account', link: '#clients/' + user.id }, { roles: notifyInternal.ADMIN });
         if (propertyId) {
           await mailer.sendPropertyReceived(user.email, user.full_name, company.trim(), propertyId);
           await mailer.sendOpsNewProperty({ property_name: company.trim(), city: corridor.city, state: corridor.state }, user.full_name);

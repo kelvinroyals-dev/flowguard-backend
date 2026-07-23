@@ -620,7 +620,7 @@ router.post('/:propertyId/schedule-inspection', authenticateToken, requirePermis
           try { whenStr = ' for ' + new Date(b.scheduled_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); } catch (_) {}
           require('../utils/notify').notify(owner.rows[0].user_id, {
             type: 'property', title: 'Inspection scheduled',
-            message: (r && r.property_name ? r.property_name : 'Your property') + ' — inspection scheduled' + whenStr + '.', link: '#properties',
+            message: (r && r.property_name ? r.property_name : 'Your property') + ' — inspection scheduled' + whenStr + '.', link: '#property/' + pid,
           });
         }
       } catch (e) { console.error('[schedule-inspection] notify error:', e.message); }

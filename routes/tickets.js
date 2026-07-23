@@ -66,7 +66,7 @@ router.post('/', authenticateToken, async (req, res) => {
     // A client raising a ticket lands in the ops notification center.
     if (isClient(req)) {
       const { notifyInternal } = require('../utils/notify');
-      notifyInternal({ type: 'support', title: 'New support ticket', message: (b.subject || 'A client opened a ticket'), link: '#support' }, { roles: notifyInternal.SUPPORT });
+      notifyInternal({ type: 'support', title: 'New support ticket', message: (b.subject || 'A client opened a ticket'), link: '#support/' + ticketId }, { roles: notifyInternal.SUPPORT });
     }
     res.status(201).json({ success: true, data: shape(rows[0]) });
   } catch (err) {
@@ -224,13 +224,13 @@ router.post('/:ticketId/reply', authenticateToken, async (req, res) => {
     if (!isClient(req) && t.user_id) {
       require('../utils/notify').notify(t.user_id, {
         type: 'support', title: 'Support replied to your ticket',
-        message: message.trim().slice(0, 140), link: '#support',
+        message: message.trim().slice(0, 140), link: '#ticket/' + req.params.ticketId,
       });
     }
     // …and notify the ops support team when the CLIENT replies.
     if (isClient(req)) {
       const { notifyInternal } = require('../utils/notify');
-      notifyInternal({ type: 'support', title: 'Client replied to a ticket', message: message.trim().slice(0, 140), link: '#support' }, { roles: notifyInternal.SUPPORT });
+      notifyInternal({ type: 'support', title: 'Client replied to a ticket', message: message.trim().slice(0, 140), link: '#support/' + req.params.ticketId }, { roles: notifyInternal.SUPPORT });
     }
     res.json({ success: true, data: rows[0] });
   } catch (err) {
