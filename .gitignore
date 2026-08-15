@@ -3,3 +3,4 @@ node_modules/
 .DS_Store
 *.log
 scripts/.seed-360-ids.json
+.DS_Store

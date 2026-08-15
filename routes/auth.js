@@ -94,12 +94,12 @@ const DUMMY_HASH = '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
 // POST /api/v1/auth/login   body: { email, password }
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body || {};
+    const { email, password, portal } = req.body || {};
     if (!email || !password) {
       return res.status(400).json({ success: false, error: 'Email and password required' });
     }
     const addr = email.toLowerCase().trim();
-    const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [addr]);
+    const { rows } = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [addr]);
     const user = rows[0];
 
     // locked out?
@@ -129,6 +129,19 @@ router.post('/login', async (req, res) => {
       }
       await logAuth(addr, 'login_failed', req);
       return res.status(401).json({ success: false, error: 'Invalid credentials' });
+    }
+
+    // Portal segregation: the Neon operations portal is FlowGuard staff only.
+    // When the ops login page authenticates (portal === 'ops'), refuse any
+    // non-internal account even with valid credentials — a client belongs on
+    // the client portal. The client portal sends no `portal` flag, so its login
+    // path is completely unaffected.
+    if (portal === 'ops' && user.user_type !== 'internal') {
+      await logAuth(addr, 'login_denied_non_staff', req);
+      return res.status(403).json({
+        success: false,
+        error: 'This portal is for FlowGuard staff. Please sign in on the client portal instead.',
+      });
     }
 
     await pool.query(
