@@ -9,7 +9,7 @@ const router = express.Router();
 
 function signToken(user) {
   return jwt.sign(
-    { id: user.id, email: user.email, role: user.role, user_type: user.user_type },
+    { id: user.id, email: user.email, role: user.role, user_type: user.user_type, tv: user.token_version || 0 },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   );
@@ -166,15 +166,28 @@ router.post('/send-email-code', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Enter a valid email address' });
     }
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-    if (existing.rows.length) {
-      return res.status(409).json({ success: false, error: 'An account with this email already exists' });
-    }
     const code = String(Math.floor(100000 + Math.random() * 900000));
     const token = signEmailCodeToken(email, code);
-    // fire-and-forget: still return the token so the flow proceeds even if mail is slow
+    // Do NOT reveal whether the email is already registered — that lets an
+    // attacker enumerate accounts. Always return the same shape; only email a
+    // usable code to a genuinely new address. An existing account instead gets
+    // a "you already have an account" notice so a real owner is not left waiting
+    // for a code that never arrives.
     (async () => {
-      try { await require('../utils/mailer').sendEmailCode(email, code); }
-      catch (e) { console.error('[send-email-code] mail error:', e.message); }
+      try {
+        const mailer = require('../utils/mailer');
+        if (existing.rows.length) {
+          await mailer.sendEmail({
+            to: email,
+            subject: 'You already have a FlowGuard account',
+            html: '<p>Someone tried to sign up using this email, but an account already exists for it.</p>'
+                + '<p>If this was you, just <a href="https://app.flowguard.ng/login.html">sign in</a>, '
+                + 'or reset your password if you have forgotten it. If it was not you, you can ignore this email.</p>',
+          });
+        } else {
+          await mailer.sendEmailCode(email, code);
+        }
+      } catch (e) { console.error('[send-email-code] mail error:', e.message); }
     })();
     return res.json({ success: true, data: { token } });
   } catch (err) {
@@ -354,7 +367,7 @@ router.post('/forgot-password', async (req, res) => {
     const resetUrl = `https://app.flowguard.ng/reset-password.html?token=${token}`;
     // Email delivery is handled by the mail layer (SendGrid). Until that's wired,
     // the token is stored and the link is logged server-side so the flow is testable.
-    console.log(`[forgot-password] reset link for ${email}: ${resetUrl}`);
+    // NOTE: never log the reset URL — a logged link is an account-takeover primitive.
     try {
       const { sendPasswordReset } = require('../utils/mailer');
       if (typeof sendPasswordReset === 'function') await sendPasswordReset(email, resetUrl);
@@ -387,7 +400,8 @@ router.post('/reset-password', async (req, res) => {
     // deactivated account can't silently reactivate itself through a reset.
     await pool.query(
       `UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL,
-              email_verified = true, failed_attempts = 0, locked_until = NULL, updated_at = NOW()
+              email_verified = true, failed_attempts = 0, locked_until = NULL,
+              token_version = token_version + 1, updated_at = NOW()
         WHERE id = $2`,
       [hash, rows[0].id]);
 
