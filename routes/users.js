@@ -7,14 +7,12 @@ const { authenticateToken, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
 const { requireIntParam } = require('../middleware/validate-id');
 const { isClient } = require('../utils/scope');
+const { INTERNAL_ROLES, normalizeRole } = require('../utils/roles');
 const router = express.Router();
 
-// Roles that may exist on an internal account. Keep in sync with
-// js/config.js CONFIG.NAV_ACCESS in the ops frontend.
-const INTERNAL_ROLES = [
-  'admin', 'super_admin', 'operations_manager', 'dispatcher',
-  'field_lead', 'analyst', 'finance',
-];
+// INTERNAL_ROLES now lives in utils/roles.js (shared with the auth middleware),
+// which also adds 'field_team' so field crews can actually be invited. Keep
+// js/config.js CONFIG.NAV_ACCESS in the ops frontend aligned with that list.
 // Roles allowed to grant/change another account's role, or remove an account.
 // This is the one place privilege escalation must be blocked.
 const canManageRoles = requireRole('admin', 'super_admin');
@@ -77,7 +75,7 @@ router.get('/:id', authenticateToken, requireIntParam('id'), async (req, res) =>
 router.post('/invite', authenticateToken, canManageRoles, requirePermission('team-members.manage'), async (req, res) => {
   try {
     const { email, full_name, role } = req.body || {};
-    const roleVal = role || req.body.role_id;
+    const roleVal = normalizeRole(role || req.body.role_id);
     if (!email || !full_name) return res.status(400).json({ success: false, error: 'Email and full name required' });
     if (roleVal && !INTERNAL_ROLES.includes(roleVal)) {
       return res.status(400).json({ success: false, error: `role must be one of: ${INTERNAL_ROLES.join(', ')}` });
