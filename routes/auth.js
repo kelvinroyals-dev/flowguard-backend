@@ -137,11 +137,12 @@ router.post('/login', async (req, res) => {
     // the client portal. The client portal sends no `portal` flag, so its login
     // path is completely unaffected.
     if (portal === 'ops' && user.user_type !== 'internal') {
+      // Do NOT reveal that these credentials are valid-but-wrong-portal — that
+      // would confirm to an attacker they hold a working client login. Return
+      // the identical generic failure as any bad login; the denial is audited
+      // server-side only.
       await logAuth(addr, 'login_denied_non_staff', req);
-      return res.status(403).json({
-        success: false,
-        error: 'This portal is for FlowGuard staff. Please sign in on the client portal instead.',
-      });
+      return res.status(401).json({ success: false, error: 'Invalid credentials' });
     }
 
     await pool.query(
