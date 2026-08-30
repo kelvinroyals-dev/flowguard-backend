@@ -320,6 +320,12 @@ async function buildHorizonForecast() {
     };
   }).sort((a, b) => b.peak_risk - a.peak_risk);
 
+  return summarizeHorizons(estates, rain);
+}
+
+// Build the portfolio-triage envelope from an estates array. Shared so a
+// client-scoped subset gets the SAME triage maths as the full ops portfolio.
+function summarizeHorizons(estates, rain) {
   const critical_now = estates.filter(e => e.horizons.now >= 80);
   const entering_high = estates.filter(e => e.horizons.now < 70 && e.horizons.h3 >= 70);
   const preventive = estates.filter(e => e.horizons.now < 60 && e.horizons.h6 >= 60 && e.horizons.h6 < 80);
@@ -342,4 +348,16 @@ async function buildHorizonForecast() {
   };
 }
 
-module.exports = { scoreProperties, rainfallWindow, buildForecast, buildHorizonForecast, rainfallWindows, LAGOS };
+// Re-scope an already-built horizon forecast to a subset of property_ids
+// (client isolation). Recomputes the portfolio triage over just those estates.
+function scopeHorizonsToProperties(forecast, propertyIds) {
+  const allow = new Set((propertyIds || []).map(String));
+  const estates = (forecast.estates || []).filter(e => allow.has(String(e.property_id)));
+  const rain = forecast.rain_next_3h_mm != null ? { h3: forecast.rain_next_3h_mm } : null;
+  return { ...summarizeHorizons(estates, rain), has_rainfall_data: forecast.has_rainfall_data };
+}
+
+module.exports = {
+  scoreProperties, rainfallWindow, buildForecast, buildHorizonForecast,
+  summarizeHorizons, scopeHorizonsToProperties, rainfallWindows, LAGOS,
+};

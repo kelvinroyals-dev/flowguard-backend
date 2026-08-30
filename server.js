@@ -107,6 +107,7 @@ app.use(`${API_PREFIX}/forecast`, require('./routes/forecast'));
 app.use(`${API_PREFIX}/ai`, require('./routes/ai'));
 app.use(`${API_PREFIX}/meta`, require('./routes/meta'));
 app.use(`${API_PREFIX}/client-team`, require('./routes/clientTeam'));
+app.use(`${API_PREFIX}/client-forecast`, require('./routes/clientForecast'));
 app.use(`${API_PREFIX}`, require('./routes/account'));
 
 // ── 404 ──────────────────────────────────────────────────
