@@ -4,6 +4,7 @@ const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { isClient } = require('../utils/scope');
 const { scoreProperties } = require('../utils/riskForecast');
+const { computeInterventionEffects } = require('../utils/interventions');
 const router = express.Router();
 
 // Company-wide revenue/MRR and every client's map location — ops only.
@@ -130,6 +131,19 @@ router.get('/map-data', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('GET /analytics/map-data', err);
     res.status(500).json({ success: false, error: 'Failed to load map data' });
+  }
+});
+
+// GET /analytics/interventions?days=180&window=7 — does maintenance reduce risk?
+router.get('/interventions', async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 180, 30), 365);
+    const windowDays = Math.min(Math.max(parseInt(req.query.window, 10) || 7, 1), 30);
+    const data = await computeInterventionEffects({ days, windowDays });
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('GET /analytics/interventions', err);
+    res.status(500).json({ success: false, error: 'Failed to compute intervention effects' });
   }
 });
 
