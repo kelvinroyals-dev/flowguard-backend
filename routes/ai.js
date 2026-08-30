@@ -6,7 +6,7 @@ const express = require('express');
 const { authenticateToken } = require('../middleware/auth');
 const { isClient } = require('../utils/scope');
 const { buildHorizonForecast } = require('../utils/riskForecast');
-const { askClaude, hasKey, MODEL } = require('../utils/claude');
+const { askLLM, hasKey, MODEL, PROVIDER } = require('../utils/llm');
 
 const router = express.Router();
 router.use(authenticateToken);
@@ -65,9 +65,9 @@ router.post('/brief', async (req, res) => {
       userPrompt = 'Write a 2–4 sentence risk briefing for this single estate: the risk level and trajectory, the main drivers, and the recommended action. Data:\n' + JSON.stringify(est);
     }
 
-    const ai = await askClaude({ system: SYSTEM, user: userPrompt, maxTokens: wantPortfolio ? 800 : 400 });
+    const ai = await askLLM({ system: SYSTEM, user: userPrompt, maxTokens: wantPortfolio ? 800 : 400 });
     if (ai.ok) {
-      return res.json({ success: true, data: { ai: true, model: ai.model, briefing: ai.text, structured } });
+      return res.json({ success: true, data: { ai: true, provider: ai.provider, model: ai.model, briefing: ai.text, structured } });
     }
     // Graceful: template briefing + a note about why the LLM didn't run.
     return res.json({
@@ -85,9 +85,9 @@ router.post('/brief', async (req, res) => {
   }
 });
 
-// GET /ai/status — is the Claude layer configured?
+// GET /ai/status — is the LLM layer configured, and with which provider?
 router.get('/status', (req, res) => {
-  res.json({ success: true, data: { llm_enabled: hasKey(), model: hasKey() ? MODEL : null } });
+  res.json({ success: true, data: { llm_enabled: hasKey(), provider: PROVIDER, model: hasKey() ? MODEL : null } });
 });
 
 module.exports = router;
