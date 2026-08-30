@@ -3,10 +3,12 @@
 // the real numbers as an operational briefing. Falls back to a deterministic
 // template when no LLM key is set or the provider errors. Ops sees ALL estates.
 const express = require('express');
+const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { isClient } = require('../utils/scope');
 const { buildHorizonForecast } = require('../utils/riskForecast');
 const { generateBrief } = require('../utils/briefing');
+const { runOnce } = require('../utils/dailyBrief');
 const { hasKey, MODEL, PROVIDER } = require('../utils/llm');
 
 const router = express.Router();
@@ -30,6 +32,35 @@ router.post('/brief', async (req, res) => {
   } catch (err) {
     console.error('POST /ai/brief', err);
     res.status(500).json({ success: false, error: 'Failed to build briefing' });
+  }
+});
+
+// GET /ai/daily — the latest stored ops portfolio briefing (from the morning job).
+router.get('/daily', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT generated_at, ai, provider, model, briefing, portfolio, structured
+         FROM daily_briefings WHERE scope='ops_portfolio'
+        ORDER BY generated_at DESC LIMIT 1`);
+    res.json({ success: true, data: rows[0] || null });
+  } catch (err) {
+    console.error('GET /ai/daily', err);
+    res.status(500).json({ success: false, error: 'Failed to load daily briefing' });
+  }
+});
+
+// POST /ai/daily/run — regenerate now (ops-only; useful for testing / on demand).
+router.post('/daily/run', async (req, res) => {
+  try {
+    await runOnce();
+    const { rows } = await pool.query(
+      `SELECT generated_at, ai, provider, model, briefing, portfolio, structured
+         FROM daily_briefings WHERE scope='ops_portfolio'
+        ORDER BY generated_at DESC LIMIT 1`);
+    res.json({ success: true, data: rows[0] || null });
+  } catch (err) {
+    console.error('POST /ai/daily/run', err);
+    res.status(500).json({ success: false, error: 'Failed to generate briefings' });
   }
 });
 

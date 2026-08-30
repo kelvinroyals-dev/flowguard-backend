@@ -69,6 +69,20 @@ router.post('/brief', async (req, res) => {
   }
 });
 
+// GET /client-forecast/daily — the latest stored morning briefing for this org.
+router.get('/daily', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT generated_at, ai, provider, model, briefing, portfolio
+         FROM daily_briefings WHERE scope='client' AND owner_id=$1
+        ORDER BY generated_at DESC LIMIT 1`, [ownerIdOf(req.user)]);
+    res.json({ success: true, data: rows[0] || null });
+  } catch (err) {
+    console.error('GET /client-forecast/daily', err);
+    res.status(500).json({ success: false, error: 'Failed to load daily briefing' });
+  }
+});
+
 // GET /client-forecast/status — whether AI briefings are live (for FE labelling).
 router.get('/status', (req, res) => {
   res.json({ success: true, data: { llm_enabled: hasKey(), provider: PROVIDER, model: hasKey() ? MODEL : null } });

@@ -123,6 +123,7 @@ app.use((err, _req, res, _next) => {
 
 require('./utils/health').startDailySnapshots();
 require('./utils/incidents').startIncidentWatch();
+require('./utils/dailyBrief').startDailyBriefings();
 
 server.listen(PORT, () => {
   console.log(`✅ FlowGuard API listening on port ${PORT}`);
