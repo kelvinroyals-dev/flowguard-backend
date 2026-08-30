@@ -74,7 +74,9 @@ router.post('/brief', async (req, res) => {
       success: true,
       data: {
         ai: false,
-        reason: ai.reason,                       // 'no_key' until ANTHROPIC_API_KEY is set
+        reason: ai.reason,                       // 'no_key' | 'api_error' | 'network'
+        status: ai.status || null,               // HTTP status from the provider (e.g. 404 model_not_found)
+        detail: ai.detail || null,
         briefing: fallback,
         structured,
       },

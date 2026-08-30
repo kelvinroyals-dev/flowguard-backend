@@ -16,7 +16,7 @@
 
 const PROVIDERS = {
   // OpenAI-compatible chat/completions
-  groq:       { mode: 'openai', base: 'https://api.groq.com/openai/v1',            model: 'llama-3.3-70b-versatile' },
+  groq:       { mode: 'openai', base: 'https://api.groq.com/openai/v1',            model: 'openai/gpt-oss-20b' },
   openrouter: { mode: 'openai', base: 'https://openrouter.ai/api/v1',              model: 'meta-llama/llama-3.3-70b-instruct:free' },
   gemini:     { mode: 'openai', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash' },
   // Anthropic messages API
