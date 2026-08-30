@@ -4,7 +4,7 @@
 const express = require('express');
 const { authenticateToken } = require('../middleware/auth');
 const { isClient } = require('../utils/scope');
-const { buildForecast } = require('../utils/riskForecast');
+const { buildForecast, buildHorizonForecast } = require('../utils/riskForecast');
 const router = express.Router();
 
 router.use(authenticateToken);
@@ -28,6 +28,18 @@ router.get('/', async (req, res) => {
   } catch (err) {
     console.error('GET /forecast', err);
     res.status(500).json({ success: false, error: 'Failed to build risk forecast' });
+  }
+});
+
+// GET /forecast/horizons — per-estate now/+1h/+3h/+6h trajectory, critical
+// window, rise-rate/silt drivers, blockage anomalies, and portfolio triage.
+router.get('/horizons', async (req, res) => {
+  try {
+    const data = await buildHorizonForecast();
+    res.json({ success: true, data });
+  } catch (err) {
+    console.error('GET /forecast/horizons', err);
+    res.status(500).json({ success: false, error: 'Failed to build horizon forecast' });
   }
 });
 

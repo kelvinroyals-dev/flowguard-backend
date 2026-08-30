@@ -15,6 +15,7 @@
    ══════════════════════════════════════════════════════════════ */
 
 const pool = require('../config/database');
+const { computeFeatures } = require('./features');
 
 const LAGOS = { lat: 6.45, lon: 3.47 };   // same point the dashboard's rainfall chart already uses
 const CURRENT_WEIGHT = 0.55;
@@ -241,4 +242,104 @@ async function buildForecast(startHour, endHour) {
   };
 }
 
-module.exports = { scoreProperties, rainfallWindow, buildForecast, LAGOS };
+// ── Multi-horizon forecast (now / +1h / +3h / +6h) ────────────────────
+// Additive model so "now" ≈ current risk and future horizons rise with
+// forecast rainfall and water-level momentum (rate of rise). Still rule-based
+// and explainable — every horizon and driver is derived from real figures.
+async function rainfallWindows() {
+  const rain = await rainfallWindow(0, 6);   // hourly precipitation for the next 6h
+  if (!rain) return null;
+  const cum = h => rain.slice(0, h).reduce((s, x) => s + (x.mm || 0), 0);
+  return { h1: cum(1), h3: cum(3), h6: cum(6), series: rain };
+}
+
+async function buildHorizonForecast() {
+  const [properties, feats, rain] = await Promise.all([
+    scoreProperties(), computeFeatures(), rainfallWindows(),
+  ]);
+  const cum = h => rain ? (h === 1 ? rain.h1 : h === 3 ? rain.h3 : rain.h6) : 0;
+
+  const estates = properties.map(e => {
+    const f = feats.get(e.property_id) || {};
+    const base = e.current_risk;
+    const rise = f.rise_rate_pph != null ? f.rise_rate_pph : 0;
+
+    function predict(h) {
+      const rainAdd = Math.round(Math.min(100, cum(h) * RAIN_TO_SCORE) * RAIN_WEIGHT);
+      const momentum = Math.round(Math.max(0, rise) * h * 0.6);              // rising water keeps pushing risk up
+      const relief = (rise < 0 && cum(h) < 3) ? Math.round(Math.min(-rise * h * 0.4, 8)) : 0;  // falling + dry = improving
+      return Math.max(0, Math.min(100, base + rainAdd + momentum - relief));
+    }
+    const horizons = { now: Math.round(base), h1: predict(1), h3: predict(3), h6: predict(6) };
+    const peak = Math.max(horizons.now, horizons.h1, horizons.h3, horizons.h6);
+    const delta = horizons.h3 - horizons.now;
+
+    let critical = null;
+    for (const h of [1, 3, 6]) {
+      if (predict(h) >= 80) {
+        const at = new Date(Date.now() + h * 3600e3);
+        critical = { in_hours: h, at: at.toISOString(), label: at.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Lagos' }) };
+        break;
+      }
+    }
+    if (!critical && horizons.now >= 80) critical = { in_hours: 0, at: new Date().toISOString(), label: 'now' };
+
+    // Blockage anomaly: water rising fast with little/no rain -> downstream restriction.
+    const onsiteRain = f.rain_onsite_1h != null ? f.rain_onsite_1h : 0;
+    const anomaly = (rise >= 6 && onsiteRain < 2 && cum(1) < 2)
+      ? { type: 'blockage_suspected', note: `Water rising ${rise}%/hr with little rain — possible blockage or downstream restriction.` }
+      : null;
+
+    const drivers = [];
+    const rainAdd3 = Math.round(Math.min(100, cum(3) * RAIN_TO_SCORE) * RAIN_WEIGHT);
+    if (rainAdd3 > 0) drivers.push({ label: `Rainfall forecast (${Math.round(cum(3))}mm / 3h)`, delta: rainAdd3, dir: 'up' });
+    if (rise >= 2) drivers.push({ label: `Water level rising ${rise}%/hr`, delta: Math.round(rise * 1.8), dir: 'up' });
+    if (f.silt_now != null && f.silt_now >= 50) drivers.push({ label: `Silt at ${Math.round(f.silt_now)}mm${(f.silt_change_30d || 0) > 5 ? ` (up ${Math.round(f.silt_change_30d)}mm/30d)` : ''}`, delta: 9, dir: 'up' });
+    (e.env_contributors || []).forEach(c => drivers.push(c));
+    if (anomaly) drivers.unshift({ label: 'Rising with no rain — blockage suspected', delta: 14, dir: 'up' });
+    drivers.sort((a, b) => (b.delta || 0) - (a.delta || 0));
+
+    let rec;
+    if (anomaly) rec = { text: 'Investigate blockage / downstream restriction', level: 'critical' };
+    else if (f.silt_now != null && f.silt_now >= 60 && cum(3) >= 12) rec = { text: 'Prioritise desilting before the rainfall event', level: 'warning' };
+    else rec = recommendationFor(horizons.h3, delta);
+
+    const { confidence, sources } = confidenceFor(e, !!rain);
+    return {
+      property_id: e.property_id, name: e.name, client_name: e.client_name,
+      latitude: e.latitude, longitude: e.longitude, located: e.located, has_live: e.has_live,
+      current_risk: horizons.now, horizons, peak_risk: peak, delta,
+      critical_window: critical, anomaly,
+      drivers: drivers.slice(0, 6),
+      recommendation: rec.text, recommendation_level: rec.level,
+      confidence, confidence_sources: sources,
+      features: {
+        level_now: f.level_now, rise_rate_pph: f.rise_rate_pph,
+        silt_now: f.silt_now, net_flow: f.net_flow, rain_onsite_1h: f.rain_onsite_1h,
+      },
+    };
+  }).sort((a, b) => b.peak_risk - a.peak_risk);
+
+  const critical_now = estates.filter(e => e.horizons.now >= 80);
+  const entering_high = estates.filter(e => e.horizons.now < 70 && e.horizons.h3 >= 70);
+  const preventive = estates.filter(e => e.horizons.now < 60 && e.horizons.h6 >= 60 && e.horizons.h6 < 80);
+  const anomalies = estates.filter(e => e.anomaly);
+
+  return {
+    method: `Horizon projection (now / +1h / +3h / +6h): current risk + forecast rainfall (${Math.round(RAIN_WEIGHT * 100)}% weight) + water-level momentum. Rule-based, not a trained model.`,
+    has_rainfall_data: !!rain,
+    rain_next_3h_mm: rain ? Math.round(rain.h3 * 10) / 10 : null,
+    generated_at: new Date().toISOString(),
+    portfolio: {
+      total: estates.length,
+      critical_now: critical_now.length,
+      entering_high_3h: entering_high.length,
+      preventive_recommended: preventive.length,
+      anomalies: anomalies.length,
+      needs_action_today: critical_now.length + entering_high.length,
+    },
+    estates,
+  };
+}
+
+module.exports = { scoreProperties, rainfallWindow, buildForecast, buildHorizonForecast, rainfallWindows, LAGOS };
