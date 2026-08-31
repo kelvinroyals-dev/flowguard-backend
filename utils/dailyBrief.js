@@ -9,8 +9,28 @@ const pool = require('../config/database');
 const { buildHorizonForecast, scopeHorizonsToProperties } = require('./riskForecast');
 const { generateBrief } = require('./briefing');
 const { propertyIdsForUser } = require('./scope');
+const mailer = require('./mailer');
 
 const RUN_HOUR_LAGOS = 6;   // 06:00 West Africa Time (UTC+1, no DST)
+
+// Email delivery is opt-in via env so we never surprise real inboxes:
+//   BRIEF_EMAIL_TO       comma-separated ops recipients for the portfolio brief
+//   BRIEF_EMAIL_CLIENTS  'true' to also email each client owner their own brief
+const OPS_RECIPIENTS = (process.env.BRIEF_EMAIL_TO || '').split(',').map(s => s.trim()).filter(Boolean);
+const EMAIL_CLIENTS = String(process.env.BRIEF_EMAIL_CLIENTS || '').toLowerCase() === 'true';
+
+// Render a stored briefing as a branded HTML email and send it.
+async function emailBrief(to, subject, out, portfolio) {
+  if (!to || (Array.isArray(to) && !to.length)) return;
+  const p = portfolio || {};
+  const triage = `${p.total ?? 0} estates · ${p.critical_now ?? 0} critical now · ${p.entering_high_3h ?? 0} entering high (3h) · ${p.anomalies ?? 0} anomalies`;
+  const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const paras = String(out.briefing || '').split('\n').filter(Boolean)
+    .map(line => `<p style="margin:0 0 12px;font-size:14px;color:#4a626d;line-height:1.6;">${esc(line)}</p>`).join('');
+  const body = `<p style="margin:0 0 14px;font-size:13px;color:#8399a4;">${esc(triage)}</p>${paras}`;
+  try { await mailer.sendEmail({ to, subject, html: mailer.shell(subject, body) }); }
+  catch (e) { console.error('[dailyBrief] email failed:', e.message); }
+}
 
 async function persist({ scope, ownerId, out, portfolio }) {
   await pool.query(
@@ -33,13 +53,14 @@ async function runOnce() {
   try {
     const out = await generateBrief({ forecast, scope: 'portfolio' });
     await persist({ scope: 'ops_portfolio', ownerId: null, out, portfolio: forecast.portfolio });
+    if (OPS_RECIPIENTS.length) await emailBrief(OPS_RECIPIENTS, 'FlowGuard — morning risk briefing', out, forecast.portfolio);
   } catch (err) { console.error('[dailyBrief] ops portfolio failed:', err.message); }
 
   // 2) Per client account owner, scoped to their own estates.
   let owners = [];
   try {
     const { rows } = await pool.query(
-      `SELECT id FROM users
+      `SELECT id, email, full_name FROM users
         WHERE user_type='client' AND account_owner_id IS NULL AND COALESCE(is_active, true) = true`);
     owners = rows;
   } catch (err) { console.error('[dailyBrief] owner list failed:', err.message); }
@@ -53,6 +74,7 @@ async function runOnce() {
       if (!scoped.estates.length) continue;
       const out = await generateBrief({ forecast: scoped, scope: 'portfolio' });
       await persist({ scope: 'client', ownerId: o.id, out, portfolio: scoped.portfolio });
+      if (EMAIL_CLIENTS && o.email) await emailBrief(o.email, 'Your FlowGuard morning risk briefing', out, scoped.portfolio);
       clientCount++;
     } catch (err) { console.error(`[dailyBrief] client ${o.id} failed:`, err.message); }
   }
