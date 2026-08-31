@@ -79,7 +79,18 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 FEATURE_COLS = [
     "level_now", "level_change_1h", "rise_rate_pph", "level_avg_6h", "level_max_6h",
     "silt_now", "silt_avg_24h", "net_flow", "rain_1h", "rain_3h", "rain_6h",
+    "elevation_m", "distance_to_water_m",
 ]
+
+# Static terrain signals per estate (GIS enrichment, backfill-gis.js).
+GIS_SQL = """
+SELECT COALESCE(parent_property_id, property_id) AS estate_id,
+       AVG(elevation_m) AS elevation_m,
+       MIN(distance_to_water_m) AS distance_to_water_m
+  FROM properties
+ WHERE elevation_m IS NOT NULL OR distance_to_water_m IS NOT NULL
+ GROUP BY COALESCE(parent_property_id, property_id)
+"""
 
 
 def attach_labels(df: pd.DataFrame, labels: pd.DataFrame, horizon_h: int) -> pd.DataFrame:
@@ -115,6 +126,14 @@ def main():
     frame = build_features(frame)
     labels = query_df(LABELS_SQL, {"days": str(args.days)})
     frame = attach_labels(frame, labels, args.horizon)
+
+    # Merge static terrain signals (elevation, distance to water) per estate.
+    gis = query_df(GIS_SQL)
+    if not gis.empty:
+        frame = frame.merge(gis, on="estate_id", how="left")
+    for col in ("elevation_m", "distance_to_water_m"):
+        if col not in frame.columns:
+            frame[col] = np.nan
 
     # Sample at cadence; drop rows without a usable level reading.
     frame = frame.dropna(subset=["level_now"])

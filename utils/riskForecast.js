@@ -67,6 +67,22 @@ function envScore(p) {
   const alerts = parseInt(p.open_alerts) || 0;
   if (alerts > 0) { const a = Math.min(18, alerts * 8); s += a; c.push({ label: `${alerts} open incident${alerts === 1 ? '' : 's'}`, delta: a, dir: 'up' }); }
 
+  // Terrain (GIS). Low-lying ground and proximity to a water body both raise
+  // flood exposure; higher ground and distance lower it. Only applied when the
+  // property has been enriched (scripts/backfill-gis.js).
+  const elev = p.elevation_m != null ? Number(p.elevation_m) : null;
+  if (elev != null) {
+    if (elev <= 3) { s += 12; c.push({ label: `Very low-lying (${elev.toFixed(0)}m elevation)`, delta: 12, dir: 'up' }); }
+    else if (elev <= 8) { s += 7; c.push({ label: `Low-lying (${elev.toFixed(0)}m elevation)`, delta: 7, dir: 'up' }); }
+    else if (elev >= 30) { s -= 6; c.push({ label: `Elevated ground (${elev.toFixed(0)}m)`, delta: 6, dir: 'down' }); }
+  }
+  const dist = p.distance_to_water_m != null ? Number(p.distance_to_water_m) : null;
+  if (dist != null) {
+    if (dist <= 150) { s += 12; c.push({ label: `Beside water (~${Math.round(dist)}m)`, delta: 12, dir: 'up' }); }
+    else if (dist <= 500) { s += 7; c.push({ label: `Near water (~${Math.round(dist)}m)`, delta: 7, dir: 'up' }); }
+    else if (dist >= 3000) { s -= 4; c.push({ label: 'Well away from open water', delta: 4, dir: 'down' }); }
+  }
+
   return { score: Math.max(0, Math.min(100, Math.round(s))), contributors: c };
 }
 
@@ -74,6 +90,7 @@ async function scoreProperties() {
   const { rows } = await pool.query(`
     SELECT p.property_id, COALESCE(p.asset_code, p.property_name) AS name, p.property_name,
            p.latitude, p.longitude, p.location_verified, p.geocode_source,
+           p.elevation_m, p.distance_to_water_m,
            p.health_score, p.risk_level, p.user_id, p.last_inspected_at,
            u.full_name AS client_name,
            live.peak_level, live.avg_level, live.sensor_count, live.latest_reading,
