@@ -201,14 +201,30 @@ router.put('/:ticketId/support-status', authenticateToken, requirePermission('su
 router.get('/:ticketId', authenticateToken, async (req, res) => {
   try {
     if (!(await assertTicketAccess(req, res, req.params.ticketId))) return;
-    const { rows } = await pool.query('SELECT * FROM tickets WHERE ticket_id = $1', [req.params.ticketId]);
+    const { rows } = await pool.query(
+      `SELECT t.*, u.email AS creator_email, u.full_name AS creator_name
+         FROM tickets t LEFT JOIN users u ON u.id = t.user_id
+        WHERE t.ticket_id = $1`, [req.params.ticketId]);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'Ticket not found' });
+    const t = rows[0];
     let messages = [];
     try {
       const m = await pool.query('SELECT author_type, author_name, message, created_at FROM ticket_messages WHERE ticket_id = $1 ORDER BY created_at ASC', [req.params.ticketId]);
       messages = m.rows;
     } catch (_) { /* table may not exist yet */ }
-    res.json({ success: true, data: { ...shape(rows[0]), messages } });
+    // The client's original request is the ticket's own description — surface it
+    // as the first entry in the thread so the conversation always opens with the
+    // request itself, not the first support reply.
+    if (t.description && t.description.trim()) {
+      messages = [{
+        author_type: 'client',
+        author_name: t.creator_email || t.created_by || 'Client',
+        author_email: t.creator_email || t.created_by || null,
+        message: t.description,
+        created_at: t.created_at,
+      }, ...messages];
+    }
+    res.json({ success: true, data: { ...shape(t), messages } });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to load ticket' });
   }
