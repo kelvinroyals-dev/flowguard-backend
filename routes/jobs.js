@@ -61,6 +61,21 @@ async function notifySpoMembers(orgId, opts) {
   } catch (e) { console.error('[notifySpo] failed:', e.message); }
 }
 
+// Dispatching a job for a property implies that provider may operate on it.
+// Upsert the tenancy assignment so the SP's Properties view stays in sync and
+// property-scoped reads have a row to key off. Best-effort — never block dispatch.
+async function ensureAssignment(orgId, propertyId, staffId) {
+  if (!orgId || !propertyId) return;
+  try {
+    await pool.query(
+      `INSERT INTO service_provider_property_assignments (service_provider_org_id, property_id, assigned_by, active)
+       VALUES ($1,$2,$3,TRUE)
+       ON CONFLICT (service_provider_org_id, property_id)
+       DO UPDATE SET active = TRUE, assigned_by = EXCLUDED.assigned_by, assigned_at = NOW()`,
+      [orgId, propertyId, staffId || null]);
+  } catch (e) { console.error('[ensureAssignment] failed:', e.message); }
+}
+
 // Load a job and enforce tenancy. Returns the row or sends a 403/404 and returns null.
 async function loadJob(req, res, id) {
   const jid = parseInt(id, 10);
@@ -194,6 +209,7 @@ router.post('/', requireStaff, async (req, res) => {
 
     await logEvent(job.id, req, { event_type: 'created', to_status: status, note: b.title });
     if (orgId) {
+      await ensureAssignment(orgId, job.property_id, req.user.id);
       await logEvent(job.id, req, { event_type: 'dispatched', from_status: 'draft', to_status: 'dispatched' });
       notifySpoMembers(orgId, { type: 'info', title: 'New job dispatched to you',
         message: `${job.reference} — ${job.title}`, link: '#jobs/' + job.id });
@@ -222,6 +238,7 @@ router.post('/:id/dispatch', requireStaff, async (req, res) => {
               sla_due_at = COALESCE($3, sla_due_at), scheduled_for = COALESCE($4, scheduled_for), updated_at = NOW()
         WHERE id = $1 RETURNING *`,
       [job.id, orgId, b.sla_due_at || null, b.scheduled_for || null]);
+    await ensureAssignment(orgId, job.property_id, req.user.id);
     await logEvent(job.id, req, { event_type: 'dispatched', from_status: job.status, to_status: 'dispatched', meta: { org: orgId } });
     notifySpoMembers(orgId, { type: 'info', title: 'New job dispatched to you',
       message: `${job.reference} — ${job.title}`, link: '#jobs/' + job.id });
