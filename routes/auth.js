@@ -9,7 +9,8 @@ const router = express.Router();
 
 function signToken(user) {
   return jwt.sign(
-    { id: user.id, email: user.email, role: user.role, user_type: user.user_type, tv: user.token_version || 0 },
+    { id: user.id, email: user.email, role: user.role, user_type: user.user_type, tv: user.token_version || 0,
+      spo: user.service_provider_org_id || null, sp_role: user.sp_role || null },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   );
@@ -63,8 +64,22 @@ function publicUser(u) {
     phone: u.phone,
     client_id: u.client_id,
     account_owner_id: u.account_owner_id,
+    service_provider_org_id: u.service_provider_org_id || null,
+    sp_role: u.sp_role || null,
     ...clientRoleInfo(u),   // client_role, client_role_label, is_account_owner, permissions
   };
+}
+
+// For service-provider users, attach their organisation (incl. approval status)
+// so the frontend can decide whether to lock the portal.
+async function attachOrg(dataUser) {
+  if (!dataUser || dataUser.user_type !== 'service_provider' || !dataUser.service_provider_org_id) return null;
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, name, status, reject_reason, verification_submitted_at FROM service_provider_organisations WHERE id = $1',
+      [dataUser.service_provider_org_id]);
+    return rows[0] || null;
+  } catch (_) { return null; }
 }
 
 
@@ -150,7 +165,9 @@ router.post('/login', async (req, res) => {
       [user.id]);
     await logAuth(addr, 'login_success', req);
     const token = signToken(user);
-    return res.json({ success: true, data: { token, user: publicUser(user) } });
+    const pub = publicUser(user);
+    const organisation = await attachOrg(pub);
+    return res.json({ success: true, data: { token, user: pub, ...(organisation ? { organisation } : {}) } });
   } catch (err) {
     console.error('Login error:', err);
     return res.status(500).json({ success: false, error: 'Login failed' });
@@ -219,7 +236,8 @@ router.post('/register', async (req, res) => {
   const client = await pool.connect();
   try {
     const { firstName, lastName, fullName: fullNameIn, email, phone, password,
-            company, jobTitle, location, plan, marketing, emailVerifyToken } = req.body || {};
+            company, jobTitle, location, plan, marketing, emailVerifyToken,
+            accountType, contactPerson, coverageArea, serviceTypes } = req.body || {};
     const fullName = (fullNameIn && fullNameIn.trim())
       || [firstName, lastName].filter(Boolean).join(' ').trim();
     if (!email || !password || !fullName) {
@@ -245,6 +263,51 @@ router.post('/register', async (req, res) => {
       return res.status(409).json({ success: false, error: 'An account with this email already exists' });
     }
     const hash = await bcrypt.hash(password, 10);
+
+    // ── Service Provider signup: create a PENDING organisation + its owner_admin.
+    // The org is the tenant and the thing that gets approved. No client onboarding. ──
+    if (accountType === 'service_provider') {
+      const orgName = (company && company.trim()) || (fullNameIn && fullNameIn.trim());
+      if (!orgName) return res.status(400).json({ success: false, error: 'Company name is required' });
+      const types = Array.isArray(serviceTypes)
+        ? serviceTypes
+        : (serviceTypes ? String(serviceTypes).split(',').map(s => s.trim()).filter(Boolean) : null);
+      await client.query('BEGIN');
+      const orgRes = await client.query(
+        `INSERT INTO service_provider_organisations
+           (name, contact_person, email, phone, coverage_area, service_types, status)
+         VALUES ($1,$2,$3,$4,$5,$6,'pending') RETURNING *`,
+        [orgName, (contactPerson && contactPerson.trim()) || fullName, cleanEmail, phone || null,
+         (coverageArea && String(coverageArea).trim()) || location || null, types]
+      );
+      const org = orgRes.rows[0];
+      const spRes = await client.query(
+        `INSERT INTO users
+           (email, password_hash, role, user_type, full_name, phone, company, is_active, email_verified, service_provider_org_id, sp_role)
+         VALUES ($1,$2,'service_provider','service_provider',$3,$4,$5,true,$6,$7,'owner_admin') RETURNING *`,
+        [cleanEmail, hash, fullName, phone || null, orgName, emailVerified, org.id]
+      );
+      const spUser = spRes.rows[0];
+      await client.query('COMMIT');
+      const token = signToken(spUser);
+      (async () => {
+        try {
+          const mailer = require('../utils/mailer');
+          if (!spUser.email_verified) {
+            const vt = signVerifyToken(spUser);
+            await mailer.sendVerification(spUser.email, `https://app.flowguard.ng/verify-email.html?token=${vt}`);
+          }
+          const { notifyInternal } = require('../utils/notify');
+          notifyInternal({ type: 'service_provider', title: 'New provider signup (pending review)',
+            message: orgName + ' applied to join as a service provider', link: '#service-providers/' + org.id },
+            { roles: notifyInternal.ADMIN });
+        } catch (e) { console.error('[register:sp] dispatch error:', e.message); }
+      })();
+      return res.status(201).json({ success: true, data: {
+        token, user: publicUser(spUser),
+        organisation: { id: org.id, name: org.name, status: org.status }
+      }});
+    }
 
     // map the signup corridor dropdown to city / state
     const CORRIDORS = {
@@ -341,7 +404,9 @@ router.get('/me', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'User not found' });
-    return res.json({ success: true, data: { user: publicUser(rows[0]) } });
+    const pub = publicUser(rows[0]);
+    const organisation = await attachOrg(pub);
+    return res.json({ success: true, data: { user: pub, ...(organisation ? { organisation } : {}) } });
   } catch (err) {
     return res.status(500).json({ success: false, error: 'Failed to load user' });
   }
