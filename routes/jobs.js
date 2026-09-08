@@ -12,9 +12,31 @@
 // ============================================================================
 const express = require('express');
 const router = express.Router();
+const path = require('path');
+const fs = require('fs');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { notify, notifyInternal } = require('../utils/notify');
+
+const UPLOAD_BASE = process.env.PUBLIC_UPLOAD_BASE || 'https://api.flowguard.ng/uploads';
+const UPLOAD_DIR  = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads');
+const EXT = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','application/pdf':'pdf' };
+
+// Persist a base64 data-URL to disk and return its public URL (or null).
+function saveDataUrl(jobId, dataUrl) {
+  try {
+    const m = /^data:([\w/+.-]+);base64,(.+)$/s.exec(dataUrl || '');
+    if (!m) return null;
+    const ext = EXT[m[1].toLowerCase()]; if (!ext) return null;
+    const buf = Buffer.from(m[2], 'base64');
+    if (buf.length > 12 * 1024 * 1024) return null; // hard cap 12MB
+    const dir = path.join(UPLOAD_DIR, 'jobs', String(jobId));
+    fs.mkdirSync(dir, { recursive: true });
+    const name = Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.' + ext;
+    fs.writeFileSync(path.join(dir, name), buf);
+    return `${UPLOAD_BASE}/jobs/${jobId}/${name}`;
+  } catch (e) { console.error('[saveDataUrl] failed:', e.message); return null; }
+}
 
 router.use(authenticateToken);
 
@@ -378,10 +400,18 @@ router.post('/:id/evidence', requireServiceProvider, async (req, res) => {
   const KINDS = ['photo', 'video', 'document', 'note', 'signature', 'gps'];
   if (!KINDS.includes(b.kind)) return res.status(400).json({ success: false, error: 'Valid evidence kind required' });
   try {
+    // A base64 file (downscaled on the client) takes priority; otherwise fall
+    // back to a pasted URL. Either yields a file_url stored on the row.
+    let fileUrl = b.file_url || null;
+    if (b.file_data) {
+      const saved = saveDataUrl(job.id, b.file_data);
+      if (!saved) return res.status(400).json({ success: false, error: 'Unsupported or oversized file (JP, PNG, WEBP or PDF up to 12MB)' });
+      fileUrl = saved;
+    }
     const { rows } = await pool.query(
       `INSERT INTO job_evidence (job_id, evidence_key, kind, file_url, caption, lat, lng, captured_at, uploaded_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [job.id, b.evidence_key || null, b.kind, b.file_url || null, b.caption || null,
+      [job.id, b.evidence_key || null, b.kind, fileUrl, b.caption || null,
        b.lat != null ? b.lat : null, b.lng != null ? b.lng : null, b.captured_at || null, req.user.id]);
     await logEvent(job.id, req, { event_type: 'evidence_added', meta: { kind: b.kind, key: b.evidence_key || null } });
     return res.status(201).json({ success: true, data: rows[0] });

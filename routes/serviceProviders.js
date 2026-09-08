@@ -3,8 +3,13 @@
 // The ORG is the tenant and the thing that gets approved.
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
+
+const hashToken = t => crypto.createHash('sha256').update(String(t)).digest('hex');
+const SP_ROLES = ['owner_admin', 'supervisor', 'field_technician'];
 
 router.use(authenticateToken);
 
@@ -96,6 +101,98 @@ router.get('/me/properties', requireServiceProvider, async (req, res) => {
   } catch (err) { console.error('GET /me/properties', err); return res.status(500).json({ success: false, error: 'Failed to load properties' }); }
 });
 
+// ── team management (the caller's own organisation) ──────────────────────
+
+// GET /service-providers/me/members
+router.get('/me/members', requireServiceProvider, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, full_name, email, phone, sp_role, is_active, email_verified, created_at
+         FROM users WHERE service_provider_org_id = $1 ORDER BY (sp_role='owner_admin') DESC, full_name`,
+      [req.user.spo]);
+    return res.json({ success: true, data: rows });
+  } catch (err) { console.error('GET /me/members', err); return res.status(500).json({ success: false, error: 'Failed to load team' }); }
+});
+
+// POST /service-providers/me/members  { full_name, email, phone?, sp_role }
+// Creates the member and emails them a set-password link. owner_admin/supervisor only.
+router.post('/me/members', requireServiceProvider, async (req, res) => {
+  if (!['owner_admin', 'supervisor'].includes(req.user.sp_role))
+    return res.status(403).json({ success: false, error: 'Only an admin or supervisor can add members' });
+  const b = req.body || {};
+  const email = (b.email || '').trim().toLowerCase();
+  const fullName = (b.full_name || '').trim();
+  const spRole = SP_ROLES.includes(b.sp_role) ? b.sp_role : 'field_technician';
+  if (!email || !fullName) return res.status(400).json({ success: false, error: 'Name and email are required' });
+  if (spRole === 'owner_admin' && req.user.sp_role !== 'owner_admin')
+    return res.status(403).json({ success: false, error: 'Only an admin can create another admin' });
+  try {
+    const exists = (await pool.query('SELECT id FROM users WHERE LOWER(email) = $1', [email])).rows[0];
+    if (exists) return res.status(409).json({ success: false, error: 'That email is already registered' });
+    const org = (await pool.query('SELECT name FROM service_provider_organisations WHERE id = $1', [req.user.spo])).rows[0];
+
+    // random password now; the member sets their own via the emailed reset link
+    const tmp = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
+    const ins = await pool.query(
+      `INSERT INTO users (email, password_hash, role, user_type, full_name, phone, company,
+                          is_active, email_verified, service_provider_org_id, sp_role)
+       VALUES ($1,$2,'service_provider','service_provider',$3,$4,$5,true,false,$6,$7)
+       RETURNING id, full_name, email, phone, sp_role, is_active, email_verified, created_at`,
+      [email, tmp, fullName, b.phone || null, (org && org.name) || null, req.user.spo, spRole]);
+    const member = ins.rows[0];
+
+    // set-password link (reuse the reset-token mechanism)
+    const token = crypto.randomBytes(32).toString('hex');
+    await pool.query('UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
+      [hashToken(token), new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), member.id]);
+    (async () => {
+      try {
+        const mailer = require('../utils/mailer');
+        const url = `https://app.flowguard.ng/reset-password.html?token=${token}`;
+        await mailer.sendEmail({ to: email,
+          subject: `You've been added to ${(org && org.name) || 'a FlowGuard provider'} on FlowGuard`,
+          html: `<p>Hi ${fullName.split(' ')[0]},</p><p>${req.user.email} added you to <b>${(org && org.name) || 'their team'}</b> as a ${spRole.replace('_',' ')} on FlowGuard.</p>`
+              + `<p><a href="${url}">Set your password</a> to sign in to the provider portal. This link is valid for 7 days.</p>` });
+      } catch (e) { console.error('[member invite] mail', e.message); }
+    })();
+    return res.status(201).json({ success: true, data: member });
+  } catch (err) { console.error('POST /me/members', err); return res.status(500).json({ success: false, error: 'Failed to add member' }); }
+});
+
+// PUT /service-providers/me/members/:id  { sp_role?, is_active? }  owner_admin only
+router.put('/me/members/:id', requireServiceProvider, requireOrgAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: 'Invalid id' });
+  if (id === req.user.id) return res.status(400).json({ success: false, error: "You can't change your own role or status" });
+  const b = req.body || {};
+  try {
+    const target = (await pool.query('SELECT id, sp_role FROM users WHERE id = $1 AND service_provider_org_id = $2', [id, req.user.spo])).rows[0];
+    if (!target) return res.status(404).json({ success: false, error: 'Member not found in your organisation' });
+    const spRole = b.sp_role && SP_ROLES.includes(b.sp_role) ? b.sp_role : null;
+    const active = typeof b.is_active === 'boolean' ? b.is_active : null;
+    const { rows } = await pool.query(
+      `UPDATE users SET sp_role = COALESCE($2, sp_role), is_active = COALESCE($3, is_active),
+              token_version = token_version + CASE WHEN $3 = false THEN 1 ELSE 0 END, updated_at = NOW()
+        WHERE id = $1 RETURNING id, full_name, email, phone, sp_role, is_active, email_verified`,
+      [id, spRole, active]);
+    return res.json({ success: true, data: rows[0] });
+  } catch (err) { console.error('PUT /me/members/:id', err); return res.status(500).json({ success: false, error: 'Failed to update member' }); }
+});
+
+// DELETE /service-providers/me/members/:id  → deactivate (owner_admin only)
+router.delete('/me/members/:id', requireServiceProvider, requireOrgAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: 'Invalid id' });
+  if (id === req.user.id) return res.status(400).json({ success: false, error: "You can't remove yourself" });
+  try {
+    const r = await pool.query(
+      `UPDATE users SET is_active = false, token_version = token_version + 1, updated_at = NOW()
+        WHERE id = $1 AND service_provider_org_id = $2 RETURNING id`, [id, req.user.spo]);
+    if (!r.rows[0]) return res.status(404).json({ success: false, error: 'Member not found' });
+    return res.json({ success: true });
+  } catch (err) { console.error('DELETE /me/members/:id', err); return res.status(500).json({ success: false, error: 'Failed to remove member' }); }
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 //  FLOWGUARD OPS — review & approval (staff only)
 // ─────────────────────────────────────────────────────────────────────────
@@ -122,7 +219,22 @@ router.get('/:id', requireStaff, async (req, res) => {
     if (!org) return res.status(404).json({ success: false, error: 'Not found' });
     const members = (await pool.query(
       'SELECT id, full_name, email, phone, sp_role, is_active FROM users WHERE service_provider_org_id = $1 ORDER BY id', [id])).rows;
-    return res.json({ success: true, data: { ...org, members } });
+    // performance: counts by state + on-time rate + avg accept/complete durations
+    const stats = (await pool.query(
+      `SELECT
+         COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE status IN ('dispatched','accepted','en_route','in_progress'))::int AS open,
+         COUNT(*) FILTER (WHERE status = 'completed')::int AS awaiting,
+         COUNT(*) FILTER (WHERE status = 'verified')::int AS verified,
+         COUNT(*) FILTER (WHERE status = 'declined')::int AS declined,
+         COUNT(*) FILTER (WHERE status IN ('dispatched','accepted','en_route','in_progress')
+                          AND sla_due_at IS NOT NULL AND sla_due_at < NOW())::int AS overdue,
+         COUNT(*) FILTER (WHERE completed_at IS NOT NULL AND sla_due_at IS NOT NULL AND completed_at <= sla_due_at)::int AS on_time,
+         COUNT(*) FILTER (WHERE completed_at IS NOT NULL AND sla_due_at IS NOT NULL)::int AS with_sla,
+         ROUND(AVG(EXTRACT(EPOCH FROM (accepted_at - dispatched_at))/3600.0) FILTER (WHERE accepted_at IS NOT NULL AND dispatched_at IS NOT NULL)::numeric, 1) AS avg_accept_hrs,
+         ROUND(AVG(EXTRACT(EPOCH FROM (completed_at - started_at))/3600.0) FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL)::numeric, 1) AS avg_work_hrs
+       FROM jobs WHERE service_provider_org_id = $1`, [id])).rows[0];
+    return res.json({ success: true, data: { ...org, members, stats } });
   } catch (err) { console.error('GET /service-providers/:id', err); return res.status(500).json({ success: false, error: 'Failed to load provider' }); }
 });
 

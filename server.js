@@ -51,8 +51,25 @@ app.use(cors({
   maxAge: 86400, // cache CORS preflight for 24h — kills repeat OPTIONS round-trips
 }));
 
+// Evidence uploads carry a downscaled base64 image, so they need a larger body
+// than the tiny global default — but ONLY that one endpoint, not everything.
+const _bigJson = express.json({ limit: '15mb' });
+app.use((req, res, next) => {
+  if (req.method === 'POST' && /\/jobs\/\d+\/evidence$/.test(req.path)) return _bigJson(req, res, next);
+  next();
+});
 app.use(express.json({ limit: '1mb' }));   // telemetry payloads are tiny; 5mb was an invitation
 app.use(express.urlencoded({ extended: true }));
+
+// ── Uploaded evidence (job photos/documents) ─────────────
+// Stored on disk under UPLOAD_DIR and served read-only at /uploads. Field crews
+// upload downscaled images as base64 through the jobs route (which sets its own
+// larger body limit); this just serves the resulting files back.
+const path = require('path');
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
+require('fs').mkdirSync(UPLOAD_DIR, { recursive: true });
+app.set('uploadDir', UPLOAD_DIR);
+app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '30d', immutable: true }));
 
 // ── Request log (light) ──────────────────────────────────
 app.use((req, _res, next) => {
