@@ -33,7 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_spo_status ON service_provider_organisations(stat
 CREATE TABLE IF NOT EXISTS service_provider_property_assignments (
   id                      SERIAL PRIMARY KEY,
   service_provider_org_id INTEGER NOT NULL REFERENCES service_provider_organisations(id) ON DELETE CASCADE,
-  property_id             INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+  property_id             VARCHAR(50) NOT NULL REFERENCES properties(property_id) ON DELETE CASCADE,
   assigned_by             INTEGER REFERENCES users(id),
   assigned_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   active                  BOOLEAN NOT NULL DEFAULT TRUE,

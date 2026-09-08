@@ -111,6 +111,7 @@ app.use(`${API_PREFIX}/client-forecast`, require('./routes/clientForecast'));
 app.use(`${API_PREFIX}/labels`, require('./routes/labels'));
 app.use(`${API_PREFIX}/network`, require('./routes/network'));
 app.use(`${API_PREFIX}/service-providers`, require('./routes/serviceProviders'));
+app.use(`${API_PREFIX}/jobs`, require('./routes/jobs'));
 app.use(`${API_PREFIX}`, require('./routes/account'));
 
 // ── 404 ──────────────────────────────────────────────────
