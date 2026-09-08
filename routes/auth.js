@@ -76,7 +76,9 @@ async function attachOrg(dataUser) {
   if (!dataUser || dataUser.user_type !== 'service_provider' || !dataUser.service_provider_org_id) return null;
   try {
     const { rows } = await pool.query(
-      'SELECT id, name, status, reject_reason, verification_submitted_at FROM service_provider_organisations WHERE id = $1',
+      `SELECT id, name, contact_person, email, phone, coverage_area, service_types,
+              status, reject_reason, reject_note, verification_submitted_at, approved_at, created_at
+         FROM service_provider_organisations WHERE id = $1`,
       [dataUser.service_provider_org_id]);
     return rows[0] || null;
   } catch (_) { return null; }

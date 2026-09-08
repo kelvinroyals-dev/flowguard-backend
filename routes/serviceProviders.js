@@ -31,6 +31,12 @@ const requireStaff = [requireRole('admin', 'super_admin', 'operations_manager', 
   (req, res, next) => (req.user.user_type === 'internal'
     ? next()
     : res.status(403).json({ success: false, error: 'Staff only' }))];
+// Read-only staff (adds dispatcher): dispatchers run the Jobs tab and need to
+// read the active-provider list to dispatch, but not approve/reject/assign.
+const requireStaffRead = [requireRole('admin', 'super_admin', 'operations_manager', 'operations', 'dispatcher'),
+  (req, res, next) => (req.user.user_type === 'internal'
+    ? next()
+    : res.status(403).json({ success: false, error: 'Staff only' }))];
 
 const REJECT_REASONS = {
   incomplete_info:     'Incomplete information',
@@ -197,8 +203,8 @@ router.delete('/me/members/:id', requireServiceProvider, requireOrgAdmin, async 
 //  FLOWGUARD OPS — review & approval (staff only)
 // ─────────────────────────────────────────────────────────────────────────
 
-// GET /service-providers?status=pending  → list orgs for review
-router.get('/', requireStaff, async (req, res) => {
+// GET /service-providers?status=pending  → list orgs for review (dispatchers can read for dispatch)
+router.get('/', requireStaffRead, async (req, res) => {
   try {
     const status = req.query.status;
     const params = []; let where = '';
