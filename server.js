@@ -62,14 +62,13 @@ app.use(express.json({ limit: '1mb' }));   // telemetry payloads are tiny; 5mb w
 app.use(express.urlencoded({ extended: true }));
 
 // ── Uploaded evidence (job photos/documents) ─────────────
-// Stored on disk under UPLOAD_DIR and served read-only at /uploads. Field crews
-// upload downscaled images as base64 through the jobs route (which sets its own
-// larger body limit); this just serves the resulting files back.
+// Stored on disk under UPLOAD_DIR. NOT served via public static — evidence is
+// access-controlled and delivered through routes/jobs.js as short-lived signed
+// links (GET /jobs/evidence-file?t=…), so a leaked URL can't expose site imagery.
 const path = require('path');
-const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'routes', '..', 'uploads');
 require('fs').mkdirSync(UPLOAD_DIR, { recursive: true });
 app.set('uploadDir', UPLOAD_DIR);
-app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '30d', immutable: true }));
 
 // ── Request log (light) ──────────────────────────────────
 app.use((req, _res, next) => {

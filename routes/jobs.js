@@ -14,15 +14,20 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
+const jwt = require('jsonwebtoken');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { notify, notifyInternal } = require('../utils/notify');
+const { writeLimiter } = require('../middleware/rate-limit');
 
-const UPLOAD_BASE = process.env.PUBLIC_UPLOAD_BASE || 'https://api.flowguard.ng/uploads';
 const UPLOAD_DIR  = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads');
+const API_PUBLIC  = process.env.PUBLIC_API_BASE || 'https://api.flowguard.ng/api/v1';
 const EXT = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','application/pdf':'pdf' };
+const MAX_EVIDENCE_PER_JOB = 60;
+const EV_PATH = /^jobs\/\d+\/[A-Za-z0-9._-]+$/;   // guard against traversal
 
-// Persist a base64 data-URL to disk and return its public URL (or null).
+// Persist a base64 data-URL to disk. Returns the STORAGE PATH (jobs/<id>/<name>),
+// never a public URL — evidence is access-controlled and links are signed at read.
 function saveDataUrl(jobId, dataUrl) {
   try {
     const m = /^data:([\w/+.-]+);base64,(.+)$/s.exec(dataUrl || '');
@@ -34,9 +39,36 @@ function saveDataUrl(jobId, dataUrl) {
     fs.mkdirSync(dir, { recursive: true });
     const name = Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.' + ext;
     fs.writeFileSync(path.join(dir, name), buf);
-    return `${UPLOAD_BASE}/jobs/${jobId}/${name}`;
+    return `jobs/${jobId}/${name}`;
   } catch (e) { console.error('[saveDataUrl] failed:', e.message); return null; }
 }
+
+// Turn a stored evidence file_url into a short-lived signed link. Pasted external
+// URLs (http…) pass through untouched; stored paths get a 6h token so the plain
+// <a>/<img> in the portals can load them without a bearer header.
+function toEvidenceUrl(fileUrl) {
+  if (!fileUrl) return null;
+  if (/^https?:\/\//i.test(fileUrl)) return fileUrl;
+  const t = jwt.sign({ p: fileUrl, purpose: 'evidence' }, process.env.JWT_SECRET, { expiresIn: '6h' });
+  return `${API_PUBLIC}/jobs/evidence-file?t=${encodeURIComponent(t)}`;
+}
+function signEvidenceRows(rows) {
+  (rows || []).forEach(e => { if (e && e.file_url) e.file_url = toEvidenceUrl(e.file_url); });
+  return rows;
+}
+
+// Signed evidence download — deliberately defined BEFORE authenticateToken so it
+// authorises via the signed `t` query param (a bearer header can't ride on an
+// <img>/<a>). The token embeds the exact storage path and expires in 6h.
+router.get('/evidence-file', (req, res) => {
+  try {
+    const payload = jwt.verify(String(req.query.t || ''), process.env.JWT_SECRET);
+    if (payload.purpose !== 'evidence' || !EV_PATH.test(payload.p || '')) {
+      return res.status(403).json({ success: false, error: 'Invalid or expired link' });
+    }
+    return res.sendFile(path.join(UPLOAD_DIR, payload.p));
+  } catch (_) { return res.status(403).json({ success: false, error: 'Invalid or expired link' }); }
+});
 
 router.use(authenticateToken);
 
@@ -180,13 +212,34 @@ router.put('/evidence-templates/:jobType', requireStaff, async (req, res) => {
   } catch (err) { console.error('PUT evidence-templates', err); return res.status(500).json({ success: false, error: 'Failed to save template' }); }
 });
 
+// GET /jobs/stats  → lightweight counts for the caller's scope (must precede /:id)
+router.get('/stats', async (req, res) => {
+  try {
+    let orgId = null;
+    if (isStaff(req)) { if (req.query.org) orgId = parseInt(req.query.org, 10); }
+    else { if (!req.user.spo) return res.status(403).json({ success: false, error: 'Service provider account required' }); orgId = req.user.spo; }
+    const where = orgId ? 'WHERE service_provider_org_id = $1' : '';
+    const params = orgId ? [orgId] : [];
+    const s = (await pool.query(
+      `SELECT COUNT(*)::int AS total,
+         COUNT(*) FILTER (WHERE status IN ('dispatched','accepted','en_route','in_progress','rejected'))::int AS open,
+         COUNT(*) FILTER (WHERE status IN ('dispatched','accepted','en_route','in_progress')
+                          AND sla_due_at IS NOT NULL AND sla_due_at < NOW())::int AS overdue,
+         COUNT(*) FILTER (WHERE status = 'completed')::int AS awaiting,
+         COUNT(*) FILTER (WHERE status = 'verified')::int AS verified,
+         COUNT(*) FILTER (WHERE status = 'declined')::int AS declined
+       FROM jobs ${where}`, params)).rows[0];
+    return res.json({ success: true, data: s });
+  } catch (err) { console.error('GET /jobs/stats', err); return res.status(500).json({ success: false, error: 'Failed to load stats' }); }
+});
+
 // GET /jobs/:id  → job + events + evidence
 router.get('/:id', async (req, res) => {
   const job = await loadJob(req, res, req.params.id);
   if (!job) return;
   try {
     const events = (await pool.query('SELECT * FROM job_events WHERE job_id = $1 ORDER BY created_at', [job.id])).rows;
-    const evidence = (await pool.query('SELECT * FROM job_evidence WHERE job_id = $1 ORDER BY created_at', [job.id])).rows;
+    const evidence = signEvidenceRows((await pool.query('SELECT * FROM job_evidence WHERE job_id = $1 ORDER BY created_at', [job.id])).rows);
     const prop = job.property_id
       ? (await pool.query('SELECT property_id, property_name, city, state, country, latitude, longitude FROM properties WHERE property_id = $1', [job.property_id])).rows[0]
       : null;
@@ -390,8 +443,8 @@ function spTransition(action, from, to, eventType) {
 router.post('/:id/en-route', requireServiceProvider, spTransition('set en route', ['accepted'], 'en_route', 'en_route'));
 router.post('/:id/start',    requireServiceProvider, spTransition('start', ['accepted', 'en_route'], 'in_progress', 'started'));
 
-// POST /jobs/:id/evidence  body:{ kind, evidence_key?, file_url?, caption?, lat?, lng?, captured_at? }
-router.post('/:id/evidence', requireServiceProvider, async (req, res) => {
+// POST /jobs/:id/evidence  body:{ kind, evidence_key?, file_url?, file_data?, caption?, lat?, lng?, captured_at? }
+router.post('/:id/evidence', writeLimiter, requireServiceProvider, async (req, res) => {
   const job = await loadJob(req, res, req.params.id);
   if (!job) return;
   if (!['accepted', 'en_route', 'in_progress'].includes(job.status))
@@ -400,12 +453,14 @@ router.post('/:id/evidence', requireServiceProvider, async (req, res) => {
   const KINDS = ['photo', 'video', 'document', 'note', 'signature', 'gps'];
   if (!KINDS.includes(b.kind)) return res.status(400).json({ success: false, error: 'Valid evidence kind required' });
   try {
+    const count = (await pool.query('SELECT COUNT(*)::int AS n FROM job_evidence WHERE job_id = $1', [job.id])).rows[0].n;
+    if (count >= MAX_EVIDENCE_PER_JOB) return res.status(429).json({ success: false, error: 'Evidence limit reached for this job' });
     // A base64 file (downscaled on the client) takes priority; otherwise fall
-    // back to a pasted URL. Either yields a file_url stored on the row.
+    // back to a pasted URL. Uploaded files store a relative path, signed at read.
     let fileUrl = b.file_url || null;
     if (b.file_data) {
       const saved = saveDataUrl(job.id, b.file_data);
-      if (!saved) return res.status(400).json({ success: false, error: 'Unsupported or oversized file (JP, PNG, WEBP or PDF up to 12MB)' });
+      if (!saved) return res.status(400).json({ success: false, error: 'Unsupported or oversized file (JPG, PNG, WEBP or PDF up to 12MB)' });
       fileUrl = saved;
     }
     const { rows } = await pool.query(
@@ -414,8 +469,56 @@ router.post('/:id/evidence', requireServiceProvider, async (req, res) => {
       [job.id, b.evidence_key || null, b.kind, fileUrl, b.caption || null,
        b.lat != null ? b.lat : null, b.lng != null ? b.lng : null, b.captured_at || null, req.user.id]);
     await logEvent(job.id, req, { event_type: 'evidence_added', meta: { kind: b.kind, key: b.evidence_key || null } });
-    return res.status(201).json({ success: true, data: rows[0] });
+    return res.status(201).json({ success: true, data: signEvidenceRows(rows)[0] });
   } catch (err) { console.error('POST evidence', err); return res.status(500).json({ success: false, error: 'Failed to add evidence' }); }
+});
+
+// POST /jobs/:id/assign  { technician_id }  — SP admin/supervisor assigns/reassigns
+router.post('/:id/assign', requireServiceProvider, async (req, res) => {
+  if (!['owner_admin', 'supervisor'].includes(req.user.sp_role))
+    return res.status(403).json({ success: false, error: 'Only an admin or supervisor can assign jobs' });
+  const job = await loadJob(req, res, req.params.id);
+  if (!job) return;
+  const techId = parseInt((req.body || {}).technician_id, 10);
+  if (!Number.isInteger(techId)) return res.status(400).json({ success: false, error: 'technician_id required' });
+  try {
+    const t = (await pool.query(
+      'SELECT id, full_name FROM users WHERE id = $1 AND service_provider_org_id = $2 AND is_active = true', [techId, req.user.spo])).rows[0];
+    if (!t) return res.status(400).json({ success: false, error: 'Technician not in your organisation' });
+    const { rows } = await pool.query(
+      'UPDATE jobs SET assigned_technician_id = $2, updated_at = NOW() WHERE id = $1 RETURNING *', [job.id, techId]);
+    await logEvent(job.id, req, { event_type: 'note', note: 'Assigned to ' + (t.full_name || 'a technician'), meta: { technician: techId } });
+    notify(techId, { type: 'info', title: 'You were assigned a job', message: `${job.reference} — ${job.title}`, link: '#jobs/' + job.id });
+    return res.json({ success: true, data: rows[0] });
+  } catch (err) { console.error('POST assign', err); return res.status(500).json({ success: false, error: 'Failed to assign' }); }
+});
+
+// ── job comments (staff ↔ provider thread) ───────────────────────────────
+router.get('/:id/comments', async (req, res) => {
+  const job = await loadJob(req, res, req.params.id);
+  if (!job) return;
+  try {
+    const rows = (await pool.query('SELECT * FROM job_comments WHERE job_id = $1 ORDER BY created_at', [job.id])).rows;
+    return res.json({ success: true, data: rows });
+  } catch (err) { console.error('GET comments', err); return res.status(500).json({ success: false, error: 'Failed to load comments' }); }
+});
+router.post('/:id/comments', writeLimiter, async (req, res) => {
+  const job = await loadJob(req, res, req.params.id);
+  if (!job) return;
+  const body = ((req.body || {}).body || '').trim();
+  if (!body) return res.status(400).json({ success: false, error: 'Message is required' });
+  if (body.length > 4000) return res.status(400).json({ success: false, error: 'Message too long' });
+  try {
+    const who = (await pool.query('SELECT full_name FROM users WHERE id = $1', [req.user.id])).rows[0];
+    const name = (who && who.full_name) || req.user.email;
+    const { rows } = await pool.query(
+      `INSERT INTO job_comments (job_id, author_id, author_name, author_type, body)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`, [job.id, req.user.id, name, req.user.user_type, body]);
+    const snippet = body.length > 90 ? body.slice(0, 90) + '…' : body;
+    if (isStaff(req)) notifySpoMembers(job.service_provider_org_id, { type: 'info', title: 'New message on a job', message: `${job.reference}: ${snippet}`, link: '#jobs/' + job.id });
+    else notifyInternal({ type: 'info', title: 'Provider messaged on a job', message: `${job.reference}: ${snippet}`, link: '#jobs/' + job.id }, { roles: notifyInternal.ADMIN });
+    return res.status(201).json({ success: true, data: rows[0] });
+  } catch (err) { console.error('POST comments', err); return res.status(500).json({ success: false, error: 'Failed to post message' }); }
 });
 
 // POST /jobs/:id/complete  (in_progress → completed) — requires all required evidence

@@ -199,6 +199,34 @@ router.delete('/me/members/:id', requireServiceProvider, requireOrgAdmin, async 
   } catch (err) { console.error('DELETE /me/members/:id', err); return res.status(500).json({ success: false, error: 'Failed to remove member' }); }
 });
 
+// POST /service-providers/me/members/:id/resend → re-send a set-password link
+router.post('/me/members/:id/resend', requireServiceProvider, async (req, res) => {
+  if (!['owner_admin', 'supervisor'].includes(req.user.sp_role))
+    return res.status(403).json({ success: false, error: 'Only an admin or supervisor can resend invites' });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: 'Invalid id' });
+  try {
+    const m = (await pool.query(
+      'SELECT id, email, full_name, email_verified FROM users WHERE id = $1 AND service_provider_org_id = $2', [id, req.user.spo])).rows[0];
+    if (!m) return res.status(404).json({ success: false, error: 'Member not found' });
+    if (m.email_verified) return res.status(409).json({ success: false, error: 'This member has already set up their account' });
+    const org = (await pool.query('SELECT name FROM service_provider_organisations WHERE id = $1', [req.user.spo])).rows[0];
+    const token = crypto.randomBytes(32).toString('hex');
+    await pool.query('UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3',
+      [hashToken(token), new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), m.id]);
+    (async () => {
+      try {
+        const mailer = require('../utils/mailer');
+        const url = `https://app.flowguard.ng/reset-password.html?token=${token}`;
+        await mailer.sendEmail({ to: m.email,
+          subject: `Set up your FlowGuard account for ${(org && org.name) || 'your team'}`,
+          html: `<p>Hi ${(m.full_name || '').split(' ')[0]},</p><p>Here's a fresh link to set your password and sign in to the provider portal. It's valid for 7 days.</p><p><a href="${url}">Set your password</a></p>` });
+      } catch (e) { console.error('[member resend] mail', e.message); }
+    })();
+    return res.json({ success: true });
+  } catch (err) { console.error('POST resend', err); return res.status(500).json({ success: false, error: 'Failed to resend invite' }); }
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 //  FLOWGUARD OPS — review & approval (staff only)
 // ─────────────────────────────────────────────────────────────────────────
