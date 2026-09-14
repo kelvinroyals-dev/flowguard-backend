@@ -307,7 +307,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
       SELECT s.sensor_id, s.name, s.zone, s.status, s.battery_voltage, s.signal_strength,
              s.last_ping, s.max_capacity, s.latitude, s.longitude,
              s.client_id, s.property_id, s.device_variant, s.firmware_version,
-             s.capabilities, s.link_type, s.last_calibrated_at, s.calibration_due_at,
+             s.capabilities, s.link_type, s.tags, s.last_calibrated_at, s.calibration_due_at,
              s.enzyme_level_percent, s.cartridge_status,
              -- CANONICAL: a Sentinel attaches to a PROPERTY (via sensors.property_id
              -- and sentinel_coverage), and the "client" is that property's OWNER
@@ -388,6 +388,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
         primary_asset: (x.assets || []).find(a => a.is_primary) || null,
         device_variant: x.device_variant, firmware_version: x.firmware_version,
         capabilities: x.capabilities || {}, link_type: x.link_type,
+        tags: x.tags || [],
         last_calibrated_at: x.last_calibrated_at, calibration_due_at: x.calibration_due_at,
         enzyme_level_percent: x.enzyme_level_percent != null ? parseFloat(x.enzyme_level_percent) : null,
         cartridge_status: x.cartridge_status,
@@ -742,6 +743,52 @@ function validateCommandBody(body) {
   }
   return null;
 }
+
+// ── Device tags (grouping / bulk targeting) ───────────────────────────────
+// Normalise a tag: lowercase, trim, spaces→hyphen, safe charset, capped length.
+function cleanTag(t) {
+  return String(t || '').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9_\-.]/g, '').slice(0, 32);
+}
+function cleanTags(arr) {
+  return [...new Set((Array.isArray(arr) ? arr : []).map(cleanTag).filter(Boolean))].slice(0, 20);
+}
+
+// PUT /monitoring/sensors/:sensorId/tags  { tags:[] }  → replace this node's tags
+router.put('/sensors/:sensorId/tags', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  try {
+    const { isClient } = require('../utils/scope');
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const tags = cleanTags((req.body || {}).tags);
+    const { rows } = await pool.query(
+      `UPDATE sensors SET tags = $2 WHERE sensor_id = $1 RETURNING sensor_id, tags`,
+      [req.params.sensorId, tags]);
+    if (!rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) { console.error('PUT sensor tags', err); res.status(500).json({ success: false, error: 'Failed to update tags' }); }
+});
+
+// POST /monitoring/sensors/tags/bulk  { sensor_ids:[], add:[], remove:[] }
+router.post('/sensors/tags/bulk', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  try {
+    const { isClient } = require('../utils/scope');
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const ids = Array.isArray(req.body.sensor_ids) ? req.body.sensor_ids : [];
+    const add = cleanTags(req.body.add), remove = cleanTags(req.body.remove);
+    if (!ids.length || (!add.length && !remove.length))
+      return res.status(400).json({ success: false, error: 'sensor_ids and at least one of add/remove required' });
+    // add via array_cat + dedupe, then strip removed — done in SQL per row
+    const { rowCount } = await pool.query(
+      `UPDATE sensors
+          SET tags = (
+            SELECT ARRAY(
+              SELECT DISTINCT t FROM unnest(array_cat(tags, $2::text[])) AS t
+               WHERE t <> ALL ($3::text[])
+            ))
+        WHERE sensor_id = ANY($1)`,
+      [ids, add, remove]);
+    res.json({ success: true, data: { updated: rowCount } });
+  } catch (err) { console.error('POST bulk tags', err); res.status(500).json({ success: false, error: 'Failed to update tags' }); }
+});
 
 // GET /monitoring/sensors/:sensorId/commands — queued + past commands for one node
 router.get('/sensors/:sensorId/commands', authenticateToken, async (req, res) => {
