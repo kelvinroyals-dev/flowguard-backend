@@ -248,6 +248,56 @@ router.get('/sensor/:sensorId', authenticateToken, async (req, res) => {
 });
 
 
+// ── Trustworthiness layer ────────────────────────────────────────────────
+// Three states that are deliberately NOT the same thing:
+//   DEVICE  — is the Sentinel alive? (online/degraded/offline/maintenance)
+//   SENSOR  — is its data trustworthy? (ok/stale/frozen/implausible/unknown)
+//   INFRA   — what's actually happening in the drain (normal…critical) OR
+//             UNKNOWN when the sensor isn't trustworthy. Missing/stale/frozen
+//             telemetry must NEVER be read as "the drain is fine".
+const STALE_MIN = 90, OFFLINE_H = 6, FROZEN_READS = 10, FROZEN_SPAN_MIN = 120;
+function computeStates(x, win) {
+  const now = Date.now();
+  const readAge = x.reading_time ? (now - new Date(x.reading_time).getTime()) / 60000 : null; // minutes
+  const pingAge = x.last_ping ? (now - new Date(x.last_ping).getTime()) / 60000 : null;
+  const lvl = x.level;
+
+  // DEVICE
+  let device_state, device_reason = null;
+  if (x.status === 'maintenance') { device_state = 'maintenance'; device_reason = 'In maintenance'; }
+  else if (x.status !== 'active' || pingAge == null || pingAge > OFFLINE_H * 60) {
+    device_state = 'offline';
+    device_reason = pingAge == null ? 'Never checked in' : `Last check-in ${Math.round(pingAge / 60)}h ago`;
+  } else {
+    const low = [];
+    if (x.battery_percent != null && x.battery_percent < 50) low.push('low battery');
+    if (x.signal_strength != null && x.signal_strength < 70) low.push('weak signal');
+    device_state = low.length ? 'degraded' : 'online';
+    device_reason = low.join(', ') || null;
+  }
+
+  // SENSOR (data trust)
+  let sensor_state = 'ok', sensor_reason = null;
+  if (device_state === 'offline' || device_state === 'maintenance') { sensor_state = 'unknown'; sensor_reason = 'device ' + device_state; }
+  else if (lvl == null && readAge == null) { sensor_state = 'unknown'; sensor_reason = 'no readings received'; }
+  else if (lvl != null && (lvl < 0 || lvl > 100)) { sensor_state = 'implausible'; sensor_reason = 'reading out of range'; }
+  else if (readAge != null && readAge > STALE_MIN) { sensor_state = 'stale'; sensor_reason = `last reading ${Math.round(readAge)}m ago`; }
+  else if (win && Number(win.n) >= FROZEN_READS && Number(win.span_min) >= FROZEN_SPAN_MIN
+           && Number(win.sd) === 0 && Number(win.rng) === 0) {
+    sensor_state = 'frozen'; sensor_reason = `value unchanged for ${(Number(win.span_min) / 60).toFixed(1)}h`;
+  }
+  const data_trust = sensor_state === 'ok';
+
+  // INFRASTRUCTURE — only meaningful when the sensor is trustworthy
+  let infrastructure_state = 'unknown', infra_reason = null;
+  if (data_trust && lvl != null) {
+    infrastructure_state = lvl >= 85 ? 'critical' : lvl >= 70 ? 'high' : lvl >= 50 ? 'elevated' : 'normal';
+  } else {
+    infra_reason = 'sensor ' + sensor_state; // e.g. "sensor stale" — NOT "normal"
+  }
+  return { device_state, device_reason, sensor_state, sensor_reason, infrastructure_state, infra_reason, data_trust };
+}
+
 // GET /monitoring/sensors/all — ops-wide node fleet with latest reading (ops only)
 router.get('/sensors/all', authenticateToken, async (req, res) => {
   const { isClient } = require('../utils/scope');
@@ -309,6 +359,15 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
             FROM device_commands dc
            WHERE dc.sensor_id = s.sensor_id AND dc.status = 'queued'
         ) cmd ON true
+        -- last-6h reading spread, to detect a frozen/stuck sensor (flat line)
+        LEFT JOIN LATERAL (
+          SELECT COUNT(*) AS n,
+                 COALESCE(STDDEV_POP(water_level_percent), 0) AS sd,
+                 COALESCE(MAX(water_level_percent) - MIN(water_level_percent), 0) AS rng,
+                 COALESCE(EXTRACT(EPOCH FROM (MAX(time) - MIN(time))) / 60, 0) AS span_min
+            FROM sensor_readings
+           WHERE sensor_id = s.sensor_id AND time > NOW() - INTERVAL '6 hours'
+        ) win ON true
        ORDER BY
          CASE s.status WHEN 'active' THEN 0 WHEN 'maintenance' THEN 1 ELSE 2 END,
          r.water_level_percent DESC NULLS LAST, s.name`);
@@ -348,6 +407,10 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
         last_ping: x.last_ping, reading_time: x.reading_time,
         latitude: x.latitude, longitude: x.longitude,
         pending_commands: parseInt(x.pending_commands) || 0,
+        ...computeStates(
+          { status: x.status, last_ping: x.last_ping, reading_time: x.reading_time,
+            level: lvl, battery_percent: batt, signal_strength: x.signal_strength },
+          { n: x.n, sd: x.sd, rng: x.rng, span_min: x.span_min }),
       };
     });
     res.json({ success: true, data });
@@ -710,12 +773,55 @@ router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission(
     const sensorCheck = await pool.query(`SELECT sensor_id FROM sensors WHERE sensor_id = $1`, [req.params.sensorId]);
     if (!sensorCheck.rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
 
+    // ── Command-safety policy ──────────────────────────────────────────────
+    // A reboot / firmware push takes the node offline for a while. Refuse it if
+    // this is the ONLY node still reporting trustworthy data on a channel that
+    // is currently at high water — that would blind the drain during a flood
+    // window. Ops can still proceed with an explicit override + reason.
+    const DISRUPTIVE = ['reset', 'firmware_update'];
+    if (DISRUPTIVE.includes(req.body.command_type) && req.body.override !== true) {
+      const cur = (await pool.query(`
+        SELECT s.status, s.last_ping, s.property_id,
+               r.water_level_percent AS level, r.time AS reading_time
+          FROM sensors s
+          LEFT JOIN LATERAL (SELECT water_level_percent, time FROM sensor_readings
+                              WHERE sensor_id = s.sensor_id ORDER BY time DESC LIMIT 1) r ON true
+         WHERE s.sensor_id = $1`, [req.params.sensorId])).rows[0];
+      const now = Date.now();
+      const readAge = cur.reading_time ? (now - new Date(cur.reading_time).getTime()) / 60000 : null;
+      const pingAge = cur.last_ping ? (now - new Date(cur.last_ping).getTime()) / 60000 : null;
+      const level = cur.level != null ? parseFloat(cur.level) : null;
+      const trusted = cur.status === 'active' && pingAge != null && pingAge <= 360
+        && readAge != null && readAge <= 90 && level != null && level >= 0 && level <= 100;
+      if (trusted && level >= 70) {
+        const sib = (await pool.query(`
+          SELECT COUNT(*)::int AS n FROM sensors s2
+           WHERE s2.sensor_id <> $1 AND s2.status = 'active'
+             AND s2.last_ping > NOW() - INTERVAL '6 hours'
+             AND ( s2.property_id = $2
+                   OR s2.sensor_id IN (SELECT sensor_id FROM sentinel_coverage
+                                        WHERE property_id IN (SELECT property_id FROM sentinel_coverage WHERE sensor_id = $1)) )`,
+          [req.params.sensorId, cur.property_id])).rows[0].n;
+        if (sib === 0) {
+          return res.status(409).json({ success: false, safety: true,
+            error: 'This is the only node reporting on a channel that is at high water right now. Taking it offline would leave the drain unmonitored during a flood-risk window.',
+            detail: { water_level: Math.round(level), trusted_siblings: 0 },
+            override_hint: 'Resend with override:true and a reason to proceed anyway.' });
+        }
+      }
+    }
+
+    const overridden = req.body.override === true && DISRUPTIVE.includes(req.body.command_type);
+    const note = overridden
+      ? `[SAFETY OVERRIDE] ${req.body.note || '(no reason given)'}`
+      : (req.body.note || null);
+
     const { rows } = await pool.query(`
       INSERT INTO device_commands (sensor_id, command_type, payload, requested_by, note)
       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
       [req.params.sensorId, req.body.command_type,
        req.body.payload ? JSON.stringify(req.body.payload) : null,
-       req.user.id, req.body.note || null]);
+       req.user.id, note]);
 
     res.status(201).json({ success: true, data: rows[0] });
   } catch (err) {
