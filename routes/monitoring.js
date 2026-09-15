@@ -744,6 +744,74 @@ function validateCommandBody(body) {
   return null;
 }
 
+// ── Protection (maintenance) windows ──────────────────────────────────────
+// Return the active protection window covering a sensor, or null. A window
+// covers a sensor when scope matches: whole fleet, one of its tags, its
+// property, or the sensor itself — and NOW is between starts/ends, not cancelled.
+async function activeProtection(sensorId) {
+  const s = (await pool.query('SELECT property_id, tags FROM sensors WHERE sensor_id = $1', [sensorId])).rows[0];
+  if (!s) return null;
+  const { rows } = await pool.query(`
+    SELECT id, scope_type, scope_value, reason, ends_at
+      FROM device_protection_windows
+     WHERE cancelled_at IS NULL AND NOW() BETWEEN starts_at AND ends_at
+       AND ( scope_type = 'fleet'
+             OR (scope_type = 'sensor'   AND scope_value = $1)
+             OR (scope_type = 'property' AND scope_value = $2)
+             OR (scope_type = 'tag'      AND scope_value = ANY($3::text[])) )
+     ORDER BY ends_at DESC LIMIT 1`,
+    [sensorId, s.property_id, s.tags || []]);
+  return rows[0] || null;
+}
+
+// GET /monitoring/protection-windows — active + upcoming (not cancelled/expired)
+router.get('/protection-windows', authenticateToken, async (req, res) => {
+  try {
+    const { isClient } = require('../utils/scope');
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const { rows } = await pool.query(`
+      SELECT w.*, u.full_name AS created_by_name,
+             (NOW() BETWEEN w.starts_at AND w.ends_at) AS active
+        FROM device_protection_windows w
+        LEFT JOIN users u ON u.id = w.created_by
+       WHERE w.cancelled_at IS NULL AND w.ends_at > NOW()
+       ORDER BY w.starts_at`);
+    res.json({ success: true, data: rows });
+  } catch (err) { console.error('GET protection-windows', err); res.status(500).json({ success: false, error: 'Failed to load windows' }); }
+});
+
+// POST /monitoring/protection-windows  { scope_type, scope_value?, reason, starts_at?, ends_at }
+router.post('/protection-windows', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  try {
+    const { isClient } = require('../utils/scope');
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const b = req.body || {};
+    const SCOPES = ['fleet', 'tag', 'property', 'sensor'];
+    if (!SCOPES.includes(b.scope_type)) return res.status(400).json({ success: false, error: 'Invalid scope_type' });
+    if (b.scope_type !== 'fleet' && !b.scope_value) return res.status(400).json({ success: false, error: 'scope_value required for this scope' });
+    if (!b.ends_at) return res.status(400).json({ success: false, error: 'ends_at required' });
+    if (new Date(b.ends_at) <= (b.starts_at ? new Date(b.starts_at) : new Date())) return res.status(400).json({ success: false, error: 'ends_at must be in the future' });
+    const { rows } = await pool.query(`
+      INSERT INTO device_protection_windows (scope_type, scope_value, reason, starts_at, ends_at, created_by)
+      VALUES ($1,$2,$3,COALESCE($4,NOW()),$5,$6) RETURNING *`,
+      [b.scope_type, b.scope_type === 'fleet' ? null : String(b.scope_value), b.reason || null,
+       b.starts_at || null, b.ends_at, req.user.id]);
+    res.status(201).json({ success: true, data: rows[0] });
+  } catch (err) { console.error('POST protection-windows', err); res.status(500).json({ success: false, error: 'Failed to create window' }); }
+});
+
+// POST /monitoring/protection-windows/:id/cancel
+router.post('/protection-windows/:id/cancel', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  try {
+    const { isClient } = require('../utils/scope');
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const { rowCount } = await pool.query(
+      `UPDATE device_protection_windows SET cancelled_at = NOW() WHERE id = $1 AND cancelled_at IS NULL`, [parseInt(req.params.id, 10)]);
+    if (!rowCount) return res.status(404).json({ success: false, error: 'Window not found' });
+    res.json({ success: true });
+  } catch (err) { console.error('cancel protection-window', err); res.status(500).json({ success: false, error: 'Failed to cancel' }); }
+});
+
 // ── Device tags (grouping / bulk targeting) ───────────────────────────────
 // Normalise a tag: lowercase, trim, spaces→hyphen, safe charset, capped length.
 function cleanTag(t) {
@@ -827,6 +895,15 @@ router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission(
     // window. Ops can still proceed with an explicit override + reason.
     const DISRUPTIVE = ['reset', 'firmware_update'];
     if (DISRUPTIVE.includes(req.body.command_type) && req.body.override !== true) {
+      // 1) Operator-declared protection/maintenance window in force?
+      const win = await activeProtection(req.params.sensorId);
+      if (win) {
+        return res.status(409).json({ success: false, safety: true,
+          error: `A protection window is active (${win.scope_type}${win.reason ? ' — ' + win.reason : ''}). Disruptive commands are paused until ${new Date(win.ends_at).toISOString()}.`,
+          detail: { window_id: win.id, ends_at: win.ends_at },
+          override_hint: 'Resend with override:true and a reason to proceed anyway.' });
+      }
+      // 2) Sole trusted node on a channel at high water right now?
       const cur = (await pool.query(`
         SELECT s.status, s.last_ping, s.property_id,
                r.water_level_percent AS level, r.time AS reading_time
