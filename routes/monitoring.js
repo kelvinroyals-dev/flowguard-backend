@@ -307,7 +307,9 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
       SELECT s.sensor_id, s.name, s.zone, s.status, s.battery_voltage, s.signal_strength,
              s.last_ping, s.max_capacity, s.latitude, s.longitude,
              s.client_id, s.property_id, s.device_variant, s.firmware_version,
-             s.capabilities, s.link_type, s.tags, s.last_calibrated_at, s.calibration_due_at,
+             s.capabilities, s.link_type, s.tags, s.profile_id, s.applied_profile_version,
+             pf.name AS profile_name, pf.version AS profile_version,
+             s.last_calibrated_at, s.calibration_due_at,
              s.enzyme_level_percent, s.cartridge_status,
              -- CANONICAL: a Sentinel attaches to a PROPERTY (via sensors.property_id
              -- and sentinel_coverage), and the "client" is that property's OWNER
@@ -328,6 +330,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
              r.water_quality_ph, r.turbidity_ntu, r.time AS reading_time,
              cov.assets, cmd.pending_commands
         FROM sensors s
+        LEFT JOIN device_profiles pf ON pf.id = s.profile_id
         LEFT JOIN clients c  ON c.id = s.client_id
         LEFT JOIN users cu   ON LOWER(cu.email) = LOWER(c.estate_manager_email)
         LEFT JOIN properties sp ON sp.property_id = s.property_id
@@ -389,6 +392,9 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
         device_variant: x.device_variant, firmware_version: x.firmware_version,
         capabilities: x.capabilities || {}, link_type: x.link_type,
         tags: x.tags || [],
+        profile_id: x.profile_id, profile_name: x.profile_name,
+        config_drift: x.profile_id ? (x.applied_profile_version !== x.profile_version) : false,
+        config_state: !x.profile_id ? 'none' : (x.applied_profile_version == null ? 'pending' : (x.applied_profile_version !== x.profile_version ? 'drift' : 'in_sync')),
         last_calibrated_at: x.last_calibrated_at, calibration_due_at: x.calibration_due_at,
         enzyme_level_percent: x.enzyme_level_percent != null ? parseFloat(x.enzyme_level_percent) : null,
         cartridge_status: x.cartridge_status,
