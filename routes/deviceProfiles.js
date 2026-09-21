@@ -9,11 +9,13 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
-const { isClient } = require('../utils/scope');
+const { isClient, isSpUser } = require('../utils/scope');
 
 router.use(authenticateToken);
-router.use((req, res, next) => isClient(req)
-  ? res.status(403).json({ success: false, error: 'Not authorised' }) : next());
+// Config profiles are fleet-wide, FlowGuard-operations tooling: closed to
+// clients and to service-provider (tenant) users alike.
+router.use((req, res, next) => (isClient(req) || isSpUser(req))
+  ? res.status(403).json({ success: false, error: 'Profile management is restricted to FlowGuard operations' }) : next());
 const canManage = requirePermission('devices.manage');
 
 // Canonical config schema — coerce & bound so a profile can't hold junk.

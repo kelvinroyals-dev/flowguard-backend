@@ -5,7 +5,31 @@ const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
+const { isClient, isSpUser, deviceSensorScope, sensorInScope } = require('../utils/scope');
 const router = express.Router();
+
+// ── Multi-tenant device isolation ─────────────────────────────────────────
+// Any device route carrying a :sensorId is guarded here: a service-provider
+// user may only touch sensors on the properties assigned to their org. Full-
+// fleet (FlowGuard) users pass through. Runs before the route handler, so it
+// covers reads and writes alike without editing each handler.
+router.param('sensorId', async (req, res, next, sensorId) => {
+  try {
+    if (isSpUser(req) && !(await sensorInScope(req, sensorId))) {
+      return res.status(403).json({ success: false, error: 'Device is outside your tenancy' });
+    }
+    next();
+  } catch (err) {
+    console.error('sensorId scope guard', err);
+    res.status(500).json({ success: false, error: 'Scope check failed' });
+  }
+});
+
+// Block a service-provider user from a fleet-wide (ops-only) action.
+function denyTenant(req, res) {
+  if (isSpUser(req)) { res.status(403).json({ success: false, error: 'Fleet-wide actions are restricted to FlowGuard operations' }); return true; }
+  return false;
+}
 
 // Resolve which client(s) this user owns (client-portal users map to a client)
 async function clientIdsForUser(userId) {
@@ -434,7 +458,10 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
           { n: x.n, sd: x.sd, rng: x.rng, span_min: x.span_min }),
       };
     });
-    res.json({ success: true, data });
+    // multi-tenant isolation: an SP user only sees devices in their tenancy
+    const scope = await deviceSensorScope(req);
+    const out = scope ? (() => { const set = new Set(scope); return data.filter(d => set.has(d.sensor_id)); })() : data;
+    res.json({ success: true, data: out });
   } catch (err) {
     console.error('GET /monitoring/sensors/all', err);
     res.status(500).json({ success: false, error: 'Failed to load sensor fleet' });
@@ -882,6 +909,7 @@ router.post('/protection-windows', authenticateToken, requirePermission('devices
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    if (denyTenant(req, res)) return;
     const b = req.body || {};
     const SCOPES = ['fleet', 'tag', 'property', 'sensor'];
     if (!SCOPES.includes(b.scope_type)) return res.status(400).json({ success: false, error: 'Invalid scope_type' });
@@ -902,6 +930,7 @@ router.post('/protection-windows/:id/cancel', authenticateToken, requirePermissi
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    if (denyTenant(req, res)) return;
     const { rowCount } = await pool.query(
       `UPDATE device_protection_windows SET cancelled_at = NOW() WHERE id = $1 AND cancelled_at IS NULL`, [parseInt(req.params.id, 10)]);
     if (!rowCount) return res.status(404).json({ success: false, error: 'Window not found' });
@@ -1160,6 +1189,7 @@ router.post('/sensors/:sensorId/replace', authenticateToken, requirePermission('
   const client = await pool.connect();
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    if (denyTenant(req, res)) return;   // client released by finally
     const oldId = req.params.sensorId, newId = (req.body || {}).replacement_sensor_id;
     if (!newId) return res.status(400).json({ success: false, error: 'replacement_sensor_id required' });
     if (newId === oldId) return res.status(400).json({ success: false, error: 'Replacement must be a different device' });
@@ -1220,10 +1250,13 @@ router.post('/sensors/tags/bulk', authenticateToken, requirePermission('devices.
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
-    const ids = Array.isArray(req.body.sensor_ids) ? req.body.sensor_ids : [];
+    let ids = Array.isArray(req.body.sensor_ids) ? req.body.sensor_ids : [];
+    // multi-tenant isolation: keep only targets within the caller's tenancy
+    const scope = await deviceSensorScope(req);
+    if (scope) { const set = new Set(scope); ids = ids.filter(id => set.has(id)); }
     const add = cleanTags(req.body.add), remove = cleanTags(req.body.remove);
     if (!ids.length || (!add.length && !remove.length))
-      return res.status(400).json({ success: false, error: 'sensor_ids and at least one of add/remove required' });
+      return res.status(400).json({ success: false, error: 'sensor_ids (within your scope) and at least one of add/remove required' });
     // add via array_cat + dedupe, then strip removed — done in SQL per row
     const { rowCount } = await pool.query(
       `UPDATE sensors
@@ -1318,9 +1351,12 @@ router.post('/sensors/commands/bulk', authenticateToken, requirePermission('devi
 
     const { rows: valid } = await pool.query(
       `SELECT sensor_id FROM sensors WHERE sensor_id = ANY($1)`, [ids]);
-    const validIds = valid.map(r => r.sensor_id);
+    let validIds = valid.map(r => r.sensor_id);
+    // multi-tenant isolation: drop any target outside the caller's tenancy
+    const scope = await deviceSensorScope(req);
+    if (scope) { const set = new Set(scope); validIds = validIds.filter(id => set.has(id)); }
     const skipped = ids.filter(id => !validIds.includes(id));
-    if (!validIds.length) return res.status(404).json({ success: false, error: 'None of the given sensors exist' });
+    if (!validIds.length) return res.status(404).json({ success: false, error: 'None of the given sensors are within your scope' });
 
     const payload = req.body.payload ? JSON.stringify(req.body.payload) : null;
     const { rows } = await pool.query(`

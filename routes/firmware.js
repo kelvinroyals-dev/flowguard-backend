@@ -9,11 +9,13 @@ const router = express.Router();
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
-const { isClient } = require('../utils/scope');
+const { isClient, isSpUser } = require('../utils/scope');
 
 router.use(authenticateToken);
-router.use((req, res, next) => isClient(req)
-  ? res.status(403).json({ success: false, error: 'Not authorised' }) : next());
+// Firmware is a fleet-wide, FlowGuard-operations concern: closed to clients
+// and to service-provider (tenant) users alike.
+router.use((req, res, next) => (isClient(req) || isSpUser(req))
+  ? res.status(403).json({ success: false, error: 'Firmware management is restricted to FlowGuard operations' }) : next());
 const canManage = requirePermission('devices.manage');
 
 // sensor_ids currently covered by an active protection window (deferred from rollout).

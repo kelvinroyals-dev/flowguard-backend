@@ -44,4 +44,50 @@ async function teamIdsForUser(userId) {
   return rows.map(r => r.team_id);
 }
 
-module.exports = { isClient, clientIdsForUser, propertyIdsForUser, teamIdsForUser };
+// ── Service-provider (multi-tenant) device isolation ──────────────────────
+// A service-provider user is scoped to devices on the properties assigned to
+// their organisation (service_provider_property_assignments). FlowGuard staff
+// (no service_provider_org_id) see the whole fleet.
+function isSpUser(req) {
+  return !!(req && req.user && req.user.service_provider_org_id);
+}
+
+// The sensor_ids an SP user may see/act on: sensors on the org's ACTIVE
+// property assignments. Returns [] if none.
+async function spSensorIds(userId) {
+  if (!userId) return [];
+  const { rows } = await pool.query(
+    `SELECT s.sensor_id
+       FROM sensors s
+       JOIN service_provider_property_assignments a
+         ON a.property_id = s.property_id AND a.active = TRUE
+       JOIN users u ON u.id = $1 AND u.service_provider_org_id = a.service_provider_org_id`,
+    [userId]);
+  return rows.map(r => r.sensor_id);
+}
+
+// Device visibility scope for a request:
+//   null  → full fleet (FlowGuard staff / ops)
+//   [...] → restricted to these sensor_ids (SP tenant; possibly empty)
+async function deviceSensorScope(req) {
+  if (isSpUser(req)) return await spSensorIds(req.user.id);
+  return null;
+}
+
+// Is a single sensor within the caller's device scope? Always true for
+// full-fleet (non-SP) callers; membership-checked for SP users.
+async function sensorInScope(req, sensorId) {
+  if (!isSpUser(req)) return true;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM sensors s
+       JOIN service_provider_property_assignments a
+         ON a.property_id = s.property_id AND a.active = TRUE
+      WHERE s.sensor_id = $1 AND a.service_provider_org_id = $2 LIMIT 1`,
+    [sensorId, req.user.service_provider_org_id]);
+  return rows.length > 0;
+}
+
+module.exports = {
+  isClient, clientIdsForUser, propertyIdsForUser, teamIdsForUser,
+  isSpUser, spSensorIds, deviceSensorScope, sensorInScope,
+};
