@@ -555,13 +555,31 @@ router.post('/readings', authenticateDevice, async (req, res) => {
       WHERE sensor_id = $1`,
       [sensorId, ts, batt, signal, b.firmware_version || null]);
 
-    // hand over any commands queued for this node since its last check-in —
-    // store-and-forward: there's no open socket, so "delivery" happens here,
+    // hand over queued commands — store-and-forward: "delivery" happens here,
     // piggybacked on the node's own reporting cadence.
-    const { rows: pending } = await client.query(
-      `UPDATE device_commands SET status = 'delivered', delivered_at = NOW()
-        WHERE sensor_id = $1 AND status = 'queued'
-        RETURNING id, command_type, payload`, [sensorId]);
+    // 1) lapse any that expired while the device was offline
+    await client.query(
+      `UPDATE device_commands SET status = 'expired'
+        WHERE sensor_id = $1 AND status = 'queued' AND expires_at IS NOT NULL AND expires_at < NOW()`, [sensorId]);
+    // 2) re-check safety NOW for disruptive commands (conditions may have changed
+    //    since they were queued) using this fresh reading; hold rather than deliver.
+    const { rows: queued } = await client.query(
+      `SELECT id, command_type, payload FROM device_commands
+        WHERE sensor_id = $1 AND status = 'queued' ORDER BY created_at`, [sensorId]);
+    const isDisr = c => c.command_type === 'reset' || c.command_type === 'firmware_update';
+    let holdReason = null;
+    if (queued.some(isDisr)) holdReason = await disruptiveUnsafe(sensorId, level);
+    let pending;
+    if (holdReason) {
+      const deliverIds = queued.filter(c => !isDisr(c)).map(c => c.id);
+      const holdIds    = queued.filter(isDisr).map(c => c.id);
+      if (deliverIds.length) await client.query(`UPDATE device_commands SET status='delivered', delivered_at=NOW() WHERE id = ANY($1)`, [deliverIds]);
+      if (holdIds.length)    await client.query(`UPDATE device_commands SET hold_reason=$2, held_at=NOW() WHERE id = ANY($1)`, [holdIds, holdReason]);
+      pending = queued.filter(c => !isDisr(c));
+    } else {
+      if (queued.length) await client.query(`UPDATE device_commands SET status='delivered', delivered_at=NOW(), hold_reason=NULL WHERE sensor_id=$1 AND status='queued'`, [sensorId]);
+      pending = queued;
+    }
 
     await client.query('COMMIT');
     res.status(201).json({
@@ -770,6 +788,41 @@ async function activeProtection(sensorId) {
   return rows[0] || null;
 }
 
+// Why a disruptive command (reboot/firmware) is unsafe for this sensor right
+// now, or null. Reused at enqueue AND re-checked at delivery — a command queued
+// while calm must not be handed to the device mid-flood. Pass freshLevel when
+// the device is checking in (that reading is authoritative and trusted).
+async function disruptiveUnsafe(sensorId, freshLevel) {
+  const win = await activeProtection(sensorId);
+  if (win) return `A protection window is active (${win.scope_type}${win.reason ? ' — ' + win.reason : ''}) until ${new Date(win.ends_at).toISOString()}.`;
+  let level, propertyId, trusted;
+  if (freshLevel !== undefined) {
+    level = freshLevel; trusted = true;
+    propertyId = (await pool.query('SELECT property_id FROM sensors WHERE sensor_id = $1', [sensorId])).rows[0]?.property_id;
+  } else {
+    const cur = (await pool.query(`
+      SELECT s.status, s.last_ping, s.property_id, r.water_level_percent AS level, r.time AS reading_time
+        FROM sensors s
+        LEFT JOIN LATERAL (SELECT water_level_percent, time FROM sensor_readings WHERE sensor_id=s.sensor_id ORDER BY time DESC LIMIT 1) r ON true
+       WHERE s.sensor_id = $1`, [sensorId])).rows[0];
+    if (!cur) return null;
+    const now = Date.now();
+    const readAge = cur.reading_time ? (now - new Date(cur.reading_time).getTime()) / 60000 : null;
+    const pingAge = cur.last_ping ? (now - new Date(cur.last_ping).getTime()) / 60000 : null;
+    level = cur.level != null ? parseFloat(cur.level) : null; propertyId = cur.property_id;
+    trusted = cur.status === 'active' && pingAge != null && pingAge <= 360 && readAge != null && readAge <= 90 && level != null && level >= 0 && level <= 100;
+  }
+  if (!(trusted && level != null && level >= 70)) return null;
+  const sib = (await pool.query(`
+    SELECT COUNT(*)::int AS n FROM sensors s2
+     WHERE s2.sensor_id <> $1 AND s2.status = 'active' AND s2.last_ping > NOW() - INTERVAL '6 hours'
+       AND ( s2.property_id = $2
+             OR s2.sensor_id IN (SELECT sensor_id FROM sentinel_coverage
+                                  WHERE property_id IN (SELECT property_id FROM sentinel_coverage WHERE sensor_id = $1)) )`,
+    [sensorId, propertyId])).rows[0].n;
+  return sib === 0 ? 'This is the only node reporting on a channel that is at high water right now.' : null;
+}
+
 // GET /monitoring/protection-windows — active + upcoming (not cancelled/expired)
 router.get('/protection-windows', authenticateToken, async (req, res) => {
   try {
@@ -901,43 +954,10 @@ router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission(
     // window. Ops can still proceed with an explicit override + reason.
     const DISRUPTIVE = ['reset', 'firmware_update'];
     if (DISRUPTIVE.includes(req.body.command_type) && req.body.override !== true) {
-      // 1) Operator-declared protection/maintenance window in force?
-      const win = await activeProtection(req.params.sensorId);
-      if (win) {
-        return res.status(409).json({ success: false, safety: true,
-          error: `A protection window is active (${win.scope_type}${win.reason ? ' — ' + win.reason : ''}). Disruptive commands are paused until ${new Date(win.ends_at).toISOString()}.`,
-          detail: { window_id: win.id, ends_at: win.ends_at },
+      const reason = await disruptiveUnsafe(req.params.sensorId);
+      if (reason) {
+        return res.status(409).json({ success: false, safety: true, error: reason,
           override_hint: 'Resend with override:true and a reason to proceed anyway.' });
-      }
-      // 2) Sole trusted node on a channel at high water right now?
-      const cur = (await pool.query(`
-        SELECT s.status, s.last_ping, s.property_id,
-               r.water_level_percent AS level, r.time AS reading_time
-          FROM sensors s
-          LEFT JOIN LATERAL (SELECT water_level_percent, time FROM sensor_readings
-                              WHERE sensor_id = s.sensor_id ORDER BY time DESC LIMIT 1) r ON true
-         WHERE s.sensor_id = $1`, [req.params.sensorId])).rows[0];
-      const now = Date.now();
-      const readAge = cur.reading_time ? (now - new Date(cur.reading_time).getTime()) / 60000 : null;
-      const pingAge = cur.last_ping ? (now - new Date(cur.last_ping).getTime()) / 60000 : null;
-      const level = cur.level != null ? parseFloat(cur.level) : null;
-      const trusted = cur.status === 'active' && pingAge != null && pingAge <= 360
-        && readAge != null && readAge <= 90 && level != null && level >= 0 && level <= 100;
-      if (trusted && level >= 70) {
-        const sib = (await pool.query(`
-          SELECT COUNT(*)::int AS n FROM sensors s2
-           WHERE s2.sensor_id <> $1 AND s2.status = 'active'
-             AND s2.last_ping > NOW() - INTERVAL '6 hours'
-             AND ( s2.property_id = $2
-                   OR s2.sensor_id IN (SELECT sensor_id FROM sentinel_coverage
-                                        WHERE property_id IN (SELECT property_id FROM sentinel_coverage WHERE sensor_id = $1)) )`,
-          [req.params.sensorId, cur.property_id])).rows[0].n;
-        if (sib === 0) {
-          return res.status(409).json({ success: false, safety: true,
-            error: 'This is the only node reporting on a channel that is at high water right now. Taking it offline would leave the drain unmonitored during a flood-risk window.',
-            detail: { water_level: Math.round(level), trusted_siblings: 0 },
-            override_hint: 'Resend with override:true and a reason to proceed anyway.' });
-        }
       }
     }
 
@@ -945,13 +965,16 @@ router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission(
     const note = overridden
       ? `[SAFETY OVERRIDE] ${req.body.note || '(no reason given)'}`
       : (req.body.note || null);
+    // optional expiry — if the device never reconnects in time, the command lapses
+    const ttl = parseInt(req.body.ttl_hours, 10);
+    const expiresAt = ttl > 0 ? new Date(Date.now() + ttl * 3600 * 1000) : null;
 
     const { rows } = await pool.query(`
-      INSERT INTO device_commands (sensor_id, command_type, payload, requested_by, note)
-      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      INSERT INTO device_commands (sensor_id, command_type, payload, requested_by, note, expires_at)
+      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
       [req.params.sensorId, req.body.command_type,
        req.body.payload ? JSON.stringify(req.body.payload) : null,
-       req.user.id, note]);
+       req.user.id, note, expiresAt]);
 
     res.status(201).json({ success: true, data: rows[0] });
   } catch (err) {
