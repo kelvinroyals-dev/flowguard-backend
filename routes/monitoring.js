@@ -10,21 +10,25 @@ const { getDriver, normalizeReading, driverSupportsCommand } = require('../utils
 const router = express.Router();
 
 // ── Multi-tenant device isolation ─────────────────────────────────────────
-// Any device route carrying a :sensorId is guarded here: a service-provider
-// user may only touch sensors on the properties assigned to their org. Full-
-// fleet (FlowGuard) users pass through. Runs before the route handler, so it
-// covers reads and writes alike without editing each handler.
-router.param('sensorId', async (req, res, next, sensorId) => {
+// Middleware placed AFTER authenticateToken on device routes: a service-
+// provider user may only touch sensors on the properties assigned to their
+// org. No-ops when the route has no :sensorId param or the caller is full-
+// fleet (FlowGuard) staff, so it is safe to apply to every route. (A
+// router.param callback can't be used here — it runs before the route's
+// inline auth handler, so req.user would not yet be set.)
+async function sensorScope(req, res, next) {
   try {
-    if (isSpUser(req) && !(await sensorInScope(req, sensorId))) {
+    const id = req.params && req.params.sensorId;
+    if (!id || !isSpUser(req)) return next();
+    if (!(await sensorInScope(req, id))) {
       return res.status(403).json({ success: false, error: 'Device is outside your tenancy' });
     }
     next();
   } catch (err) {
-    console.error('sensorId scope guard', err);
+    console.error('sensorScope guard', err);
     res.status(500).json({ success: false, error: 'Scope check failed' });
   }
-});
+}
 
 // Block a service-provider user from a fleet-wide (ops-only) action.
 function denyTenant(req, res) {
@@ -62,7 +66,7 @@ async function clientSensorIds(userId) {
 }
 
 // GET /monitoring/flood-risk  -> { has_data, risk_index, level, sensors_online, sensors_total, peak_level }
-router.get('/flood-risk', authenticateToken, async (req, res) => {
+router.get('/flood-risk', authenticateToken, sensorScope, async (req, res) => {
   try {
     const sids = await clientSensorIds(req.user.id);
     if (!sids.length) {
@@ -113,7 +117,7 @@ router.get('/flood-risk', authenticateToken, async (req, res) => {
 });
 
 // GET /monitoring/sensors -> [{ sensor_id, name, zone, status, level, trend[] }]
-router.get('/sensors', authenticateToken, async (req, res) => {
+router.get('/sensors', authenticateToken, sensorScope, async (req, res) => {
   try {
     const sids = await clientSensorIds(req.user.id);
     if (!sids.length) return res.json({ success: true, data: [] });
@@ -187,7 +191,7 @@ router.get('/sensors', authenticateToken, async (req, res) => {
 });
 
 // GET /monitoring/history?hours=24 -> time-series readings for charts + log
-router.get('/history', authenticateToken, async (req, res) => {
+router.get('/history', authenticateToken, sensorScope, async (req, res) => {
   try {
     const sids = await clientSensorIds(req.user.id);
     if (!sids.length) return res.json({ success: true, data: { series: [], log: [] } });
@@ -229,7 +233,7 @@ router.get('/history', authenticateToken, async (req, res) => {
 });
 
 // GET /monitoring/sensor/:sensorId?hours=24 -> one sensor's detail + history
-router.get('/sensor/:sensorId', authenticateToken, async (req, res) => {
+router.get('/sensor/:sensorId', authenticateToken, sensorScope, async (req, res) => {
   try {
     const sids = await clientSensorIds(req.user.id);
     if (!sids.includes(req.params.sensorId)) return res.status(404).json({ success: false, error: 'Sensor not found' });
@@ -324,7 +328,7 @@ function computeStates(x, win) {
 }
 
 // GET /monitoring/sensors/all — ops-wide node fleet with latest reading (ops only)
-router.get('/sensors/all', authenticateToken, async (req, res) => {
+router.get('/sensors/all', authenticateToken, sensorScope, async (req, res) => {
   const { isClient } = require('../utils/scope');
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
@@ -653,7 +657,7 @@ router.post('/readings', authenticateDevice, async (req, res) => {
 
 // POST /monitoring/sensors/:sensorId/device-key — issue/rotate a device key (ops only)
 // Returns the plaintext key ONCE; only its hash is stored.
-router.post('/sensors/:sensorId/device-key', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/sensors/:sensorId/device-key', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -676,7 +680,7 @@ router.post('/sensors/:sensorId/device-key', authenticateToken, requirePermissio
 });
 
 // GET /monitoring/ingest-errors — recent rejected payloads (ops only)
-router.get('/ingest-errors', authenticateToken, async (req, res) => {
+router.get('/ingest-errors', authenticateToken, sensorScope, async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -695,7 +699,7 @@ router.get('/ingest-errors', authenticateToken, async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 
 // PUT /monitoring/sensors/:sensorId/coverage  { assets: [{property_id, is_primary}] }
-router.put('/sensors/:sensorId/coverage', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.put('/sensors/:sensorId/coverage', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   const client = await pool.connect();
   try {
     const { isClient } = require('../utils/scope');
@@ -757,7 +761,7 @@ router.put('/sensors/:sensorId/coverage', authenticateToken, requirePermission('
 });
 
 // GET /monitoring/sensors/:sensorId/events — calibration / firmware / repair history
-router.get('/sensors/:sensorId/events', authenticateToken, async (req, res) => {
+router.get('/sensors/:sensorId/events', authenticateToken, sensorScope, async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -775,7 +779,7 @@ router.get('/sensors/:sensorId/events', authenticateToken, async (req, res) => {
 });
 
 // POST /monitoring/sensors/:sensorId/events  { event_type, detail? }
-router.post('/sensors/:sensorId/events', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/sensors/:sensorId/events', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -898,7 +902,7 @@ async function disruptiveUnsafe(sensorId, freshLevel) {
 }
 
 // GET /monitoring/protection-windows — active + upcoming (not cancelled/expired)
-router.get('/protection-windows', authenticateToken, async (req, res) => {
+router.get('/protection-windows', authenticateToken, sensorScope, async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -914,7 +918,7 @@ router.get('/protection-windows', authenticateToken, async (req, res) => {
 });
 
 // POST /monitoring/protection-windows  { scope_type, scope_value?, reason, starts_at?, ends_at }
-router.post('/protection-windows', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/protection-windows', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -935,7 +939,7 @@ router.post('/protection-windows', authenticateToken, requirePermission('devices
 });
 
 // POST /monitoring/protection-windows/:id/cancel
-router.post('/protection-windows/:id/cancel', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/protection-windows/:id/cancel', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -1031,7 +1035,7 @@ async function applyIntegrity(client, sensorId, b) {
 
 // PUT /monitoring/sensors/:id/driver  { driver_id }  — bind a device to a driver
 // (null unbinds → treated as native). Provisioning action: FlowGuard ops only.
-router.put('/sensors/:sensorId/driver', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.put('/sensors/:sensorId/driver', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
     if (denyTenant(req, res)) return;
@@ -1050,7 +1054,7 @@ router.put('/sensors/:sensorId/driver', authenticateToken, requirePermission('de
 
 // PUT /monitoring/sensors/:id/geofence  { center_lat, center_lng, radius_m } | { anchor:true }
 // `anchor:true` pins the fence to the device's current reported position.
-router.put('/sensors/:sensorId/geofence', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.put('/sensors/:sensorId/geofence', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
     const b = req.body || {};
@@ -1079,7 +1083,7 @@ router.put('/sensors/:sensorId/geofence', authenticateToken, requirePermission('
 });
 
 // POST /monitoring/sensors/:id/tamper  { flagged:boolean, reason? }  — raise/clear
-router.post('/sensors/:sensorId/tamper', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/sensors/:sensorId/tamper', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
     const b = req.body || {};
@@ -1102,7 +1106,7 @@ router.post('/sensors/:sensorId/tamper', authenticateToken, requirePermission('d
 });
 
 // PUT /monitoring/sensors/:id/lifecycle  { lifecycle_state, note? }
-router.put('/sensors/:sensorId/lifecycle', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.put('/sensors/:sensorId/lifecycle', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
     const to = (req.body || {}).lifecycle_state;
@@ -1116,7 +1120,7 @@ router.put('/sensors/:sensorId/lifecycle', authenticateToken, requirePermission(
 });
 
 // PUT /monitoring/sensors/:id/hardware — manufacturing / identity fields
-router.put('/sensors/:sensorId/hardware', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.put('/sensors/:sensorId/hardware', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
     const b = req.body || {};
@@ -1134,7 +1138,7 @@ router.put('/sensors/:sensorId/hardware', authenticateToken, requirePermission('
 });
 
 // GET /monitoring/sensors/:id/lifecycle — event log (transitions, RMA, notes)
-router.get('/sensors/:sensorId/lifecycle', authenticateToken, async (req, res) => {
+router.get('/sensors/:sensorId/lifecycle', authenticateToken, sensorScope, async (req, res) => {
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
     const { rows } = await pool.query(`
@@ -1147,7 +1151,7 @@ router.get('/sensors/:sensorId/lifecycle', authenticateToken, async (req, res) =
 
 // GET /monitoring/sensors/:id/timeline — one chronological feed unifying
 // maintenance events, command activity and lifecycle transitions.
-router.get('/sensors/:sensorId/timeline', authenticateToken, async (req, res) => {
+router.get('/sensors/:sensorId/timeline', authenticateToken, sensorScope, async (req, res) => {
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
     const id = req.params.sensorId;
@@ -1213,7 +1217,7 @@ router.get('/sensors/:sensorId/timeline', authenticateToken, async (req, res) =>
 // POST /monitoring/sensors/:id/replace  { replacement_sensor_id, note? }
 // RMA transfer: move property, coverage, tags, profile from the failed unit to
 // its replacement; retire the old (rma) and bring the new online.
-router.post('/sensors/:sensorId/replace', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/sensors/:sensorId/replace', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   const client = await pool.connect();
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -1260,7 +1264,7 @@ function cleanTags(arr) {
 }
 
 // PUT /monitoring/sensors/:sensorId/tags  { tags:[] }  → replace this node's tags
-router.put('/sensors/:sensorId/tags', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.put('/sensors/:sensorId/tags', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -1274,7 +1278,7 @@ router.put('/sensors/:sensorId/tags', authenticateToken, requirePermission('devi
 });
 
 // POST /monitoring/sensors/tags/bulk  { sensor_ids:[], add:[], remove:[] }
-router.post('/sensors/tags/bulk', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/sensors/tags/bulk', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -1300,7 +1304,7 @@ router.post('/sensors/tags/bulk', authenticateToken, requirePermission('devices.
 });
 
 // GET /monitoring/sensors/:sensorId/commands — queued + past commands for one node
-router.get('/sensors/:sensorId/commands', authenticateToken, async (req, res) => {
+router.get('/sensors/:sensorId/commands', authenticateToken, sensorScope, async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -1318,7 +1322,7 @@ router.get('/sensors/:sensorId/commands', authenticateToken, async (req, res) =>
 });
 
 // POST /monitoring/sensors/:sensorId/commands  { command_type, payload?, note? }
-router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/sensors/:sensorId/commands', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -1371,7 +1375,7 @@ router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission(
 });
 
 // POST /monitoring/sensors/commands/bulk  { sensor_ids: [...], command_type, payload?, note? }
-router.post('/sensors/commands/bulk', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/sensors/commands/bulk', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -1384,13 +1388,20 @@ router.post('/sensors/commands/bulk', authenticateToken, requirePermission('devi
     if (ids.length > 200) return res.status(400).json({ success: false, error: 'Too many sensors in one bulk request (max 200)' });
 
     const { rows: valid } = await pool.query(
-      `SELECT sensor_id FROM sensors WHERE sensor_id = ANY($1)`, [ids]);
+      `SELECT sensor_id, driver_id FROM sensors WHERE sensor_id = ANY($1)`, [ids]);
     let validIds = valid.map(r => r.sensor_id);
     // multi-tenant isolation: drop any target outside the caller's tenancy
     const scope = await deviceSensorScope(req);
     if (scope) { const set = new Set(scope); validIds = validIds.filter(id => set.has(id)); }
+    // third-party abstraction: drop devices whose driver can't take this command
+    const drvById = new Map(valid.map(r => [r.sensor_id, r.driver_id]));
+    const unsupported = [];
+    for (const id of validIds) {
+      if (!driverSupportsCommand(await getDriver(drvById.get(id)), req.body.command_type)) unsupported.push(id);
+    }
+    if (unsupported.length) { const u = new Set(unsupported); validIds = validIds.filter(id => !u.has(id)); }
     const skipped = ids.filter(id => !validIds.includes(id));
-    if (!validIds.length) return res.status(404).json({ success: false, error: 'None of the given sensors are within your scope' });
+    if (!validIds.length) return res.status(404).json({ success: false, error: 'No eligible sensors (out of scope, unknown, or driver does not support this command)' });
 
     const payload = req.body.payload ? JSON.stringify(req.body.payload) : null;
     const { rows } = await pool.query(`
@@ -1407,7 +1418,7 @@ router.post('/sensors/commands/bulk', authenticateToken, requirePermission('devi
 });
 
 // POST /monitoring/sensors/:sensorId/commands/:commandId/cancel — pull back a queued command
-router.post('/sensors/:sensorId/commands/:commandId/cancel', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/sensors/:sensorId/commands/:commandId/cancel', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -1426,7 +1437,7 @@ router.post('/sensors/:sensorId/commands/:commandId/cancel', authenticateToken, 
 
 // ── Incident candidates: automation drafts, a human confirms ──
 // GET /monitoring/incident-candidates?status=pending
-router.get('/incident-candidates', authenticateToken, async (req, res) => {
+router.get('/incident-candidates', authenticateToken, sensorScope, async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
@@ -1448,7 +1459,7 @@ router.get('/incident-candidates', authenticateToken, async (req, res) => {
 // POST /monitoring/incident-candidates/:id/confirm  { confirmed: true|false, note? }
 //   confirmed → writes a flood_incident property_event (resets days-flood-free)
 //   dismissed → nothing client-facing; a false positive never touches their record
-router.post('/incident-candidates/:id/confirm', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+router.post('/incident-candidates/:id/confirm', authenticateToken, sensorScope, requirePermission('devices.manage'), async (req, res) => {
   const client = await pool.connect();
   try {
     const { isClient } = require('../utils/scope');

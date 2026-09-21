@@ -34,7 +34,16 @@ ALTER TABLE sensors ADD COLUMN IF NOT EXISTS applied_profile_version INTEGER;   
 ALTER TABLE sensors ADD COLUMN IF NOT EXISTS reported_config JSONB;             -- what the device says it's running (future firmware)
 CREATE INDEX IF NOT EXISTS idx_sensors_profile ON sensors(profile_id);
 
--- allow config pushes on the command queue
+-- allow config pushes on the command queue.
+-- NOTE: this lists the FULL command vocabulary (mirrors 2026-09-21-command-vocab.sql)
+-- so the constraint is identical whichever of the two migrations runs last —
+-- filename order would otherwise let this clobber the expanded vocabulary on a
+-- fresh rebuild.
 ALTER TABLE device_commands DROP CONSTRAINT IF EXISTS device_commands_command_type_check;
 ALTER TABLE device_commands ADD CONSTRAINT device_commands_command_type_check
-  CHECK (command_type IN ('firmware_update','reset','recalibrate','apply_config'));
+  CHECK (command_type IN (
+    'firmware_update','reset','recalibrate','apply_config',
+    'force_sync','connectivity_test','self_test','reconnect_modem','refresh_gps',
+    'diagnostic_bundle','locate','set_reporting_interval','set_thresholds',
+    'enable_sensor','disable_sensor','reset_config','factory_reset','reprovision'
+  ));
