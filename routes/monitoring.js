@@ -309,6 +309,8 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
              s.client_id, s.property_id, s.device_variant, s.firmware_version,
              s.capabilities, s.link_type, s.tags, s.profile_id, s.applied_profile_version,
              pf.name AS profile_name, pf.version AS profile_version,
+             s.lifecycle_state, s.serial_number, s.hardware_rev, s.manufacturing_batch,
+             s.modem_imei, s.sim_iccid, s.install_date, s.warranty_expires_at,
              s.last_calibrated_at, s.calibration_due_at,
              s.enzyme_level_percent, s.cartridge_status,
              -- CANONICAL: a Sentinel attaches to a PROPERTY (via sensors.property_id
@@ -393,6 +395,9 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
         capabilities: x.capabilities || {}, link_type: x.link_type,
         tags: x.tags || [],
         profile_id: x.profile_id, profile_name: x.profile_name,
+        lifecycle_state: x.lifecycle_state,
+        serial_number: x.serial_number, hardware_rev: x.hardware_rev, manufacturing_batch: x.manufacturing_batch,
+        modem_imei: x.modem_imei, sim_iccid: x.sim_iccid, install_date: x.install_date, warranty_expires_at: x.warranty_expires_at,
         config_drift: x.profile_id ? (x.applied_profile_version !== x.profile_version) : false,
         config_state: !x.profile_id ? 'none' : (x.applied_profile_version == null ? 'pending' : (x.applied_profile_version !== x.profile_version ? 'drift' : 'in_sync')),
         last_calibrated_at: x.last_calibrated_at, calibration_due_at: x.calibration_due_at,
@@ -869,6 +874,100 @@ router.post('/protection-windows/:id/cancel', authenticateToken, requirePermissi
     if (!rowCount) return res.status(404).json({ success: false, error: 'Window not found' });
     res.json({ success: true });
   } catch (err) { console.error('cancel protection-window', err); res.status(500).json({ success: false, error: 'Failed to cancel' }); }
+});
+
+// ── Device lifecycle + hardware inventory + RMA ───────────────────────────
+const LIFECYCLE = ['inventory','warehouse','assigned','installed','active','maintenance','rma','retired'];
+async function logLifecycle(sensorId, event, fromState, toState, detail, actorId) {
+  try {
+    await pool.query(
+      `INSERT INTO device_lifecycle_events (sensor_id, event, from_state, to_state, detail, actor_id)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [sensorId, event, fromState || null, toState || null, detail ? JSON.stringify(detail) : null, actorId || null]);
+  } catch (e) { console.error('[logLifecycle]', e.message); }
+}
+
+// PUT /monitoring/sensors/:id/lifecycle  { lifecycle_state, note? }
+router.put('/sensors/:sensorId/lifecycle', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  try {
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const to = (req.body || {}).lifecycle_state;
+    if (!LIFECYCLE.includes(to)) return res.status(400).json({ success: false, error: 'Invalid lifecycle_state' });
+    const cur = (await pool.query('SELECT lifecycle_state FROM sensors WHERE sensor_id = $1', [req.params.sensorId])).rows[0];
+    if (!cur) return res.status(404).json({ success: false, error: 'Sensor not found' });
+    await pool.query('UPDATE sensors SET lifecycle_state = $2, updated_at = NOW() WHERE sensor_id = $1', [req.params.sensorId, to]);
+    await logLifecycle(req.params.sensorId, 'state_change', cur.lifecycle_state, to, (req.body || {}).note ? { note: req.body.note } : null, req.user.id);
+    res.json({ success: true, data: { lifecycle_state: to } });
+  } catch (err) { console.error('PUT lifecycle', err); res.status(500).json({ success: false, error: 'Failed to update lifecycle' }); }
+});
+
+// PUT /monitoring/sensors/:id/hardware — manufacturing / identity fields
+router.put('/sensors/:sensorId/hardware', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  try {
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const b = req.body || {};
+    const s = v => v == null || v === '' ? null : String(v).slice(0, 64);
+    const { rows } = await pool.query(
+      `UPDATE sensors SET serial_number=$2, hardware_rev=$3, manufacturing_batch=$4,
+              modem_imei=$5, sim_iccid=$6, install_date=$7, warranty_expires_at=$8, updated_at=NOW()
+        WHERE sensor_id=$1
+        RETURNING serial_number, hardware_rev, manufacturing_batch, modem_imei, sim_iccid, install_date, warranty_expires_at`,
+      [req.params.sensorId, s(b.serial_number), s(b.hardware_rev), s(b.manufacturing_batch),
+       s(b.modem_imei), s(b.sim_iccid), b.install_date || null, b.warranty_expires_at || null]);
+    if (!rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) { console.error('PUT hardware', err); res.status(500).json({ success: false, error: 'Failed to update hardware' }); }
+});
+
+// GET /monitoring/sensors/:id/lifecycle — event log (transitions, RMA, notes)
+router.get('/sensors/:sensorId/lifecycle', authenticateToken, async (req, res) => {
+  try {
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const { rows } = await pool.query(`
+      SELECT e.*, u.full_name AS actor_name FROM device_lifecycle_events e
+        LEFT JOIN users u ON u.id = e.actor_id
+       WHERE e.sensor_id = $1 ORDER BY e.created_at DESC LIMIT 100`, [req.params.sensorId]);
+    res.json({ success: true, data: rows });
+  } catch (err) { console.error('GET lifecycle', err); res.status(500).json({ success: false, error: 'Failed to load lifecycle' }); }
+});
+
+// POST /monitoring/sensors/:id/replace  { replacement_sensor_id, note? }
+// RMA transfer: move property, coverage, tags, profile from the failed unit to
+// its replacement; retire the old (rma) and bring the new online.
+router.post('/sensors/:sensorId/replace', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const oldId = req.params.sensorId, newId = (req.body || {}).replacement_sensor_id;
+    if (!newId) return res.status(400).json({ success: false, error: 'replacement_sensor_id required' });
+    if (newId === oldId) return res.status(400).json({ success: false, error: 'Replacement must be a different device' });
+    const rows = (await client.query('SELECT sensor_id, lifecycle_state, property_id, tags, profile_id FROM sensors WHERE sensor_id = ANY($1)', [[oldId, newId]])).rows;
+    const oldS = rows.find(r => r.sensor_id === oldId), newS = rows.find(r => r.sensor_id === newId);
+    if (!oldS || !newS) return res.status(404).json({ success: false, error: 'Old or replacement device not found' });
+
+    await client.query('BEGIN');
+    // move property, tags, profile to the replacement; reset its applied config version
+    await client.query(`UPDATE sensors SET property_id=$2, tags=$3, profile_id=$4, applied_profile_version=NULL,
+                          lifecycle_state='active', updated_at=NOW() WHERE sensor_id=$1`,
+      [newId, oldS.property_id, oldS.tags, oldS.profile_id]);
+    // move coverage rows (skip any that would collide on the replacement)
+    await client.query(`
+      UPDATE sentinel_coverage sc SET sensor_id=$2
+       WHERE sc.sensor_id=$1
+         AND NOT EXISTS (SELECT 1 FROM sentinel_coverage x WHERE x.sensor_id=$2 AND x.property_id=sc.property_id)`,
+      [oldId, newId]);
+    await client.query(`DELETE FROM sentinel_coverage WHERE sensor_id=$1`, [oldId]);
+    // retire the failed unit, detach it from the property/profile
+    await client.query(`UPDATE sensors SET lifecycle_state='rma', property_id=NULL, profile_id=NULL, updated_at=NOW() WHERE sensor_id=$1`, [oldId]);
+    const detail = { counterpart: newId, note: (req.body || {}).note || null };
+    await logLifecycle(oldId, 'rma_out', oldS.lifecycle_state, 'rma', { replaced_by: newId, note: detail.note }, req.user.id);
+    await logLifecycle(newId, 'rma_in', newS.lifecycle_state, 'active', { replaces: oldId, note: detail.note }, req.user.id);
+    await client.query('COMMIT');
+    res.json({ success: true, data: { old: oldId, replacement: newId } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST replace', err); res.status(500).json({ success: false, error: 'Failed to transfer' });
+  } finally { client.release(); }
 });
 
 // ── Device tags (grouping / bulk targeting) ───────────────────────────────
