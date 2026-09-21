@@ -313,6 +313,10 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
              s.modem_imei, s.sim_iccid, s.install_date, s.warranty_expires_at,
              s.last_calibrated_at, s.calibration_due_at,
              s.enzyme_level_percent, s.cartridge_status,
+             s.geofence_center_lat, s.geofence_center_lng, s.geofence_radius_m,
+             s.geofence_state, s.geofence_distance_m,
+             s.last_clock_skew_seconds, s.clock_synced_at,
+             s.tamper_flagged, s.tamper_reason, s.tamper_at,
              -- CANONICAL: a Sentinel attaches to a PROPERTY (via sensors.property_id
              -- and sentinel_coverage), and the "client" is that property's OWNER
              -- (a users row) — NOT the clients-account table. The client is ONLY
@@ -401,6 +405,11 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
         config_drift: x.profile_id ? (x.applied_profile_version !== x.profile_version) : false,
         config_state: !x.profile_id ? 'none' : (x.applied_profile_version == null ? 'pending' : (x.applied_profile_version !== x.profile_version ? 'drift' : 'in_sync')),
         last_calibrated_at: x.last_calibrated_at, calibration_due_at: x.calibration_due_at,
+        geofence_center_lat: x.geofence_center_lat, geofence_center_lng: x.geofence_center_lng,
+        geofence_radius_m: x.geofence_radius_m, geofence_state: x.geofence_state, geofence_distance_m: x.geofence_distance_m,
+        last_clock_skew_seconds: x.last_clock_skew_seconds, clock_synced_at: x.clock_synced_at,
+        tamper_flagged: x.tamper_flagged, tamper_reason: x.tamper_reason, tamper_at: x.tamper_at,
+        ...integrityOf(x),
         enzyme_level_percent: x.enzyme_level_percent != null ? parseFloat(x.enzyme_level_percent) : null,
         cartridge_status: x.cartridge_status,
         silt_depth_mm: x.silt_depth_mm != null ? parseFloat(x.silt_depth_mm) : null,
@@ -559,6 +568,10 @@ router.post('/readings', authenticateDevice, async (req, res) => {
         updated_at       = NOW()
       WHERE sensor_id = $1`,
       [sensorId, ts, batt, signal, b.firmware_version || null]);
+
+    // fold in integrity signals (clock skew, geofence, tamper) — best-effort
+    try { await applyIntegrity(client, sensorId, b); }
+    catch (e) { console.error('[applyIntegrity]', e.message); }
 
     // hand over queued commands — store-and-forward: "delivery" happens here,
     // piggybacked on the node's own reporting cadence.
@@ -907,6 +920,130 @@ async function logLifecycle(sensorId, event, fromState, toState, detail, actorId
   } catch (e) { console.error('[logLifecycle]', e.message); }
 }
 
+// ── Device integrity (time-sync / geofence / tamper) ──────────────────────
+const CLOCK_SKEW_LIMIT_S = 300;   // beyond ±5 min is a drift worth flagging
+async function logIntegrity(runner, sensorId, kind, detail, actorId) {
+  try {
+    await (runner || pool).query(
+      `INSERT INTO device_integrity_events (sensor_id, kind, detail, actor_id) VALUES ($1,$2,$3,$4)`,
+      [sensorId, kind, detail ? JSON.stringify(detail) : null, actorId || null]);
+  } catch (e) { console.error('[logIntegrity]', e.message); }
+}
+function haversineM(lat1, lng1, lat2, lng2) {
+  const R = 6371000, toR = d => d * Math.PI / 180;
+  const dLat = toR(lat2 - lat1), dLng = toR(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toR(lat1)) * Math.cos(toR(lat2)) * Math.sin(dLng / 2) ** 2;
+  return Math.round(2 * R * Math.asin(Math.min(1, Math.sqrt(a))));
+}
+// Derive an integrity verdict from a sensor row (used by /sensors/all).
+function integrityOf(s) {
+  const reasons = [];
+  if (s.tamper_flagged) reasons.push('tamper flagged');
+  if (s.geofence_state === 'breach') reasons.push(`outside geofence (${s.geofence_distance_m ?? '?'} m)`);
+  if (s.last_clock_skew_seconds != null && Math.abs(s.last_clock_skew_seconds) >= CLOCK_SKEW_LIMIT_S)
+    reasons.push(`clock skew ${Math.round(s.last_clock_skew_seconds / 60)} min`);
+  const state = s.tamper_flagged ? 'critical'
+    : reasons.length ? 'warning'
+    : (s.geofence_state === 'unknown' && s.clock_synced_at == null) ? 'unknown' : 'ok';
+  return { integrity_state: state, integrity_reasons: reasons };
+}
+// Called inside the readings txn: fold optional device-clock, GPS and tamper
+// signals into the sensor's integrity state, logging transitions.
+async function applyIntegrity(client, sensorId, b) {
+  const cur = (await client.query(
+    `SELECT geofence_center_lat, geofence_center_lng, geofence_radius_m, geofence_state,
+            tamper_flagged, last_clock_skew_seconds
+       FROM sensors WHERE sensor_id = $1 FOR UPDATE`, [sensorId])).rows[0];
+  if (!cur) return;
+
+  // time-sync: device sends its current wall-clock as `device_clock`
+  if (b.device_clock) {
+    const dc = new Date(b.device_clock);
+    if (!isNaN(dc)) {
+      const skew = Math.round((Date.now() - dc.getTime()) / 1000);
+      await client.query(`UPDATE sensors SET last_clock_skew_seconds=$2, clock_synced_at=NOW() WHERE sensor_id=$1`, [sensorId, skew]);
+      const was = cur.last_clock_skew_seconds;
+      if (Math.abs(skew) >= CLOCK_SKEW_LIMIT_S && (was == null || Math.abs(was) < CLOCK_SKEW_LIMIT_S))
+        await logIntegrity(client, sensorId, 'clock_drift', { skew_seconds: skew }, null);
+    }
+  }
+
+  // geofence: device reports GPS → update position, compare to the anchor
+  const lat = num(b.latitude, -90, 90), lng = num(b.longitude, -180, 180);
+  if (lat != null && lng != null) {
+    await client.query(`UPDATE sensors SET latitude=$2, longitude=$3 WHERE sensor_id=$1`, [sensorId, lat, lng]);
+    if (cur.geofence_center_lat != null && cur.geofence_center_lng != null) {
+      const dist = haversineM(+cur.geofence_center_lat, +cur.geofence_center_lng, lat, lng);
+      const state = dist <= (cur.geofence_radius_m || 150) ? 'inside' : 'breach';
+      await client.query(`UPDATE sensors SET geofence_state=$2, geofence_distance_m=$3 WHERE sensor_id=$1`, [sensorId, state, dist]);
+      if (state === 'breach' && cur.geofence_state !== 'breach')
+        await logIntegrity(client, sensorId, 'geofence_breach', { distance_m: dist, radius_m: cur.geofence_radius_m }, null);
+      else if (state === 'inside' && cur.geofence_state === 'breach')
+        await logIntegrity(client, sensorId, 'geofence_ok', { distance_m: dist }, null);
+    }
+  }
+
+  // tamper: device raises a tamper flag (enclosure/orientation)
+  if (b.tamper === true && !cur.tamper_flagged) {
+    await client.query(`UPDATE sensors SET tamper_flagged=TRUE, tamper_at=NOW(), tamper_reason=$2 WHERE sensor_id=$1`,
+      [sensorId, String(b.tamper_reason || 'device-reported').slice(0, 200)]);
+    await logIntegrity(client, sensorId, 'tamper_raised', { source: 'device', reason: b.tamper_reason || 'device-reported' }, null);
+  }
+}
+
+// PUT /monitoring/sensors/:id/geofence  { center_lat, center_lng, radius_m } | { anchor:true }
+// `anchor:true` pins the fence to the device's current reported position.
+router.put('/sensors/:sensorId/geofence', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  try {
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const b = req.body || {};
+    const cur = (await pool.query('SELECT latitude, longitude, geofence_radius_m FROM sensors WHERE sensor_id=$1', [req.params.sensorId])).rows[0];
+    if (!cur) return res.status(404).json({ success: false, error: 'Sensor not found' });
+
+    let lat, lng;
+    if (b.anchor === true) {
+      if (cur.latitude == null || cur.longitude == null) return res.status(400).json({ success: false, error: 'Device has no reported position to anchor to' });
+      lat = +cur.latitude; lng = +cur.longitude;
+    } else {
+      lat = num(b.center_lat, -90, 90); lng = num(b.center_lng, -180, 180);
+      if (lat == null || lng == null) return res.status(400).json({ success: false, error: 'center_lat and center_lng (or anchor:true) required' });
+    }
+    let radius = cur.geofence_radius_m || 150;
+    if (b.radius_m != null) { const r = num(b.radius_m, 10, 100000); if (r == null) return res.status(400).json({ success: false, error: 'radius_m must be 10–100000' }); radius = Math.round(r); }
+
+    const { rows } = await pool.query(
+      `UPDATE sensors SET geofence_center_lat=$2, geofence_center_lng=$3, geofence_radius_m=$4,
+              geofence_state='unknown', geofence_distance_m=NULL, updated_at=NOW()
+        WHERE sensor_id=$1 RETURNING geofence_center_lat, geofence_center_lng, geofence_radius_m`,
+      [req.params.sensorId, lat, lng, radius]);
+    await logIntegrity(pool, req.params.sensorId, 'geofence_anchor_set', { center: [lat, lng], radius_m: radius, anchored: b.anchor === true }, req.user.id);
+    res.json({ success: true, data: rows[0] });
+  } catch (err) { console.error('PUT geofence', err); res.status(500).json({ success: false, error: 'Failed to set geofence' }); }
+});
+
+// POST /monitoring/sensors/:id/tamper  { flagged:boolean, reason? }  — raise/clear
+router.post('/sensors/:sensorId/tamper', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  try {
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const b = req.body || {};
+    const flag = b.flagged === true;
+    if (flag) {
+      const { rows } = await pool.query(
+        `UPDATE sensors SET tamper_flagged=TRUE, tamper_at=NOW(), tamper_reason=$2, updated_at=NOW()
+          WHERE sensor_id=$1 RETURNING tamper_flagged`, [req.params.sensorId, String(b.reason || 'flagged by ops').slice(0, 200)]);
+      if (!rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
+      await logIntegrity(pool, req.params.sensorId, 'tamper_raised', { source: 'ops', reason: b.reason || 'flagged by ops' }, req.user.id);
+    } else {
+      const { rows } = await pool.query(
+        `UPDATE sensors SET tamper_flagged=FALSE, tamper_reason=NULL, tamper_at=NULL, updated_at=NOW()
+          WHERE sensor_id=$1 RETURNING tamper_flagged`, [req.params.sensorId]);
+      if (!rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
+      await logIntegrity(pool, req.params.sensorId, 'tamper_cleared', { note: b.reason || null }, req.user.id);
+    }
+    res.json({ success: true, data: { tamper_flagged: flag } });
+  } catch (err) { console.error('POST tamper', err); res.status(500).json({ success: false, error: 'Failed to update tamper flag' }); }
+});
+
 // PUT /monitoring/sensors/:id/lifecycle  { lifecycle_state, note? }
 router.put('/sensors/:sensorId/lifecycle', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
   try {
@@ -957,7 +1094,7 @@ router.get('/sensors/:sensorId/timeline', authenticateToken, async (req, res) =>
   try {
     if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
     const id = req.params.sensorId;
-    const [ev, cmd, life] = await Promise.all([
+    const [ev, cmd, life, intg] = await Promise.all([
       pool.query(`SELECT de.event_type, de.detail, de.occurred_at, u.full_name AS actor
                     FROM device_events de LEFT JOIN users u ON u.id = de.performed_by
                    WHERE de.sensor_id = $1 ORDER BY de.occurred_at DESC LIMIT 60`, [id]),
@@ -968,6 +1105,9 @@ router.get('/sensors/:sensorId/timeline', authenticateToken, async (req, res) =>
       pool.query(`SELECT e.event, e.from_state, e.to_state, e.detail, e.created_at, u.full_name AS actor
                     FROM device_lifecycle_events e LEFT JOIN users u ON u.id = e.actor_id
                    WHERE e.sensor_id = $1 ORDER BY e.created_at DESC LIMIT 60`, [id]),
+      pool.query(`SELECT ie.kind, ie.detail, ie.created_at, u.full_name AS actor
+                    FROM device_integrity_events ie LEFT JOIN users u ON u.id = ie.actor_id
+                   WHERE ie.sensor_id = $1 ORDER BY ie.created_at DESC LIMIT 60`, [id]),
     ]);
 
     const feed = [];
@@ -992,6 +1132,18 @@ router.get('/sensors/:sensorId/timeline', authenticateToken, async (req, res) =>
       feed.push({ ts: r.created_at, source: 'lifecycle', kind: r.event, tone,
         title: r.from_state || r.to_state ? `${String(r.event).replace(/_/g, ' ')}: ${r.from_state || '—'} → ${r.to_state || '—'}` : String(r.event).replace(/_/g, ' '),
         detail: note, actor: r.actor || null });
+    }
+    for (const r of intg.rows) {
+      const map = {
+        geofence_breach: ['err', 'Geofence breach'], geofence_ok: ['ok', 'Geofence restored'],
+        geofence_anchor_set: ['info', 'Geofence anchor set'], tamper_raised: ['err', 'Tamper flagged'],
+        tamper_cleared: ['ok', 'Tamper cleared'], clock_drift: ['warn', 'Clock drift'],
+      }[r.kind] || ['info', String(r.kind).replace(/_/g, ' ')];
+      const d = r.detail || {};
+      const detail = d.distance_m != null ? `${d.distance_m} m from anchor`
+        : d.skew_seconds != null ? `${Math.round(d.skew_seconds / 60)} min skew`
+        : d.reason || d.note || null;
+      feed.push({ ts: r.created_at, source: 'integrity', kind: r.kind, tone: map[0], title: map[1], detail, actor: r.actor || null });
     }
     feed.sort((a, b) => new Date(b.ts) - new Date(a.ts));
     res.json({ success: true, data: feed.slice(0, 80) });
