@@ -571,7 +571,7 @@ router.post('/readings', authenticateDevice, async (req, res) => {
     const { rows: queued } = await client.query(
       `SELECT id, command_type, payload FROM device_commands
         WHERE sensor_id = $1 AND status = 'queued' ORDER BY created_at`, [sensorId]);
-    const isDisr = c => c.command_type === 'reset' || c.command_type === 'firmware_update';
+    const isDisr = c => DISRUPTIVE_COMMANDS.includes(c.command_type);
     let holdReason = null;
     if (queued.some(isDisr)) holdReason = await disruptiveUnsafe(sensorId, level);
     let pending;
@@ -761,16 +761,36 @@ router.post('/sensors/:sensorId/events', authenticateToken, requirePermission('d
 //  check-in (POST /monitoring/readings), which is where it's handed over.
 // ══════════════════════════════════════════════════════════════
 
-const VALID_COMMANDS = ['firmware_update', 'reset', 'recalibrate'];
+// The remote-action vocabulary. `disruptive` commands take the node offline or
+// wipe its state and are gated by the command-safety policy; `needs` validates
+// the payload for parameterised commands.
+const COMMAND_TYPES = {
+  firmware_update:        { disruptive: true, needs: b => (b.payload && b.payload.firmware_version) ? null : 'firmware_update requires payload.firmware_version' },
+  reset:                  { disruptive: true },   // reboot
+  reset_config:           { disruptive: true },   // revert config to defaults
+  factory_reset:          { disruptive: true },   // wipe to factory state
+  reprovision:            { disruptive: true },   // re-enrol / rotate identity
+  recalibrate:            {},
+  apply_config:           {},
+  force_sync:             {},   // report in immediately
+  connectivity_test:      {},   // uplink echo / ping
+  self_test:              {},   // onboard diagnostics
+  reconnect_modem:        {},   // cycle the cellular link
+  refresh_gps:            {},   // re-acquire a GPS fix
+  diagnostic_bundle:      {},   // collect + upload logs
+  locate:                 {},   // blink LED / buzzer to identify in the field
+  set_reporting_interval: { needs: b => { const n = b.payload && Number(b.payload.interval_seconds); return (n >= 30 && n <= 86400) ? null : 'set_reporting_interval requires payload.interval_seconds (30–86400)'; } },
+  set_thresholds:         { needs: b => (b.payload && b.payload.thresholds && typeof b.payload.thresholds === 'object') ? null : 'set_thresholds requires a payload.thresholds object' },
+  enable_sensor:          { needs: b => (b.payload && b.payload.channel) ? null : 'enable_sensor requires payload.channel' },
+  disable_sensor:         { needs: b => (b.payload && b.payload.channel) ? null : 'disable_sensor requires payload.channel' },
+};
+const VALID_COMMANDS = Object.keys(COMMAND_TYPES);
+const DISRUPTIVE_COMMANDS = VALID_COMMANDS.filter(k => COMMAND_TYPES[k].disruptive);
 
 function validateCommandBody(body) {
-  if (!VALID_COMMANDS.includes(body.command_type)) {
-    return `command_type must be one of: ${VALID_COMMANDS.join(', ')}`;
-  }
-  if (body.command_type === 'firmware_update' && !(body.payload && body.payload.firmware_version)) {
-    return 'firmware_update requires payload.firmware_version';
-  }
-  return null;
+  const spec = COMMAND_TYPES[body.command_type];
+  if (!spec) return `command_type must be one of: ${VALID_COMMANDS.join(', ')}`;
+  return spec.needs ? spec.needs(body) : null;
 }
 
 // ── Protection (maintenance) windows ──────────────────────────────────────
@@ -1101,8 +1121,7 @@ router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission(
     // this is the ONLY node still reporting trustworthy data on a channel that
     // is currently at high water — that would blind the drain during a flood
     // window. Ops can still proceed with an explicit override + reason.
-    const DISRUPTIVE = ['reset', 'firmware_update'];
-    if (DISRUPTIVE.includes(req.body.command_type) && req.body.override !== true) {
+    if (DISRUPTIVE_COMMANDS.includes(req.body.command_type) && req.body.override !== true) {
       const reason = await disruptiveUnsafe(req.params.sensorId);
       if (reason) {
         return res.status(409).json({ success: false, safety: true, error: reason,
@@ -1110,7 +1129,7 @@ router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission(
       }
     }
 
-    const overridden = req.body.override === true && DISRUPTIVE.includes(req.body.command_type);
+    const overridden = req.body.override === true && DISRUPTIVE_COMMANDS.includes(req.body.command_type);
     const note = overridden
       ? `[SAFETY OVERRIDE] ${req.body.note || '(no reason given)'}`
       : (req.body.note || null);
