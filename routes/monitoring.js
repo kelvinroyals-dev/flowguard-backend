@@ -931,6 +931,56 @@ router.get('/sensors/:sensorId/lifecycle', authenticateToken, async (req, res) =
   } catch (err) { console.error('GET lifecycle', err); res.status(500).json({ success: false, error: 'Failed to load lifecycle' }); }
 });
 
+// GET /monitoring/sensors/:id/timeline — one chronological feed unifying
+// maintenance events, command activity and lifecycle transitions.
+router.get('/sensors/:sensorId/timeline', authenticateToken, async (req, res) => {
+  try {
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    const id = req.params.sensorId;
+    const [ev, cmd, life] = await Promise.all([
+      pool.query(`SELECT de.event_type, de.detail, de.occurred_at, u.full_name AS actor
+                    FROM device_events de LEFT JOIN users u ON u.id = de.performed_by
+                   WHERE de.sensor_id = $1 ORDER BY de.occurred_at DESC LIMIT 60`, [id]),
+      pool.query(`SELECT dc.command_type, dc.status, dc.note, dc.hold_reason,
+                         dc.created_at, dc.delivered_at, dc.held_at, dc.cancelled_at, u.full_name AS actor
+                    FROM device_commands dc LEFT JOIN users u ON u.id = dc.requested_by
+                   WHERE dc.sensor_id = $1 ORDER BY dc.created_at DESC LIMIT 60`, [id]),
+      pool.query(`SELECT e.event, e.from_state, e.to_state, e.detail, e.created_at, u.full_name AS actor
+                    FROM device_lifecycle_events e LEFT JOIN users u ON u.id = e.actor_id
+                   WHERE e.sensor_id = $1 ORDER BY e.created_at DESC LIMIT 60`, [id]),
+    ]);
+
+    const feed = [];
+    for (const r of ev.rows) {
+      feed.push({ ts: r.occurred_at, source: 'maintenance', kind: r.event_type,
+        title: String(r.event_type || 'event').replace(/_/g, ' '), detail: r.detail || null, actor: r.actor || null });
+    }
+    for (const r of cmd.rows) {
+      // most recent meaningful state stamp for the command
+      const ts = r.cancelled_at || r.delivered_at || r.held_at || r.created_at;
+      const tone = r.status === 'failed' ? 'err'
+        : r.status === 'cancelled' || r.status === 'expired' ? 'muted'
+        : r.hold_reason ? 'warn'
+        : r.status === 'delivered' || r.status === 'acknowledged' ? 'ok' : 'info';
+      feed.push({ ts, source: 'command', kind: r.command_type, tone,
+        title: `${String(r.command_type || 'command').replace(/_/g, ' ')} · ${r.status}`,
+        detail: r.hold_reason ? `Held: ${r.hold_reason}` : (r.note || null), actor: r.actor || null });
+    }
+    for (const r of life.rows) {
+      const note = r.detail && (r.detail.note || r.detail.reason) ? (r.detail.note || r.detail.reason) : null;
+      const tone = r.event === 'rma_out' ? 'err' : r.event === 'rma_in' ? 'ok' : r.event === 'replaced_by' ? 'warn' : 'info';
+      feed.push({ ts: r.created_at, source: 'lifecycle', kind: r.event, tone,
+        title: r.from_state || r.to_state ? `${String(r.event).replace(/_/g, ' ')}: ${r.from_state || '—'} → ${r.to_state || '—'}` : String(r.event).replace(/_/g, ' '),
+        detail: note, actor: r.actor || null });
+    }
+    feed.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+    res.json({ success: true, data: feed.slice(0, 80) });
+  } catch (err) {
+    console.error('GET timeline', err);
+    res.status(500).json({ success: false, error: 'Failed to load timeline' });
+  }
+});
+
 // POST /monitoring/sensors/:id/replace  { replacement_sensor_id, note? }
 // RMA transfer: move property, coverage, tags, profile from the failed unit to
 // its replacement; retire the old (rma) and bring the new online.
