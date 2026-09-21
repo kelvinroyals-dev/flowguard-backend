@@ -130,6 +130,7 @@ app.use(`${API_PREFIX}/service-providers`, require('./routes/serviceProviders'))
 app.use(`${API_PREFIX}/jobs`, require('./routes/jobs'));
 app.use(`${API_PREFIX}/firmware`, require('./routes/firmware'));
 app.use(`${API_PREFIX}/device-profiles`, require('./routes/deviceProfiles'));
+app.use(`${API_PREFIX}/device-drivers`, require('./routes/deviceDrivers'));
 app.use(`${API_PREFIX}`, require('./routes/account'));
 
 // ── 404 ──────────────────────────────────────────────────

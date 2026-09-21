@@ -6,6 +6,7 @@ const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
 const { isClient, isSpUser, deviceSensorScope, sensorInScope } = require('../utils/scope');
+const { getDriver, normalizeReading, driverSupportsCommand } = require('../utils/deviceDrivers');
 const router = express.Router();
 
 // ── Multi-tenant device isolation ─────────────────────────────────────────
@@ -333,6 +334,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
              s.client_id, s.property_id, s.device_variant, s.firmware_version,
              s.capabilities, s.link_type, s.tags, s.profile_id, s.applied_profile_version,
              pf.name AS profile_name, pf.version AS profile_version,
+             s.driver_id, dd.name AS driver_name, dd.vendor AS driver_vendor, dd.native AS driver_native,
              s.lifecycle_state, s.serial_number, s.hardware_rev, s.manufacturing_batch,
              s.modem_imei, s.sim_iccid, s.install_date, s.warranty_expires_at,
              s.last_calibrated_at, s.calibration_due_at,
@@ -361,6 +363,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
              cov.assets, cmd.pending_commands
         FROM sensors s
         LEFT JOIN device_profiles pf ON pf.id = s.profile_id
+        LEFT JOIN device_drivers dd ON dd.id = s.driver_id
         LEFT JOIN clients c  ON c.id = s.client_id
         LEFT JOIN users cu   ON LOWER(cu.email) = LOWER(c.estate_manager_email)
         LEFT JOIN properties sp ON sp.property_id = s.property_id
@@ -423,6 +426,7 @@ router.get('/sensors/all', authenticateToken, async (req, res) => {
         capabilities: x.capabilities || {}, link_type: x.link_type,
         tags: x.tags || [],
         profile_id: x.profile_id, profile_name: x.profile_name,
+        driver_id: x.driver_id, driver_name: x.driver_name, driver_vendor: x.driver_vendor, driver_native: x.driver_native,
         lifecycle_state: x.lifecycle_state,
         serial_number: x.serial_number, hardware_rev: x.hardware_rev, manufacturing_batch: x.manufacturing_batch,
         modem_imei: x.modem_imei, sim_iccid: x.sim_iccid, install_date: x.install_date, warranty_expires_at: x.warranty_expires_at,
@@ -498,7 +502,7 @@ async function authenticateDevice(req, res, next) {
   }
   try {
     const { rows } = await pool.query(
-      `SELECT sensor_id, client_id, status FROM sensors WHERE device_key_hash = $1 LIMIT 1`,
+      `SELECT sensor_id, client_id, status, driver_id FROM sensors WHERE device_key_hash = $1 LIMIT 1`,
       [hashKey(key)]);
     if (!rows.length) {
       await logIngestError(req.body && req.body.sensor_id, 'unrecognised device key', req.body, req.ip);
@@ -522,14 +526,19 @@ const num = (v, lo, hi) => {
 
 // POST /monitoring/readings — a node reports in
 router.post('/readings', authenticateDevice, async (req, res) => {
-  const b = req.body || {};
+  let b = req.body || {};
   const sensorId = req.device.sensor_id;              // trust the key, not the body
 
-  // a device may not claim to be a different sensor
+  // a device may not claim to be a different sensor (control field, pre-map)
   if (b.sensor_id && b.sensor_id !== sensorId) {
     await logIngestError(sensorId, `sensor_id mismatch (claimed ${b.sensor_id})`, b, req.ip);
     return res.status(403).json({ success: false, error: 'Sensor mismatch' });
   }
+
+  // third-party device abstraction: remap the raw payload to canonical fields
+  // via this device's driver (native/unbound → identity, payload already canonical)
+  try { b = normalizeReading(await getDriver(req.device.driver_id), b); }
+  catch (e) { console.error('[driver normalize]', e.message); }
 
   const level   = num(b.water_level_percent, 0, 100);
   const liters  = num(b.water_level_liters, 0, 10000000);
@@ -1020,6 +1029,25 @@ async function applyIntegrity(client, sensorId, b) {
   }
 }
 
+// PUT /monitoring/sensors/:id/driver  { driver_id }  — bind a device to a driver
+// (null unbinds → treated as native). Provisioning action: FlowGuard ops only.
+router.put('/sensors/:sensorId/driver', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
+  try {
+    if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+    if (denyTenant(req, res)) return;
+    const did = (req.body || {}).driver_id;
+    if (did != null) {
+      const d = (await pool.query('SELECT id FROM device_drivers WHERE id = $1 AND active = TRUE', [did])).rows[0];
+      if (!d) return res.status(400).json({ success: false, error: 'Unknown or inactive driver' });
+    }
+    const { rows } = await pool.query(
+      `UPDATE sensors SET driver_id = $2, updated_at = NOW() WHERE sensor_id = $1 RETURNING sensor_id, driver_id`,
+      [req.params.sensorId, did == null ? null : did]);
+    if (!rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
+    res.json({ success: true, data: rows[0] });
+  } catch (err) { console.error('PUT driver', err); res.status(500).json({ success: false, error: 'Failed to set driver' }); }
+});
+
 // PUT /monitoring/sensors/:id/geofence  { center_lat, center_lng, radius_m } | { anchor:true }
 // `anchor:true` pins the fence to the device's current reported position.
 router.put('/sensors/:sensorId/geofence', authenticateToken, requirePermission('devices.manage'), async (req, res) => {
@@ -1298,8 +1326,14 @@ router.post('/sensors/:sensorId/commands', authenticateToken, requirePermission(
     const badReq = validateCommandBody(req.body);
     if (badReq) return res.status(400).json({ success: false, error: badReq });
 
-    const sensorCheck = await pool.query(`SELECT sensor_id FROM sensors WHERE sensor_id = $1`, [req.params.sensorId]);
+    const sensorCheck = await pool.query(`SELECT sensor_id, driver_id FROM sensors WHERE sensor_id = $1`, [req.params.sensorId]);
     if (!sensorCheck.rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
+
+    // third-party abstraction: a device's driver may not support this command
+    const driver = await getDriver(sensorCheck.rows[0].driver_id);
+    if (!driverSupportsCommand(driver, req.body.command_type)) {
+      return res.status(400).json({ success: false, error: `${driver ? driver.name : 'This device'} does not support the "${req.body.command_type}" command` });
+    }
 
     // ── Command-safety policy ──────────────────────────────────────────────
     // A reboot / firmware push takes the node offline for a while. Refuse it if
