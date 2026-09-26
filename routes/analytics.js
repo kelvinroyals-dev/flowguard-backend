@@ -215,6 +215,7 @@ router.get('/overview', authenticateToken, async (req, res) => {
     return 'Monitoring';
   };
   const topEstates = [...withLevel].sort((a, b) => b.score - a.score).slice(0, 12).map(e => ({
+    property_id: e.property_id,
     name: e.name || e.property_id,
     zone: e.location,
     score: e.hasLive ? e.score : null,           // no definitive score without live telemetry
