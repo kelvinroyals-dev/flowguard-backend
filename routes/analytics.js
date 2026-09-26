@@ -186,10 +186,16 @@ router.get('/overview', authenticateToken, async (req, res) => {
   // ── estates + risk ──────────────────────────────────────────────────────
   let estates = [];
   try { estates = await scoreProperties(); } catch (e) { console.error('overview scoreProperties', e.message); }
+  // estate location (zone/city) for the row subtitle — operational, not owner name
+  let loc = {};
+  try {
+    const l = await pool.query(`SELECT property_id, COALESCE(NULLIF(zone,''), city) AS loc FROM properties`);
+    l.rows.forEach(r => { loc[r.property_id] = r.loc || ''; });
+  } catch (_) {}
   const withLevel = estates.map(e => {
-    const hasData = (e.sensor_count || 0) > 0 && e.has_live;
+    const hasLive = (e.sensor_count || 0) > 0 && e.has_live;   // sensor-backed assessment
     const score = Math.round(e.current_risk || 0);
-    return { ...e, score, risk: riskLevel(score, hasData || score > 0) };
+    return { ...e, score, hasLive, location: loc[e.property_id] || '', risk: hasLive ? riskLevel(score, true) : 'unknown' };
   });
   const rk = { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 };
   withLevel.forEach(e => { rk[e.risk] = (rk[e.risk] || 0) + 1; });
@@ -208,13 +214,16 @@ router.get('/overview', authenticateToken, async (req, res) => {
     if (e.health_score != null && e.health_score < 60) return 'Inspection due';
     return 'Monitoring';
   };
-  const topEstates = [...withLevel].sort((a, b) => b.score - a.score).slice(0, 8).map(e => ({
+  const topEstates = [...withLevel].sort((a, b) => b.score - a.score).slice(0, 12).map(e => ({
     name: e.name || e.property_id,
-    zone: e.client_name || '',
-    score: e.score,
+    zone: e.location,
+    score: e.hasLive ? e.score : null,           // no definitive score without live telemetry
+    baseline: e.hasLive ? null : e.score,        // baseline estimate, shown distinctly
     risk: e.risk,
-    change: 0,
-    driver: (e.env_contributors && e.env_contributors[0] && e.env_contributors[0].label) || (e.risk === 'unknown' ? 'No live telemetry' : 'Stable'),
+    change: null,                                // no 1h history yet — never fabricate
+    driver: e.hasLive
+      ? ((e.env_contributors && e.env_contributors[0] && e.env_contributors[0].label) || 'Nominal conditions')
+      : 'Baseline estimate · no live telemetry',
     response: respFor(e),
   }));
 
@@ -222,8 +231,8 @@ router.get('/overview', authenticateToken, async (req, res) => {
   vm.estates = topEstates;
   vm.portfolio = {
     estates: withLevel.length,
-    assessed: withLevel.filter(e => e.risk !== 'unknown').length,
-    unknown: withLevel.filter(e => e.risk === 'unknown').length,
+    assessed: withLevel.filter(e => e.hasLive).length,      // sensor-backed assessments
+    unknown: withLevel.filter(e => !e.hasLive).length,      // baseline / unassessed
   };
 
   // ── device trust ────────────────────────────────────────────────────────
@@ -258,7 +267,7 @@ router.get('/overview', authenticateToken, async (req, res) => {
   } catch (_) {}
 
   // ── response desk ───────────────────────────────────────────────────────
-  const rd = { open: 0, unacknowledged: 0, priority: [], workOrders: 0, teamsDeployed: '0 / 0', slaBreaches: 0, nextAction: 'All estates monitored' };
+  const rd = { open: 0, unacknowledged: 0, priority: [], workOrders: 0, teamsDeployed: '0 / 0', teamsConfigured: false, slaBreaches: 0, nextAction: 'No immediate action required', dispatchable: false };
   try {
     const a = await pool.query(`
       SELECT a.alert_type, a.severity, a.status, a.assigned_team_id, a.created_at,
@@ -277,13 +286,18 @@ router.get('/overview', authenticateToken, async (req, res) => {
       team: r.assigned_team_id ? 'Assigned' : null,
     }));
     const firstUnassigned = a.rows.find(r => !r.assigned_team_id);
-    if (firstUnassigned) rd.nextAction = `Dispatch a team to ${firstUnassigned.property_name || firstUnassigned.asset_name || 'incident'}`;
+    if (firstUnassigned) {
+      rd.dispatchable = true;
+      rd.dispatchTarget = firstUnassigned.property_name || firstUnassigned.asset_name || 'incident';
+      rd.nextAction = `Dispatch a team to ${rd.dispatchTarget}`;
+    }
   } catch (e) { console.error('overview alerts', e.message); }
   try {
     const t = await pool.query(`SELECT status FROM teams`);
     const total = t.rows.length;
     const deployed = t.rows.filter(r => ['on_site', 'en_route'].includes(r.status)).length;
-    rd.teamsDeployed = `${deployed} / ${total}`;
+    rd.teamsConfigured = total > 0;
+    rd.teamsDeployed = total > 0 ? `${deployed} / ${total}` : 'No teams configured';
   } catch (_) {}
   try {
     const j = await pool.query(`SELECT COUNT(*)::int AS n FROM jobs WHERE status IN ('dispatched','accepted','in_progress')`);
