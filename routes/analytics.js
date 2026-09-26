@@ -224,7 +224,7 @@ router.get('/overview', authenticateToken, async (req, res) => {
     change: null,                                // no 1h history yet — never fabricate
     driver: e.hasLive
       ? ((e.env_contributors && e.env_contributors[0] && e.env_contributors[0].label) || 'Nominal conditions')
-      : 'Baseline estimate · no live telemetry',
+      : 'No live assessment',
     response: respFor(e),
   }));
 
