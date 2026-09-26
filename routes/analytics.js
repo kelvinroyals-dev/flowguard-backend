@@ -267,7 +267,7 @@ router.get('/overview', authenticateToken, async (req, res) => {
   } catch (_) {}
 
   // ── response desk ───────────────────────────────────────────────────────
-  const rd = { open: 0, unacknowledged: 0, priority: [], workOrders: 0, teamsDeployed: '0 / 0', teamsConfigured: false, slaBreaches: 0, nextAction: 'No immediate action required', dispatchable: false };
+  const rd = { open: 0, unacknowledged: 0, priority: [], workOrders: 0, teamsDeployed: '0 / 0', teamsConfigured: false, slaBreaches: 0, nextAction: 'No incident response required', dispatchable: false };
   try {
     const a = await pool.query(`
       SELECT a.alert_type, a.severity, a.status, a.assigned_team_id, a.created_at,
