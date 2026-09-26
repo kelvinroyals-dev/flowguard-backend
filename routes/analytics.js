@@ -201,6 +201,35 @@ router.get('/overview', authenticateToken, async (req, res) => {
   withLevel.forEach(e => { rk[e.risk] = (rk[e.risk] || 0) + 1; });
   rk.highRisk = rk.critical + rk.high;
 
+  // ── Change · 1h — snapshot live-assessed scores (≤hourly) and diff vs ~1h ago
+  const changeById = {};
+  const liveIds = withLevel.filter(e => e.hasLive).map(e => e.property_id);
+  if (liveIds.length) {
+    try {
+      const recent = await pool.query(
+        `SELECT DISTINCT ON (property_id) property_id, captured_at
+           FROM estate_risk_snapshots WHERE property_id = ANY($1)
+          ORDER BY property_id, captured_at DESC`, [liveIds]);
+      const lastCap = {}; recent.rows.forEach(r => { lastCap[r.property_id] = r.captured_at; });
+      for (const e of withLevel) {
+        if (!e.hasLive) continue;
+        const last = lastCap[e.property_id];
+        if (!last || (Date.now() - new Date(last).getTime()) > 50 * 60 * 1000) {
+          await pool.query(`INSERT INTO estate_risk_snapshots (property_id, score) VALUES ($1,$2)`, [e.property_id, e.score]);
+        }
+      }
+      const past = await pool.query(
+        `SELECT DISTINCT ON (property_id) property_id, score
+           FROM estate_risk_snapshots
+          WHERE property_id = ANY($1) AND captured_at <= NOW() - INTERVAL '40 minutes'
+          ORDER BY property_id, captured_at DESC`, [liveIds]);
+      past.rows.forEach(r => {
+        const cur = withLevel.find(e => e.property_id === r.property_id);
+        if (cur) changeById[r.property_id] = cur.score - r.score;
+      });
+    } catch (err) { console.error('overview snapshots', err.message); }
+  }
+
   // active jobs per property (for response status)
   let activeJobProps = new Set();
   try {
@@ -221,7 +250,7 @@ router.get('/overview', authenticateToken, async (req, res) => {
     score: e.hasLive ? e.score : null,           // no definitive score without live telemetry
     baseline: e.hasLive ? null : e.score,        // baseline estimate, shown distinctly
     risk: e.risk,
-    change: null,                                // no 1h history yet — never fabricate
+    change: (e.hasLive && changeById[e.property_id] != null) ? changeById[e.property_id] : null,  // real 1h delta or null
     driver: e.hasLive
       ? ((e.env_contributors && e.env_contributors[0] && e.env_contributors[0].label) || 'Nominal conditions')
       : 'No live assessment',
