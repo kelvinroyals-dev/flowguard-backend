@@ -2,6 +2,7 @@
 // Client-role users must only see their own data; ops roles (admin, etc.) see all.
 
 const pool = require('../config/database');
+const assignments = require('./providerAssignments').createProviderAssignments(pool);
 
 function isClient(req) {
   return req && req.user && req.user.role === 'client';
@@ -49,7 +50,8 @@ async function teamIdsForUser(userId) {
 // their organisation (service_provider_property_assignments). FlowGuard staff
 // (no service_provider_org_id) see the whole fleet.
 function isSpUser(req) {
-  return !!(req && req.user && req.user.service_provider_org_id);
+  return !!(req && req.user && (req.user.user_type === 'service_provider'
+    || req.user.spo || req.user.service_provider_org_id));
 }
 
 // The sensor_ids an SP user may see/act on: sensors on the org's ACTIVE
@@ -59,9 +61,12 @@ async function spSensorIds(userId) {
   const { rows } = await pool.query(
     `SELECT s.sensor_id
        FROM sensors s
+       JOIN properties p ON p.property_id = s.property_id
        JOIN service_provider_property_assignments a
-         ON a.property_id = s.property_id AND a.active = TRUE
-       JOIN users u ON u.id = $1 AND u.service_provider_org_id = a.service_provider_org_id`,
+         ON a.property_id = p.${await assignments.propertyKey()} AND a.active = TRUE
+       JOIN users u ON u.id = $1 AND u.service_provider_org_id = a.service_provider_org_id
+       JOIN service_provider_organisations o ON o.id=a.service_provider_org_id
+      WHERE u.user_type='service_provider' AND u.is_active=TRUE AND o.status='active'`,
     [userId]);
   return rows.map(r => r.sensor_id);
 }
@@ -78,13 +83,8 @@ async function deviceSensorScope(req) {
 // full-fleet (non-SP) callers; membership-checked for SP users.
 async function sensorInScope(req, sensorId) {
   if (!isSpUser(req)) return true;
-  const { rows } = await pool.query(
-    `SELECT 1 FROM sensors s
-       JOIN service_provider_property_assignments a
-         ON a.property_id = s.property_id AND a.active = TRUE
-      WHERE s.sensor_id = $1 AND a.service_provider_org_id = $2 LIMIT 1`,
-    [sensorId, req.user.service_provider_org_id]);
-  return rows.length > 0;
+  // Resolve current organisation membership from the database, not stale JWTs.
+  return (await spSensorIds(req.user.id)).includes(sensorId);
 }
 
 module.exports = {

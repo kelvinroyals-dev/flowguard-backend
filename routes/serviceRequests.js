@@ -3,6 +3,7 @@
 const express = require('express');
 const { randomUUID } = require('crypto');
 const pool = require('../config/database');
+const assignments = require('../utils/providerAssignments').createProviderAssignments(pool);
 const { authenticateToken } = require('../middleware/auth');
 const { propertyIdsForUser } = require('../utils/scope');
 const { requirePermission } = require('../utils/permissions');
@@ -30,25 +31,8 @@ router.use((req,res,next)=>staff(req)?requirePermission('jobs.view')(req,res,nex
 // Production assignments reference properties.id (integer); older installations
 // may reference properties.property_id (public text reference). Resolve the FK,
 // not a value cast, so a numeric-looking public reference cannot cross estates.
-let assignmentPropertyKey;
 async function assignmentPropertyJoin() {
-  if (!assignmentPropertyKey) {
-    const { rows } = await pool.query(`SELECT target.attname AS property_key
-      FROM pg_constraint c
-      JOIN pg_attribute source ON source.attrelid=c.conrelid AND source.attnum=ANY(c.conkey)
-      JOIN pg_attribute target ON target.attrelid=c.confrelid AND target.attnum=ANY(c.confkey)
-      WHERE c.contype='f'
-        AND c.conrelid='service_provider_property_assignments'::regclass
-        AND c.confrelid='properties'::regclass
-        AND cardinality(c.conkey)=1 AND source.attname='property_id'`);
-    const key = rows[0]?.property_key;
-    if (rows.length !== 1 || !['id', 'property_id'].includes(key)) {
-      throw new Error('Unsupported provider assignment property relationship');
-    }
-    assignmentPropertyKey = key;
-  }
-  // Only the two whitelisted database column names above can reach SQL.
-  return `JOIN properties p ON p.${assignmentPropertyKey}=a.property_id`;
+  return assignments.join();
 }
 
 async function scope(req, row) {

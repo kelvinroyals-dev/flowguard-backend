@@ -6,6 +6,7 @@ const router = express.Router();
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const pool = require('../config/database');
+const assignments = require('../utils/providerAssignments').createProviderAssignments(pool);
 const { authenticateToken, requireRole } = require('../middleware/auth');
 
 const hashToken = t => crypto.createHash('sha256').update(String(t)).digest('hex');
@@ -100,7 +101,7 @@ router.get('/me/properties', requireServiceProvider, async (req, res) => {
       `SELECT p.property_id, p.property_name, p.property_type, p.city, p.state, p.country,
               p.latitude, p.longitude, a.assigned_at
          FROM service_provider_property_assignments a
-         JOIN properties p ON p.property_id = a.property_id
+         ${await assignments.join()}
         WHERE a.service_provider_org_id = $1 AND a.active = TRUE
         ORDER BY a.assigned_at DESC`, [req.user.spo]);
     return res.json({ success: true, data: rows });
@@ -332,7 +333,7 @@ router.get('/:id/properties', requireStaff, async (req, res) => {
       `SELECT p.property_id, p.property_name, p.property_type, p.city, p.state,
               a.assigned_at, a.assigned_by
          FROM service_provider_property_assignments a
-         JOIN properties p ON p.property_id = a.property_id
+         ${await assignments.join()}
         WHERE a.service_provider_org_id = $1 AND a.active = TRUE
         ORDER BY a.assigned_at DESC`, [id]);
     return res.json({ success: true, data: rows });
@@ -349,13 +350,8 @@ router.post('/:id/properties', requireStaff, async (req, res) => {
     if (!org) return res.status(404).json({ success: false, error: 'Provider not found' });
     const prop = (await pool.query('SELECT property_id FROM properties WHERE property_id = $1', [propertyId])).rows[0];
     if (!prop) return res.status(404).json({ success: false, error: 'Property not found' });
-    const { rows } = await pool.query(
-      `INSERT INTO service_provider_property_assignments (service_provider_org_id, property_id, assigned_by, active)
-       VALUES ($1,$2,$3,TRUE)
-       ON CONFLICT (service_provider_org_id, property_id)
-       DO UPDATE SET active = TRUE, assigned_by = EXCLUDED.assigned_by, assigned_at = NOW()
-       RETURNING *`, [id, propertyId, req.user.id]);
-    return res.status(201).json({ success: true, data: rows[0] });
+    const assignment = await assignments.assign(id, propertyId, req.user.id);
+    return res.status(201).json({ success: true, data: assignment });
   } catch (err) { console.error('POST /:id/properties', err); return res.status(500).json({ success: false, error: 'Failed to assign property' }); }
 });
 
@@ -364,9 +360,7 @@ router.delete('/:id/properties/:propertyId', requireStaff, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: 'Invalid id' });
-    await pool.query(
-      `UPDATE service_provider_property_assignments SET active = FALSE
-        WHERE service_provider_org_id = $1 AND property_id = $2`, [id, req.params.propertyId]);
+    await assignments.unassign(id, req.params.propertyId);
     return res.json({ success: true });
   } catch (err) { console.error('DELETE /:id/properties', err); return res.status(500).json({ success: false, error: 'Failed to unassign' }); }
 });

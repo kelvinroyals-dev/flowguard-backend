@@ -16,6 +16,7 @@ const path = require('path');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const pool = require('../config/database');
+const assignments = require('../utils/providerAssignments').createProviderAssignments(pool);
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { notify, notifyInternal } = require('../utils/notify');
 const { writeLimiter } = require('../middleware/rate-limit');
@@ -90,20 +91,23 @@ const JOB_TYPES = ['inspection', 'drain_cleaning', 'sensor_maintenance', 'repair
 const PRIORITIES = ['low', 'normal', 'high', 'urgent'];
 
 // ── helpers ───────────────────────────────────────────────────────────────
-async function nextReference() {
+async function nextReference(db = pool) {
   const y = new Date().getFullYear();
-  const { rows } = await pool.query(
+  const { rows } = await db.query(
     `SELECT COUNT(*)::int AS n FROM jobs WHERE reference LIKE $1`, [`JOB-${y}-%`]);
   return `JOB-${y}-` + String((rows[0].n || 0) + 1).padStart(6, '0');
 }
 
-async function logEvent(jobId, req, { event_type, from_status = null, to_status = null, note = null, meta = null }) {
+async function logEvent(jobId, req, { event_type, from_status = null, to_status = null, note = null, meta = null }, db = pool) {
   try {
-    await pool.query(
+    await db.query(
       `INSERT INTO job_events (job_id, event_type, from_status, to_status, actor_id, actor_type, note, meta)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [jobId, event_type, from_status, to_status, req.user.id, req.user.user_type, note, meta ? JSON.stringify(meta) : null]);
-  } catch (e) { console.error('[job event] failed:', e.message); }
+  } catch (e) {
+    if (db !== pool) throw e;
+    console.error('[job event] failed:', e.message);
+  }
 }
 
 async function notifySpoMembers(orgId, opts) {
@@ -117,17 +121,10 @@ async function notifySpoMembers(orgId, opts) {
 
 // Dispatching a job for a property implies that provider may operate on it.
 // Upsert the tenancy assignment so the SP's Properties view stays in sync and
-// property-scoped reads have a row to key off. Best-effort — never block dispatch.
-async function ensureAssignment(orgId, propertyId, staffId) {
+// property-scoped reads have a row to key off. Commit atomically with dispatch.
+async function ensureAssignment(orgId, propertyId, staffId, db) {
   if (!orgId || !propertyId) return;
-  try {
-    await pool.query(
-      `INSERT INTO service_provider_property_assignments (service_provider_org_id, property_id, assigned_by, active)
-       VALUES ($1,$2,$3,TRUE)
-       ON CONFLICT (service_provider_org_id, property_id)
-       DO UPDATE SET active = TRUE, assigned_by = EXCLUDED.assigned_by, assigned_at = NOW()`,
-      [orgId, propertyId, staffId || null]);
-  } catch (e) { console.error('[ensureAssignment] failed:', e.message); }
+  await assignments.assign(orgId, propertyId, staffId, db);
 }
 
 // Load a job and enforce tenancy. Returns the row or sends a 403/404 and returns null.
@@ -253,6 +250,7 @@ router.get('/:id', async (req, res) => {
 
 // POST /jobs  → create a draft (or dispatch straight away if org supplied)
 router.post('/', requireStaff, async (req, res) => {
+  let db;
   try {
     const b = req.body || {};
     const jobType = b.job_type;
@@ -267,11 +265,26 @@ router.post('/', requireStaff, async (req, res) => {
       required = (t && t.required) || [];
     }
 
-    const ref = await nextReference();
-    const orgId = b.service_provider_org_id ? parseInt(b.service_provider_org_id, 10) : null;
+    const orgId = b.service_provider_org_id ? Number(b.service_provider_org_id) : null;
+    if (orgId !== null && (!Number.isSafeInteger(orgId) || orgId <= 0))
+      return res.status(400).json({ success: false, error: 'Valid provider id required' });
+    // Resolve schema before acquiring the transaction connection.
+    if (orgId && b.property_id) await assignments.propertyKey();
+    db = await pool.connect();
+    await db.query('BEGIN');
+    if (orgId) {
+      const org = (await db.query('SELECT status FROM service_provider_organisations WHERE id=$1 FOR SHARE', [orgId])).rows[0];
+      if (!org || org.status !== 'active') {
+        await db.query('ROLLBACK');
+        return res.status(409).json({ success: false, error: 'Active provider required' });
+      }
+    }
+    // Serialize reference generation among creates using this route.
+    await db.query('SELECT pg_advisory_xact_lock(7142301)');
+    const ref = await nextReference(db);
     const status = orgId ? 'dispatched' : 'draft';
 
-    const { rows } = await pool.query(
+    const { rows } = await db.query(
       `INSERT INTO jobs
         (reference, property_id, service_provider_org_id, job_type, title, description, priority,
          status, source_ticket_id, required_evidence, scheduled_for, sla_due_at, created_by, dispatched_at)
@@ -282,15 +295,21 @@ router.post('/', requireStaff, async (req, res) => {
        b.scheduled_for || null, b.sla_due_at || null, req.user.id, orgId ? new Date() : null]);
     const job = rows[0];
 
-    await logEvent(job.id, req, { event_type: 'created', to_status: status, note: b.title });
+    await logEvent(job.id, req, { event_type: 'created', to_status: status, note: b.title }, db);
     if (orgId) {
-      await ensureAssignment(orgId, job.property_id, req.user.id);
-      await logEvent(job.id, req, { event_type: 'dispatched', from_status: 'draft', to_status: 'dispatched' });
+      await ensureAssignment(orgId, job.property_id, req.user.id, db);
+      await logEvent(job.id, req, { event_type: 'dispatched', from_status: 'draft', to_status: 'dispatched' }, db);
+    }
+    await db.query('COMMIT');
+    if (orgId) {
       notifySpoMembers(orgId, { type: 'info', title: 'New job dispatched to you',
         message: `${job.reference} — ${job.title}`, link: '#jobs/' + job.id });
     }
     return res.status(201).json({ success: true, data: job });
-  } catch (err) { console.error('POST /jobs', err); return res.status(500).json({ success: false, error: 'Failed to create job' }); }
+  } catch (err) {
+    if (db) await db.query('ROLLBACK').catch(() => {});
+    console.error('POST /jobs', err); return res.status(500).json({ success: false, error: 'Failed to create job' });
+  } finally { if (db) db.release(); }
 });
 
 // POST /jobs/:id/dispatch  body:{ service_provider_org_id, sla_due_at?, scheduled_for? }
@@ -299,26 +318,41 @@ router.post('/:id/dispatch', requireStaff, async (req, res) => {
   if (!job) return;
   if (!['draft', 'declined'].includes(job.status))
     return res.status(409).json({ success: false, error: `Cannot dispatch a job that is ${job.status}` });
-  const orgId = parseInt((req.body || {}).service_provider_org_id, 10);
-  if (!Number.isInteger(orgId)) return res.status(400).json({ success: false, error: 'service_provider_org_id required' });
+  const orgId = Number((req.body || {}).service_provider_org_id);
+  if (!Number.isSafeInteger(orgId) || orgId <= 0) return res.status(400).json({ success: false, error: 'service_provider_org_id required' });
+  let db;
   try {
-    const org = (await pool.query(`SELECT id, status, name FROM service_provider_organisations WHERE id = $1`, [orgId])).rows[0];
-    if (!org) return res.status(404).json({ success: false, error: 'Provider not found' });
-    if (org.status !== 'active') return res.status(409).json({ success: false, error: 'Provider is not active' });
+    if (job.property_id) await assignments.propertyKey();
+    db = await pool.connect();
+    await db.query('BEGIN');
+    const current = (await db.query('SELECT * FROM jobs WHERE id=$1 FOR UPDATE', [job.id])).rows[0];
+    if (!current || !['draft', 'declined'].includes(current.status)) {
+      await db.query('ROLLBACK');
+      return res.status(409).json({ success: false, error: 'Job is no longer available for dispatch' });
+    }
+    const org = (await db.query(`SELECT id, status, name FROM service_provider_organisations WHERE id = $1 FOR SHARE`, [orgId])).rows[0];
+    if (!org || org.status !== 'active') {
+      await db.query('ROLLBACK');
+      return res.status(org ? 409 : 404).json({ success: false, error: org ? 'Provider is not active' : 'Provider not found' });
+    }
 
     const b = req.body || {};
-    const { rows } = await pool.query(
+    const { rows } = await db.query(
       `UPDATE jobs SET service_provider_org_id = $2, status = 'dispatched', dispatched_at = NOW(),
               assigned_technician_id = NULL, decline_reason = NULL,
               sla_due_at = COALESCE($3, sla_due_at), scheduled_for = COALESCE($4, scheduled_for), updated_at = NOW()
         WHERE id = $1 RETURNING *`,
       [job.id, orgId, b.sla_due_at || null, b.scheduled_for || null]);
-    await ensureAssignment(orgId, job.property_id, req.user.id);
-    await logEvent(job.id, req, { event_type: 'dispatched', from_status: job.status, to_status: 'dispatched', meta: { org: orgId } });
+    await ensureAssignment(orgId, current.property_id, req.user.id, db);
+    await logEvent(job.id, req, { event_type: 'dispatched', from_status: current.status, to_status: 'dispatched', meta: { org: orgId } }, db);
+    await db.query('COMMIT');
     notifySpoMembers(orgId, { type: 'info', title: 'New job dispatched to you',
       message: `${job.reference} — ${job.title}`, link: '#jobs/' + job.id });
     return res.json({ success: true, data: rows[0] });
-  } catch (err) { console.error('POST dispatch', err); return res.status(500).json({ success: false, error: 'Failed to dispatch' }); }
+  } catch (err) {
+    if (db) await db.query('ROLLBACK').catch(() => {});
+    console.error('POST dispatch', err); return res.status(500).json({ success: false, error: 'Failed to dispatch' });
+  } finally { if (db) db.release(); }
 });
 
 // POST /jobs/:id/verify  (completed → verified)
