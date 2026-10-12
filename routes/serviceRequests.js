@@ -27,6 +27,30 @@ router.use(async(req,res,next)=>{
 const clientOwner=req=>req.user.account_owner_id||req.user.id;
 router.use((req,res,next)=>staff(req)?requirePermission('jobs.view')(req,res,next):next());
 
+// Production assignments reference properties.id (integer); older installations
+// may reference properties.property_id (public text reference). Resolve the FK,
+// not a value cast, so a numeric-looking public reference cannot cross estates.
+let assignmentPropertyKey;
+async function assignmentPropertyJoin() {
+  if (!assignmentPropertyKey) {
+    const { rows } = await pool.query(`SELECT target.attname AS property_key
+      FROM pg_constraint c
+      JOIN pg_attribute source ON source.attrelid=c.conrelid AND source.attnum=ANY(c.conkey)
+      JOIN pg_attribute target ON target.attrelid=c.confrelid AND target.attnum=ANY(c.confkey)
+      WHERE c.contype='f'
+        AND c.conrelid='service_provider_property_assignments'::regclass
+        AND c.confrelid='properties'::regclass
+        AND cardinality(c.conkey)=1 AND source.attname='property_id'`);
+    const key = rows[0]?.property_key;
+    if (rows.length !== 1 || !['id', 'property_id'].includes(key)) {
+      throw new Error('Unsupported provider assignment property relationship');
+    }
+    assignmentPropertyKey = key;
+  }
+  // Only the two whitelisted database column names above can reach SQL.
+  return `JOIN properties p ON p.${assignmentPropertyKey}=a.property_id`;
+}
+
 async function scope(req, row) {
   if (staff(req)) return true;
   if (client(req)) return (await propertyIdsForUser(clientOwner(req))).map(String).includes(String(row.property_id));
@@ -43,7 +67,8 @@ router.get('/providers',async(req,res)=>{
   if(!client(req))return res.status(403).json({success:false,error:'Client account required'});
   try{
     const ids=await propertyIdsForUser(clientOwner(req));
-    const rows=(await pool.query(`SELECT a.property_id,o.id,o.name,o.contact_person AS contact_name,o.email,o.phone FROM service_provider_property_assignments a JOIN service_provider_organisations o ON o.id=a.service_provider_org_id WHERE a.property_id=ANY($1::varchar[]) AND a.active=TRUE AND o.status='active' ORDER BY o.name`,[ids])).rows;
+    const join=await assignmentPropertyJoin();
+    const rows=(await pool.query(`SELECT p.property_id,o.id,o.name,o.contact_person AS contact_name,o.email,o.phone FROM service_provider_property_assignments a ${join} JOIN service_provider_organisations o ON o.id=a.service_provider_org_id WHERE p.property_id=ANY($1::varchar[]) AND a.active=TRUE AND o.status='active' ORDER BY o.name`,[ids])).rows;
     res.json({success:true,data:rows});
   }catch(_){fail(res);}
 });
@@ -77,7 +102,8 @@ router.post('/', writeLimiter, requireClientPermission('manage_properties'), asy
     if(b.route==='direct_provider') {
       org=Number(b.service_provider_org_id);
       if(!Number.isSafeInteger(org)||org<=0)return res.status(400).json({success:false,error:'Existing provider required'});
-      const existing=(await pool.query(`SELECT 1 FROM service_provider_property_assignments a JOIN service_provider_organisations o ON o.id=a.service_provider_org_id WHERE a.property_id=$1 AND a.service_provider_org_id=$2 AND a.active=TRUE AND o.status='active'`,[b.property_id,org])).rows;
+      const join=await assignmentPropertyJoin();
+      const existing=(await pool.query(`SELECT 1 FROM service_provider_property_assignments a ${join} JOIN service_provider_organisations o ON o.id=a.service_provider_org_id WHERE p.property_id=$1 AND a.service_provider_org_id=$2 AND a.active=TRUE AND o.status='active'`,[b.property_id,org])).rows;
       if(!existing.length)return res.status(403).json({success:false,error:'Provider is not active on this estate'});
     }
     const row=(await pool.query(`INSERT INTO service_requests(id,property_id,requested_by,route,service_provider_org_id,job_type,title,description) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[randomUUID(),b.property_id,req.user.id,b.route,org,b.job_type,b.title.trim(),b.description.trim()])).rows[0];
