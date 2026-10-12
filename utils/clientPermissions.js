@@ -26,7 +26,7 @@ const ALL = CLIENT_PERMISSIONS.slice();
 // role key -> { label, perms }
 const CLIENT_ROLES = {
   platform_admin: {
-    label: 'Platform admin',
+    label: 'Account administrator',
     desc: 'Full control of the account, team and billing.',
     perms: ALL,
   },
@@ -45,6 +45,11 @@ const CLIENT_ROLES = {
     desc: 'Read-only access to monitoring, alerts and reports. Can raise support tickets.',
     perms: ['view_dashboard','view_monitoring','view_alerts','view_reports','download_reports','submit_support'],
   },
+  viewer: {
+    label: 'Viewer',
+    desc: 'Read monitoring, alerts and shared reports. Cannot submit requests or change the account.',
+    perms: ['view_dashboard','view_monitoring','view_alerts','view_reports','download_reports'],
+  },
 };
 
 const CLIENT_ROLE_KEYS = Object.keys(CLIENT_ROLES);
@@ -53,7 +58,7 @@ function isValidClientRole(role) { return CLIENT_ROLE_KEYS.includes(String(role 
 
 // Permission list for a role (unknown role -> read-only member baseline).
 function permsForRole(role) {
-  const r = CLIENT_ROLES[role] || CLIENT_ROLES.member;
+  const r = CLIENT_ROLES[role] || CLIENT_ROLES.viewer;
   return r.perms.slice();
 }
 
