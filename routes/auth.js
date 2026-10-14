@@ -239,7 +239,7 @@ router.post('/register', async (req, res) => {
   try {
     const { firstName, lastName, fullName: fullNameIn, email, phone, password,
             company, jobTitle, location, plan, marketing, emailVerifyToken,
-            accountType, contactPerson, coverageArea, serviceTypes } = req.body || {};
+            accountType, contactPerson, coverageArea, coverageStates, serviceTypes, property, locationSchema } = req.body || {};
     const fullName = (fullNameIn && fullNameIn.trim())
       || [firstName, lastName].filter(Boolean).join(' ').trim();
     if (!email || !password || !fullName) {
@@ -274,13 +274,20 @@ router.post('/register', async (req, res) => {
       const types = Array.isArray(serviceTypes)
         ? serviceTypes
         : (serviceTypes ? String(serviceTypes).split(',').map(s => s.trim()).filter(Boolean) : null);
+      let canonicalCoverage=null;
+      if(coverageStates!==undefined||locationSchema==='ng-states-v1'){
+        if(!Array.isArray(coverageStates)||!coverageStates.length||coverageStates.length>37)return res.status(400).json({success:false,error:'Select at least one valid coverage state'});
+        const states=coverageStates.map(require('../utils/nigeriaStates').canonical);
+        if(states.some(s=>!s))return res.status(400).json({success:false,error:'Invalid provider coverage state'});
+        canonicalCoverage=[...new Set(states)].sort().join(', ');
+      }
       await client.query('BEGIN');
       const orgRes = await client.query(
         `INSERT INTO service_provider_organisations
            (name, contact_person, email, phone, coverage_area, service_types, status)
          VALUES ($1,$2,$3,$4,$5,$6,'pending') RETURNING *`,
         [orgName, (contactPerson && contactPerson.trim()) || fullName, cleanEmail, phone || null,
-         (coverageArea && String(coverageArea).trim()) || location || null, types]
+         canonicalCoverage || (coverageArea && String(coverageArea).trim()) || location || null, types]
       );
       const org = orgRes.rows[0];
       const spRes = await client.query(
@@ -321,6 +328,49 @@ router.post('/register', async (req, res) => {
     };
     const corridor = CORRIDORS[location] || { area: location || 'Unspecified', city: 'Unspecified', state: 'Unspecified' };
 
+    // Current signup sends an explicit property, separate from the organisation.
+    // Reject malformed submissions before creating any account; never silently
+    // discard property details and report registration as successful.
+    let submittedProperty = null;
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'property')) {
+      if (!property || typeof property !== 'object' || Array.isArray(property)) {
+        return res.status(400).json({ success: false, error: 'Valid property details are required' });
+      }
+      const limits = { name: 255, location: 500, state: 120, type: 100, size: 255, primaryConcern: 10000 };
+      for (const [field, max] of Object.entries(limits)) {
+        if (property[field] != null && (typeof property[field] !== 'string' || property[field].length > max)) {
+          return res.status(400).json({ success: false, error: `Invalid property ${field}` });
+        }
+      }
+      const name = (property.name || '').trim(), address = (property.location || '').trim();
+      if (name.length < 2 || address.length < 2) {
+        return res.status(400).json({ success: false, error: 'Property name and location are required' });
+      }
+      const state=require('../utils/nigeriaStates').canonical(property.state);
+      if((property.state!==undefined||locationSchema==='ng-states-v1')&&!state)return res.status(400).json({success:false,error:'Select a valid property state'});
+      const typeLabel = (property.type || '').trim();
+      const typeKey = typeLabel.toLowerCase().replace(/[\s&-]+/g, '_');
+      const types = {
+        residential_estate: 'residential_estate', commercial: 'commercial_complex',
+        commercial_complex: 'commercial_complex', industrial: 'industrial_park',
+        industrial_park: 'industrial_park', institutional: 'individual_building',
+        retail_hospitality: 'commercial_complex', critical_infrastructure: 'mixed_use',
+        mixed_use: 'mixed_use', individual_building: 'individual_building', other: 'mixed_use'
+      };
+      submittedProperty = {
+        name, address, type: Object.prototype.hasOwnProperty.call(types, typeKey) ? types[typeKey] : (typeLabel ? 'mixed_use' : 'residential_estate'),
+        city: 'Unspecified', state: state || 'Unspecified',
+        meta: { property_type_label: typeLabel || null, approximate_size: (property.size || '').trim() || null,
+          primary_concern: (property.primaryConcern || '').trim() || null }
+      };
+    } else if (location && company && company.trim()) {
+      // Preserve legacy signup without confusing organisation and estate names
+      // in the current, explicit-property flow.
+      submittedProperty = { name: company.trim(), address: corridor.area, type: 'residential_estate',
+        city: corridor.city, state: corridor.state,
+        meta: { corridor: location, service_tier_interest: plan || null, marketing_opt_in: !!marketing } };
+    }
+
     await client.query('BEGIN');
 
     const { rows } = await client.query(
@@ -336,37 +386,38 @@ router.post('/register', async (req, res) => {
     // device the new client signs in from (not just the browser they signed up
     // in). show_demo_data starts on; onboarding_completed flips once they finish
     // the tour, and the portal turns demo off once they have real properties.
+    await client.query('SAVEPOINT onboarding_preferences');
     try {
       await client.query(
         `INSERT INTO user_preferences (user_id, show_demo_data, onboarding_completed)
          VALUES ($1, true, false) ON CONFLICT (user_id) DO NOTHING`, [user.id]);
-    } catch (_) { /* non-blocking — localStorage still drives same-device onboarding */ }
+    } catch (_) {
+      // PostgreSQL errors abort the transaction until rolled back to a savepoint.
+      await client.query('ROLLBACK TO SAVEPOINT onboarding_preferences');
+    }
+    await client.query('RELEASE SAVEPOINT onboarding_preferences');
 
-    // Create a property only when a location was submitted (the legacy single-page
-    // signup). The multi-step signup collects the ORG here, not a property — the
-    // client adds properties in-app afterwards — so org name must NOT become a
-    // property. `location` is the discriminator between the two flows.
+    // Account and property commit together. A failed property INSERT must roll
+    // back the account too, so retrying never leaves an orphan customer account.
     let propertyId = null;
-    if (location && company && company.trim()) {
-      propertyId = 'PROP-' + Date.now().toString(36).toUpperCase() + '-' + Math.floor(Math.random()*1000);
-      const meta = { corridor: location || null, service_tier_interest: plan || null, marketing_opt_in: !!marketing };
+    if (submittedProperty) {
+      propertyId = 'PROP-' + crypto.randomUUID();
       await client.query(
         `INSERT INTO properties
            (property_id, user_id, property_name, property_type, address_line1, city, state, country,
-            contact_person_name, contact_phone, contact_email, current_issues, status)
-         VALUES ($1,$2,$3,'residential_estate',$4,$5,$6,'Nigeria',$7,$8,$9,$10,'submitted')`,
+            contact_person_name, contact_phone, contact_email, current_issues, status, asset_class)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'Nigeria',$8,$9,$10,$11,'submitted','customer_property')`,
         [
-          propertyId, user.id, company.trim(),
-          corridor.area, corridor.city, corridor.state,
+          propertyId, user.id, submittedProperty.name, submittedProperty.type,
+          submittedProperty.address, submittedProperty.city, submittedProperty.state,
           fullName, phone || null, cleanEmail,
-          JSON.stringify(meta),
+          JSON.stringify(submittedProperty.meta),
         ]
       );
     }
 
-    await client.query('COMMIT');
-
     const token = signToken(user);
+    await client.query('COMMIT');
 
     // Fire-and-forget emails (never block or fail the signup response)
     (async () => {
@@ -384,13 +435,13 @@ router.post('/register', async (req, res) => {
         const { notifyInternal } = require('../utils/notify');
         notifyInternal({ type: 'client', title: 'New client signup', message: (user.full_name || user.email) + ' created an account', link: '#clients/' + user.id }, { roles: notifyInternal.ADMIN });
         if (propertyId) {
-          await mailer.sendPropertyReceived(user.email, user.full_name, company.trim(), propertyId);
-          await mailer.sendOpsNewProperty({ property_name: company.trim(), city: corridor.city, state: corridor.state }, user.full_name);
+          await mailer.sendPropertyReceived(user.email, user.full_name, submittedProperty.name, propertyId);
+          await mailer.sendOpsNewProperty({ property_name: submittedProperty.name, city: submittedProperty.city, state: submittedProperty.state }, user.full_name);
         }
       } catch (e) { console.error('[register] email dispatch error:', e.message); }
     })();
 
-    return res.status(201).json({ success: true, data: { token, user: publicUser(user) } });
+    return res.status(201).json({ success: true, data: { token, user: publicUser(user), property_id: propertyId } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('Register error:', err);

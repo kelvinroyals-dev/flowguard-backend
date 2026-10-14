@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
+const { requirePermission } = require('../utils/permissions');
 
 const hashToken = t => crypto.createHash('sha256').update(String(t)).digest('hex');
 const SP_ROLES = ['owner_admin', 'supervisor', 'field_technician'];
@@ -28,15 +29,20 @@ function requireOrgAdmin(req, res, next) {
 }
 // FlowGuard staff only (approvals). Never a client or service provider.
 const requireStaff = [requireRole('admin', 'super_admin', 'operations_manager', 'operations'),
+  requirePermission('providers.manage'),
   (req, res, next) => (req.user.user_type === 'internal'
     ? next()
     : res.status(403).json({ success: false, error: 'Staff only' }))];
 // Read-only staff (adds dispatcher): dispatchers run the Jobs tab and need to
 // read the active-provider list to dispatch, but not approve/reject/assign.
 const requireStaffRead = [requireRole('admin', 'super_admin', 'operations_manager', 'operations', 'dispatcher'),
+  requirePermission('providers.view'),
   (req, res, next) => (req.user.user_type === 'internal'
     ? next()
     : res.status(403).json({ success: false, error: 'Staff only' }))];
+const requireStaffDetail = [requireRole('admin','super_admin','operations_manager','operations'),
+  requirePermission('providers.view'),
+  (req,res,next)=>req.user.user_type==='internal' ? next() : res.status(403).json({success:false,error:'Staff only'})];
 
 const REJECT_REASONS = {
   incomplete_info:     'Incomplete information',
@@ -245,7 +251,7 @@ router.get('/', requireStaffRead, async (req, res) => {
 });
 
 // GET /service-providers/:id  → org detail + members
-router.get('/:id', requireStaff, async (req, res) => {
+router.get('/:id', requireStaffDetail, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: 'Invalid id' });
@@ -324,7 +330,7 @@ router.post('/:id/reject', requireStaff, async (req, res) => {
 // ── property assignments (tenancy) — staff manage which properties an SPO may operate on ──
 
 // GET /service-providers/:id/properties  → assigned properties for an org
-router.get('/:id/properties', requireStaff, async (req, res) => {
+router.get('/:id/properties', requireStaffDetail, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(400).json({ success: false, error: 'Invalid id' });
@@ -346,7 +352,7 @@ router.post('/:id/properties', requireStaff, async (req, res) => {
     const propertyId = (req.body && req.body.property_id) || null;
     if (!Number.isInteger(id) || !propertyId) return res.status(400).json({ success: false, error: 'Org id and property_id required' });
     const org = (await pool.query('SELECT id, status FROM service_provider_organisations WHERE id = $1', [id])).rows[0];
-    if (!org) return res.status(404).json({ success: false, error: 'Provider not found' });
+      if (!org) return res.status(404).json({ success: false, error: 'Provider not found' });
     const prop = (await pool.query('SELECT property_id FROM properties WHERE property_id = $1', [propertyId])).rows[0];
     if (!prop) return res.status(404).json({ success: false, error: 'Property not found' });
     const { rows } = await pool.query(

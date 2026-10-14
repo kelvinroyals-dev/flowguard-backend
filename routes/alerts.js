@@ -3,9 +3,11 @@ const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requirePermission, hasPermission } = require('../utils/permissions');
-const { isClient, teamIdsForUser } = require('../utils/scope');
+const { isClient, isSpUser, teamIdsForUser } = require('../utils/scope');
 const realtime = require('../realtime/io');
 const router = express.Router();
+router.use(authenticateToken);
+router.use((req,res,next)=>isSpUser(req) ? res.status(403).json({success:false,error:'Not authorised'}) : next());
 
 // A field technician may act on an alert ASSIGNED TO THEIR TEAM (resolve it,
 // request backup) without the broad alerts.manage permission.
@@ -43,6 +45,7 @@ router.get('/', authenticateToken, async (req, res) => {
              COALESCE(p.longitude, s.longitude) AS longitude,
              s.name AS sensor_name,
              ft.team_name AS assigned_team,
+             (SELECT j.id FROM jobs j WHERE j.source_alert_id=a.alert_id ORDER BY j.created_at DESC LIMIT 1) AS latest_job_id,
              (SELECT t.ticket_id FROM tickets t
                WHERE t.alert_id = a.alert_id
                ORDER BY t.created_at DESC LIMIT 1) AS ticket_id

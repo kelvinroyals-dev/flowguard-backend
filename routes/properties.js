@@ -3,9 +3,11 @@ const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
-const { isClient, clientIdsForUser, propertyIdsForUser } = require('../utils/scope');
+const { isClient, isSpUser, clientIdsForUser, propertyIdsForUser } = require('../utils/scope');
 const { logAction } = require('../utils/audit');
 const router = express.Router();
+router.use(authenticateToken);
+router.use((req,res,next)=>isSpUser(req) ? res.status(403).json({success:false,error:'Not authorised'}) : next());
 
 // Shared ownership guard for the many /:propertyId/* routes below: a client
 // may only reach a property they own; ops roles may reach any property.
@@ -42,8 +44,11 @@ const FIELD_MAP = {
 router.get('/all', authenticateToken, async (req, res) => {
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
+    let scope;try{scope=require('../utils/geography').scope(req.query);}catch(_){return res.status(400).json({success:false,error:'Invalid geography filter'});}
+    const limit=req.query.limit===undefined?null:Number(req.query.limit),offset=Number(req.query.offset||0);
+    if(limit!==null&&(!Number.isInteger(limit)||limit<1||limit>250)||!Number.isInteger(offset)||offset<0)return res.status(400).json({success:false,error:'Invalid estate page'});
     const { rows } = await pool.query(`
-      SELECT p.property_id, p.property_name, p.property_type, p.city, p.state, p.country,
+      SELECT COUNT(*) OVER()::int AS matched_total,p.property_id, p.property_name, p.property_type, p.city, p.state, p.country,
              p.latitude, p.longitude, p.status, p.urgency_level, p.risk_level, p.health_score, p.created_at,
              p.number_of_units, p.number_of_buildings,
              u.full_name AS client_name, u.email AS client_email,
@@ -62,14 +67,19 @@ router.get('/all', authenticateToken, async (req, res) => {
         SELECT status, scheduled_date FROM inspections
         WHERE property_id = p.property_id ORDER BY created_at DESC LIMIT 1
       ) i ON true
-      WHERE p.asset_class = 'customer_property' OR p.asset_class IS NULL
+      WHERE (p.asset_class = 'customer_property' OR p.asset_class IS NULL) AND p.parent_property_id IS NULL
+        AND ($1::text IS NULL OR LOWER(TRIM(p.state))=LOWER($1) OR ($1='Federal Capital Territory' AND LOWER(TRIM(p.state)) IN ('abuja','fct','abuja fct','fct abuja')))
+        AND ($2::text IS NULL OR LOWER(p.city)=LOWER($2))
+        AND ($3::text IS NULL OR p.property_id=$3)
       ORDER BY
         CASE WHEN p.status='submitted' THEN 1 WHEN p.status='active' THEN 3 ELSE 2 END,
-        p.created_at DESC
-    `);
+        p.created_at DESC,p.property_id
+      LIMIT $4 OFFSET $5
+    `,[scope.state||null,scope.city||null,scope.property_id||null,limit,offset]);
     res.json({
       success: true,
       data: rows,
+      page:{total:rows[0]?.matched_total??0,offset,limit,next_offset:rows.length&&offset+rows.length<(rows[0]?.matched_total||0)?offset+rows.length:null},
       summary: {
         total: rows.length,
         submitted: rows.filter(r => r.status === 'submitted').length,
@@ -233,7 +243,10 @@ router.get('/assets', authenticateToken, async (req, res) => {
       SELECT p.property_id, p.asset_code, p.property_name, p.property_type, p.asset_class,
              p.parent_property_id, p.latitude, p.longitude, p.capacity_liters,
              p.risk_level, p.last_inspected_at, p.status, p.client_id,
-             p.health_score, p.health_updated_at,
+             p.health_score, p.health_updated_at, p.condition, p.zone,
+             p.length_m,p.width_m,p.depth_m,p.downstream_asset_id,
+             (SELECT MAX(t.completed_at) FROM tickets t WHERE t.property_id=p.property_id AND t.work_type IS NOT NULL) AS last_maintenance,
+             (SELECT MIN(t.scheduled_date) FROM tickets t WHERE t.property_id=p.property_id AND t.work_type IS NOT NULL AND t.scheduled_date>=NOW() AND t.status NOT IN ('resolved','closed','cancelled')) AS next_maintenance,
              par.property_name AS parent_name,
              COALESCE(cov.node_count, 0) AS node_count
         FROM properties p
@@ -334,6 +347,41 @@ router.put('/:propertyId/location', authenticateToken, requirePermission('proper
 //   The hierarchy in one call: a customer property, the drainage assets
 //   inside it, and the Sentinel(s) watching each asset with their latest
 //   reading. This is the relationship made visible.
+router.get('/:propertyId/weather', async(req,res)=>{
+ res.set('Cache-Control','private, no-store');
+ try{
+  const record=await require('../utils/propertyReadAccess').readProperty(req,res);if(!record)return;
+  const weather=await require('../utils/estateWeather').load(record);
+  res.json({success:true,data:{...weather,property_id:record.property_id,estateName:record.property_name,locationVerified:record.location_verified===true}});
+ }catch(_){res.status(503).json({success:false,error:'Estate weather unavailable; check location and provider configuration. Missing rainfall is not zero.'});}
+});
+router.get('/:propertyId/weather-history', async(req,res)=>{
+ res.set('Cache-Control','private, no-store');
+ try{
+  const record=await require('../utils/propertyReadAccess').readProperty(req,res);if(!record)return;
+  const point=require('../utils/estateWeather').location(record);if(!point)return res.status(409).json({success:false,error:'Estate location unavailable'});
+  const {rows}=await pool.query('SELECT fetched_at,window_end,payload FROM weather_snapshots WHERE coordinate_key=$1 ORDER BY fetched_at DESC LIMIT 24',[point.lat+','+point.lon]);
+  res.json({success:true,data:rows});
+ }catch(_){res.status(503).json({success:false,error:'Weather history unavailable'});}
+});
+router.get('/:propertyId/monitoring-summary', async(req,res)=>{
+ res.set('Cache-Control','private, no-store');
+ try{
+  const record=await require('../utils/propertyReadAccess').readProperty(req,res);if(!record)return;
+  const {rows}=await pool.query(`SELECT s.sensor_id,s.name,s.status,s.property_id,s.battery_voltage,s.signal_strength,s.last_ping,
+    r.time AS reading_at,r.water_level_percent,r.silt_depth_mm,r.inflow_rate,r.outflow_rate,r.temperature
+    FROM sensors s LEFT JOIN LATERAL (SELECT * FROM sensor_readings WHERE sensor_id=s.sensor_id AND time<=NOW() ORDER BY time DESC LIMIT 1) r ON true
+    WHERE s.property_id IN (SELECT property_id FROM properties WHERE property_id=$1 OR parent_property_id=$1)
+    OR s.sensor_id IN (SELECT sensor_id FROM sentinel_coverage WHERE property_id IN (SELECT property_id FROM properties WHERE property_id=$1 OR parent_property_id=$1)) ORDER BY s.sensor_id`,[record.property_id]);
+  const devices=rows.map(r=>({...r,reporting:r.status==='active'&&r.reading_at!=null&&Date.now()-new Date(r.reading_at).getTime()<=1800000&&r.water_level_percent!=null&&Number(r.water_level_percent)>=0&&Number(r.water_level_percent)<=100}));
+  const {rows:history}=await pool.query(`SELECT r.sensor_id,date_trunc('hour',r.time) AS time,
+    MAX(r.water_level_percent) FILTER (WHERE r.water_level_percent BETWEEN 0 AND 100) AS water_level_percent,
+    MAX(r.silt_depth_mm) FILTER (WHERE r.silt_depth_mm>=0) AS silt_depth_mm,MAX(r.temperature) AS temperature
+    FROM sensor_readings r WHERE r.sensor_id=ANY($1::text[]) AND r.time>NOW()-INTERVAL '24 hours' AND r.time<=NOW()
+    GROUP BY r.sensor_id,date_trunc('hour',r.time) ORDER BY time`,[devices.map(d=>d.sensor_id)]);
+  res.json({success:true,data:{property_id:record.property_id,generated_at:new Date().toISOString(),freshness_minutes:30,devices,history,units:{water_level_percent:'%',silt_depth_mm:'mm',temperature:'°C',battery_voltage:'V',inflow_rate:null,outflow_rate:null},reporting:devices.filter(d=>d.reporting).length,total:devices.length,thresholds:null,aggregation:'Hourly per-device maxima; gaps are not zero. Battery is latest registry voltage, not measured capacity.'}});
+ }catch(_){res.status(503).json({success:false,error:'Estate monitoring unavailable'});}
+});
 router.get('/:propertyId', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -420,6 +468,11 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
     if (!rows[0]) return res.status(404).json({ success: false, error: 'Property not found' });
     if (isClient(req) && rows[0].user_id !== req.user.id) {
       return res.status(403).json({ success: false, error: 'Not authorised' });
+    }
+    // Successful aggregate queries with no rows are known empty collections,
+    // not missing feeds. Preserve the distinction in all linked detail sections.
+    for (const key of ['assets','devices','incidents','inspections','tickets','quotes','invoices']) {
+      if (rows[0][key]===null) rows[0][key]=[];
     }
     res.json({ success: true, data: rows[0] });
   } catch (err) {

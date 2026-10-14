@@ -6,6 +6,12 @@ const { requirePermission } = require('../utils/permissions');
 const realtime = require('../realtime/io');
 const router = express.Router();
 const { logAction } = require('../utils/audit');
+const { isClient, isSpUser } = require('../utils/scope');
+router.use(authenticateToken);
+router.use((req,res,next)=>{
+  if (isSpUser(req)) return res.status(403).json({success:false,error:'Provider reports are not part of the company field-report directory'});
+  next();
+});
 
 // map db status -> frontend status
 const toFe = s => (s === 'review' ? 'under_review' : s);
@@ -14,7 +20,7 @@ const toDb = s => (s === 'under_review' ? 'review' : s);
 // GET /field-reports?status=&limit=
 router.get('/', authenticateToken, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 100, 200);
+    const limit = Math.max(1,Math.min(parseInt(req.query.limit) || 100, 200));
     // Client-role users only see reports for their own properties; ops see all.
     const { isClient, propertyIdsForUser } = require('../utils/scope');
     let clientFilter = '';
@@ -67,6 +73,18 @@ router.post('/', authenticateToken, requirePermission('field-reports.manage'), a
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const b = req.body || {};
+    for(const field of ['title','summary','findings','recommendations','materials_used','executive_summary','internal_notes']) {
+      if (b[field]!=null && typeof b[field]!=='string') return res.status(400).json({success:false,error:`${field} must be text`});
+    }
+    if (!b.title || typeof b.title!=='string' || !b.title.trim()) return res.status(400).json({success:false,error:'A report title is required'});
+    if (!b.property_id) return res.status(400).json({success:false,error:'An estate or asset is required'});
+    const property=await pool.query('SELECT property_id FROM properties WHERE property_id=$1',[b.property_id]);
+    if (!property.rows.length) return res.status(404).json({success:false,error:'Property not found'});
+    if (b.work_duration_min!=null && (!Number.isInteger(Number(b.work_duration_min)) || Number(b.work_duration_min)<0)) return res.status(400).json({success:false,error:'Work duration must be a nonnegative integer'});
+    if (b.inspection_id) {
+      const inspection=await pool.query('SELECT property_id FROM inspections WHERE inspection_id=$1',[b.inspection_id]);
+      if (!inspection.rows.length || inspection.rows[0].property_id!==b.property_id) return res.status(409).json({success:false,error:'Inspection does not belong to the report property'});
+    }
     const reportId = 'FR-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
     // Field portal sends 'submitted' or 'draft'; DB allows draft/review/approved/
     // sent_to_client. A submitted field report enters ops review.
@@ -83,7 +101,7 @@ router.post('/', authenticateToken, requirePermission('field-reports.manage'), a
        RETURNING *`,
       [reportId, b.inspection_id || null, b.property_id || null, b.report_type || null, b.alert_id || null,
        b.title || null, b.summary || null, b.summary || b.title || null, b.findings || null, b.recommendations || null,
-       b.materials_used || null, (parseInt(b.work_duration_min) || null), dbStatus, String(req.user.id), name]);
+       b.materials_used || null, (b.work_duration_min==null ? null : Number(b.work_duration_min)), dbStatus, String(req.user.id), name]);
     logAction(req.user.id, 'submitted a field report', 'report', reportId, { status: dbStatus });
     // Surface submitted reports in the ops notification center for review.
     if (dbStatus === 'review') {
@@ -107,8 +125,8 @@ router.get('/:id', authenticateToken, async (req, res) => {
     const { isClient, propertyIdsForUser } = require('../utils/scope');
     const { rows } = await pool.query(`
       SELECT ir.*, p.property_name, p.city, p.state,
-             i.assigned_agent_name AS submitted_by_name, i.assigned_team AS team_name,
-             i.findings, i.recommendations, i.flood_risk_level, i.drainage_condition_score
+             COALESCE(ir.submitted_by_name,i.assigned_agent_name) AS submitted_by_name, i.assigned_team AS team_name,
+             COALESCE(ir.findings,i.findings) AS findings, COALESCE(ir.recommendations,i.recommendations) AS recommendations, i.flood_risk_level, i.drainage_condition_score
       FROM inspection_reports ir
       LEFT JOIN properties p ON ir.property_id=p.property_id
       LEFT JOIN inspections i ON ir.inspection_id=i.inspection_id
@@ -121,6 +139,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
         return res.status(403).json({ success: false, error: 'Not authorised' });
       }
       delete rows[0].internal_notes;   // internal notes never leave to clients
+      delete rows[0].edit_history;
     }
     rows[0].status = toFe(rows[0].status);
     res.json({ success: true, data: rows[0] });
@@ -134,17 +153,36 @@ router.put('/:id', authenticateToken, requirePermission('field-reports.manage'),
   const { isClient } = require('../utils/scope');
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
+    const current=(await pool.query('SELECT * FROM inspection_reports WHERE report_id=$1',[req.params.id])).rows[0];
+    if (!current) return res.status(404).json({success:false,error:'Report not found'});
+    for(const field of ['title','summary','findings','recommendations','materials_used','executive_summary','internal_notes']) {
+      if (req.body[field]!=null && typeof req.body[field]!=='string') return res.status(400).json({success:false,error:`${field} must be text`});
+    }
+    if (['approved','sent_to_client'].includes(current.status)) return res.status(409).json({success:false,error:'Published reports cannot be edited; submit a new revision for review'});
+    if (req.user.role==='field_lead' && (String(current.submitted_by)!==String(req.user.id) || !['draft','review'].includes(current.status))) return res.status(403).json({success:false,error:'Field staff may edit only their own unpublished reports'});
+    if (req.body.status!=null) {
+      const next=toDb(req.body.status);
+      const transitions={draft:['review'],review:['approved','rejected'],rejected:['review'],approved:[],sent_to_client:[]};
+      if (next!==current.status && !(transitions[current.status] || []).includes(next)) return res.status(409).json({success:false,error:'Invalid report review transition'});
+      if (['approved','rejected'].includes(next) && !['admin','super_admin','operations_manager'].includes(req.user.role)) return res.status(403).json({success:false,error:'An operations reviewer must approve or reject the report'});
+      if (next==='approved' && (!current.findings?.trim() && !req.body.findings?.trim())) return res.status(400).json({success:false,error:'Recorded findings are required before approval'});
+    }
+    if (req.body.work_duration_min!=null && (!Number.isInteger(Number(req.body.work_duration_min)) || Number(req.body.work_duration_min)<0)) return res.status(400).json({success:false,error:'Work duration must be a nonnegative integer'});
     const sets = [], vals = []; let i = 1;
     const FIELDS = ['title', 'summary', 'findings', 'recommendations', 'materials_used', 'work_duration_min', 'executive_summary', 'internal_notes'];
     for (const f of FIELDS) {
-      if (f in req.body) { sets.push(`${f}=$${i++}`); vals.push(f === 'work_duration_min' ? (parseInt(req.body[f]) || null) : req.body[f]); }
+      if (f in req.body) { sets.push(`${f}=$${i++}`); vals.push(f === 'work_duration_min' ? (req.body[f]==null ? null : Number(req.body[f])) : req.body[f]); }
     }
-    if ('status' in req.body) { sets.push(`status=$${i++}`); vals.push(toDb(req.body.status)); }
+    if ('status' in req.body) {
+      sets.push(`status=$${i++}`); vals.push(toDb(req.body.status));
+      if (toDb(req.body.status)==='approved') {sets.push(`approved_by=$${i++}`);vals.push(String(req.user.id));}
+    }
     if (!sets.length) return res.status(400).json({ success:false, error:'No valid fields' });
-    vals.push(req.params.id);
+    vals.push(req.params.id,current.status,current.updated_at);
     const { rows } = await pool.query(
-      `UPDATE inspection_reports SET ${sets.join(', ')}, updated_at=NOW() WHERE report_id=$${i} RETURNING *`, vals);
-    if (!rows[0]) return res.status(404).json({ success:false, error:'Report not found' });
+      `UPDATE inspection_reports SET ${sets.join(', ')}, updated_at=NOW() WHERE report_id=$${i}
+       AND status=$${i+1} AND updated_at IS NOT DISTINCT FROM $${i+2}::timestamptz RETURNING *`, vals);
+    if (!rows[0]) return res.status(409).json({ success:false, error:'Report changed during review; refresh before saving' });
     // keep the linked inspection in step with edited findings/recommendations
     if (rows[0].inspection_id && ('findings' in req.body || 'recommendations' in req.body)) {
       pool.query(`UPDATE inspections SET findings=COALESCE($1,findings), recommendations=COALESCE($2,recommendations), updated_at=NOW() WHERE inspection_id=$3`,
@@ -154,7 +192,7 @@ router.put('/:id', authenticateToken, requirePermission('field-reports.manage'),
     // ── APPROVED → the report is now the client's: advance the property to
     // report_ready, make the report available to download, and email + notify
     // the owner. (Before approval the client only ever sees "Awaiting approval".)
-    if (toDb(req.body.status) === 'approved' && rows[0].property_id) {
+    if (toDb(req.body.status) === 'approved' && current.status!=='approved' && rows[0].property_id) {
       await pool.query(`UPDATE properties SET status='report_ready', updated_at=NOW() WHERE property_id=$1`, [rows[0].property_id]).catch(() => {});
       await pool.query(`UPDATE inspection_reports SET sent_to_client_at = COALESCE(sent_to_client_at, NOW()) WHERE report_id=$1`, [rows[0].report_id]).catch(() => {});
       (async () => {
@@ -194,11 +232,12 @@ router.put('/:id', authenticateToken, requirePermission('field-reports.manage'),
 router.post('/:id/send-to-client', authenticateToken, requirePermission('field-reports.manage'), async (req, res) => {
   const { isClient } = require('../utils/scope');
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  if (!['admin','super_admin','operations_manager'].includes(req.user.role)) return res.status(403).json({success:false,error:'An operations reviewer must share the report'});
   try {
     const { rows } = await pool.query(
       `UPDATE inspection_reports SET status='sent_to_client', sent_to_client_at=NOW(), updated_at=NOW()
-       WHERE report_id=$1 RETURNING *`, [req.params.id]);
-    if (!rows[0]) return res.status(404).json({ success:false, error:'Report not found' });
+       WHERE report_id=$1 AND status='approved' RETURNING *`, [req.params.id]);
+    if (!rows[0]) return res.status(409).json({ success:false, error:'Only an approved report can be shared'});
     realtime.events.reportSent(rows[0]);
     logAction(req.user.id, 'sent inspection report', 'report', rows[0].report_id, { property_id: rows[0].property_id });
     pool.query(`INSERT INTO property_events (property_id, event_type, description, created_by) VALUES ($1,'report_delivered','Inspection report delivered',$2)`, [rows[0].property_id, req.user.id]).catch(()=>{});
@@ -207,7 +246,7 @@ router.post('/:id/send-to-client', authenticateToken, requirePermission('field-r
       .then(pr => pr.rows[0] && require('../utils/notify').notify(pr.rows[0].user_id, {
         type: 'report', title: 'Your inspection report is ready', message: 'Tap to review your assessment report.', link: '#reports',
       })).catch(() => {});
-    res.json({ success: true, data: { sent: true } });
+    res.json({ success: true, data: { shared:true,report_id:rows[0].report_id,status:rows[0].status,sent_to_client_at:rows[0].sent_to_client_at,email_delivery:'not_confirmed' } });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to send report' }); }
 });
 

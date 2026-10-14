@@ -9,11 +9,11 @@ const { isClient } = require('../utils/scope');
 const router = express.Router();
 router.use(authenticateToken);
 router.use((req, res, next) => {
-  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  if (isClient(req) || req.user.user_type === 'service_provider' || req.user.role === 'service_provider') return res.status(403).json({ success: false, error: 'Not authorised' });
   next();
 });
 
-const num = v => v == null ? null : Number(v);
+const num = v => v == null || typeof v === 'boolean' || String(v).trim() === '' || !Number.isFinite(Number(v)) ? null : Number(v);
 function conditionLabel(h) {
   if (h == null) return null;
   return h >= 75 ? 'Good' : h >= 50 ? 'Fair' : h >= 30 ? 'Poor' : 'Critical';
@@ -35,17 +35,30 @@ router.get('/graph', async (req, res) => {
         SELECT p.property_id, p.asset_code, p.property_name, p.property_type, p.zone,
                p.parent_property_id, parent.property_name AS estate_name,
                p.latitude, p.longitude, p.length_m, p.width_m, p.depth_m, p.material,
-               p.flow_direction, p.capacity_liters, p.health_score, p.risk_level,
+               p.flow_direction, p.capacity_liters, p.health_score, p.condition, p.risk_level,
                p.downstream_asset_id, p.water_body_id, p.location_verified,
                p.topology_verified, p.dimensions_verified, p.last_inspected_at,
                (SELECT COUNT(DISTINCT sc.sensor_id) FROM sentinel_coverage sc WHERE sc.property_id = p.property_id)::int AS sentinel_count,
-               (SELECT MAX(r.water_level_percent) FROM sentinel_coverage sc
-                  JOIN sensor_readings r ON r.sensor_id = sc.sensor_id
-                 WHERE sc.property_id = p.property_id AND r.time > NOW() - INTERVAL '6 hours') AS water_level,
+               telemetry.water_level, telemetry.latest_reading, telemetry.reporting_count,
                (SELECT MAX(e.occurred_at) FROM property_events e
                  WHERE e.property_id = p.property_id AND e.event_type IN ('silt_clearing','maintenance','node_repair')) AS last_maintenance
           FROM properties p
           LEFT JOIN properties parent ON parent.property_id = p.parent_property_id
+          LEFT JOIN LATERAL (
+            SELECT MAX(r.water_level_percent) FILTER (
+                     WHERE r.time > NOW() - INTERVAL '30 minutes' AND r.time <= NOW()
+                       AND r.water_level_percent BETWEEN 0 AND 100) AS water_level,
+                   MAX(r.time) AS latest_reading,
+                   COUNT(DISTINCT sc.sensor_id) FILTER (
+                     WHERE r.time > NOW() - INTERVAL '30 minutes' AND r.time <= NOW()
+                       AND r.water_level_percent BETWEEN 0 AND 100)::int AS reporting_count
+              FROM sentinel_coverage sc
+              LEFT JOIN LATERAL (
+                SELECT water_level_percent, time FROM sensor_readings
+                 WHERE sensor_id = sc.sensor_id ORDER BY time DESC LIMIT 1
+              ) r ON true
+             WHERE sc.property_id = p.property_id
+          ) telemetry ON true
          WHERE p.asset_class = 'drainage_asset'
          ORDER BY p.property_type, p.asset_code`),
       pool.query(`
@@ -63,8 +76,12 @@ router.get('/graph', async (req, res) => {
 
     const assets = assetsRes.rows.map(a => ({
       ...a,
+      length_m: num(a.length_m), width_m: num(a.width_m), depth_m: num(a.depth_m),
+      capacity_liters: num(a.capacity_liters), health_score: num(a.health_score),
       water_level: num(a.water_level),
-      condition: conditionLabel(a.health_score),
+      condition: a.condition || null,
+      health_band: conditionLabel(num(a.health_score)),
+      telemetry_state: a.reporting_count > 0 ? (a.reporting_count < a.sentinel_count ? 'partial' : 'recent') : a.latest_reading ? 'stale_or_invalid' : 'missing',
       is_outfall: a.property_type === 'outfall',
       needs_attention: needsAttention(a),
     }));
@@ -96,12 +113,14 @@ router.get('/graph', async (req, res) => {
       assets: assets.length,
       network_km: Math.round(totalLenM / 100) / 10,
       outfalls: assets.filter(a => a.is_outfall).length,
-      connected_properties: properties.length,
+      registered_properties: properties.length,
+      connected_properties: properties.filter(p => assets.some(a => a.property_id === p.downstream_asset_id)).length,
+      length_recorded_assets: assets.filter(a => a.length_m != null).length,
       sentinel_devices: devCount.rows[0].n,
       attention: assets.filter(a => a.needs_attention).length,
     };
 
-    res.json({ success: true, data: { assets, properties, water_bodies, zones, summary } });
+    res.json({ success: true, data: { assets, properties, water_bodies, zones, summary, generated_at: new Date().toISOString(), telemetry_freshness_minutes: 30 } });
   } catch (err) {
     console.error('GET /network/graph', err);
     res.status(500).json({ success: false, error: 'Failed to load network graph' });

@@ -6,7 +6,7 @@ const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
 const { requireIntParam } = require('../middleware/validate-id');
-const { isClient } = require('../utils/scope');
+const { isClient, isSpUser } = require('../utils/scope');
 const { INTERNAL_ROLES, normalizeRole } = require('../utils/roles');
 const router = express.Router();
 
@@ -22,7 +22,7 @@ const canManageRoles = requireRole('admin', 'super_admin');
 // first (so req.user exists), then block client-role tokens outright.
 router.use(authenticateToken);
 router.use((req, res, next) => {
-  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  if (isClient(req) || isSpUser(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   next();
 });
 
@@ -32,7 +32,8 @@ router.get('/', authenticateToken, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT u.id AS user_id, u.id, u.full_name, u.email, u.role, u.user_type,
              u.phone, u.team_id, u.last_login,
-             CASE WHEN u.is_active THEN 'active' ELSE 'inactive' END AS status,
+             CASE WHEN NOT u.is_active THEN 'inactive'
+               WHEN u.email_verified=false AND u.reset_token IS NOT NULL THEN 'invited' ELSE 'active' END AS status,
              u.created_at
       FROM users u
       WHERE u.user_type = 'internal'
@@ -60,9 +61,11 @@ router.get('/:id', authenticateToken, requireIntParam('id'), async (req, res) =>
   try {
     const { rows } = await pool.query(
       `SELECT id, id AS user_id, full_name, email, role, user_type, phone, team_id,
-              CASE WHEN is_active THEN 'active' ELSE 'inactive' END AS status, last_login
-       FROM users WHERE id = $1`, [req.params.id]);
+              CASE WHEN NOT is_active THEN 'inactive'
+                WHEN email_verified=false AND reset_token IS NOT NULL THEN 'invited' ELSE 'active' END AS status, last_login
+       FROM users WHERE id = $1 AND user_type='internal'`, [req.params.id]);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'User not found' });
+    rows[0].effective_permissions=await require('../utils/permissions').effective(rows[0].role);
     res.json({ success: true, data: rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to load user' });
@@ -132,12 +135,11 @@ router.post('/invite', authenticateToken, canManageRoles, requirePermission('tea
 
     let emailed = false;
     try {
-      await require('../utils/mailer').sendStaffInvite(newUser.email, {
+      emailed = await require('../utils/mailer').sendStaffInvite(newUser.email, {
         fullName: newUser.full_name, roleLabel,
         portalName: portal.name, portalUrl: portal.loginUrl, setupUrl,
         inviterName: req.user.full_name || req.user.email,
       });
-      emailed = true;
     } catch (e) { console.error('[invite] email error:', e.message); }
 
     res.status(201).json({ success: true, data: { ...newUser, invited: true, emailed } });
@@ -154,6 +156,7 @@ router.put('/:id', authenticateToken, requireIntParam('id'), requirePermission('
   try {
     const body = req.body || {};
     const changesPrivilege = ['role', 'role_id', 'status', 'is_active'].some(k => k in body);
+    if (changesPrivilege && String(req.user.id)===String(req.params.id)) return res.status(400).json({success:false,error:'Use another administrator to review changes to your own access'});
     if (changesPrivilege && !['admin', 'super_admin'].includes(req.user.role)) {
       return res.status(403).json({ success: false, error: 'Only an admin can change role or account status' });
     }
@@ -183,7 +186,8 @@ router.put('/:id', authenticateToken, requireIntParam('id'), requirePermission('
     const vals = entries.map(([, v]) => v);
     vals.push(req.params.id);
     const { rows } = await pool.query(
-      `UPDATE users SET ${sets.join(', ')}, updated_at=NOW() WHERE id=$${vals.length} RETURNING id, email, full_name, role`, vals);
+      `UPDATE users SET ${sets.join(', ')}, ${changesPrivilege ? 'token_version=COALESCE(token_version,0)+1,' : ''} updated_at=NOW()
+       WHERE id=$${vals.length} AND user_type='internal' RETURNING id, email, full_name, role`, vals);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'User not found' });
 
     // Keep the team_members link table in step with users.team_id so the field

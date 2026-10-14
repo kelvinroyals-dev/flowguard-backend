@@ -14,14 +14,15 @@ const { askLLM, hasKey, MODEL, PROVIDER } = require('../utils/llm');
 const router = express.Router();
 router.use(authenticateToken);
 router.use((req, res, next) => {
-  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
-  next();
+  if(isClient(req)||!require('../utils/roles').INTERNAL_ROLES.includes(req.user.role)||req.user.user_type==='service_provider')return res.status(403).json({success:false,error:'Not authorised'});
+  require('../utils/permissions').requirePermission('forecast.view')(req,res,next);
 });
 
 // POST /ai/brief  body: { property_id }  OR  { scope: 'portfolio' }
 router.post('/brief', async (req, res) => {
   try {
-    const forecast = await buildHorizonForecast();
+    let scope;try{scope=require('../utils/geography').scope({...req.body?.geography,...(req.body?.property_id?{property_id:req.body.property_id}:{})});}catch(_){return res.status(400).json({success:false,error:'Invalid geography filter'});}
+    const forecast = await buildHorizonForecast(scope);
     const out = await generateBrief({
       forecast,
       property_id: req.body && req.body.property_id,
@@ -82,7 +83,8 @@ router.post('/ask', async (req, res) => {
     return res.json({ success: true, data: { ai: false, reason: 'no_key', answer: 'Conversational answers need the AI layer configured — set LLM_API_KEY on the server.' } });
   }
   try {
-    const forecast = await buildHorizonForecast();
+    let scope;try{scope=require('../utils/geography').scope({...req.body?.geography,...(req.body?.property_id?{property_id:req.body.property_id}:{})});}catch(_){return res.status(400).json({success:false,error:'Invalid geography filter'});}
+    const forecast = await buildHorizonForecast(scope);
     let events = [];
     try {
       const { rows } = await pool.query(
@@ -90,8 +92,8 @@ router.post('/ask', async (req, res) => {
                 COALESCE(p.property_name, e.property_id) AS estate
            FROM property_events e
            LEFT JOIN properties p ON p.property_id = e.property_id
-          WHERE e.occurred_at >= NOW() - INTERVAL '14 days'
-          ORDER BY e.occurred_at DESC LIMIT 25`);
+          WHERE e.occurred_at >= NOW() - INTERVAL '14 days' AND e.property_id=ANY($1::text[])
+          ORDER BY e.occurred_at DESC LIMIT 25`,[forecast.estates.map(e=>e.property_id)]);
       events = rows;
     } catch (_) { /* events are optional context */ }
 

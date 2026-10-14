@@ -3,7 +3,7 @@
 // For each logged intervention (silt clearing, enzyme refill, node repair, etc.)
 // we compare what THIS estate's sensors measured in the window BEFORE the event
 // against the window AFTER it. Two honest, raw signals: mean water-level % and
-// mean silt depth (mm). A drop after the work is the effect we're crediting.
+// mean silt depth (mm). This is an observed association, not causal attribution.
 //
 // Matching is robust to whether the event was logged on the estate or on a
 // specific asset: an event's property_id matches a sensor's asset directly OR
@@ -34,10 +34,10 @@ async function eventEffects({ days = 180, windowDays = 7 } = {}) {
      )
      SELECT ev.id, ev.event_type, ev.property_id, ev.occurred_at,
             COALESCE(pe.property_name, e2.property_name) AS estate_name,
-            AVG(r.water_level_percent) FILTER (WHERE r.time <  ev.occurred_at) AS wl_before,
-            AVG(r.water_level_percent) FILTER (WHERE r.time >= ev.occurred_at) AS wl_after,
-            AVG(r.silt_depth_mm)       FILTER (WHERE r.time <  ev.occurred_at) AS silt_before,
-            AVG(r.silt_depth_mm)       FILTER (WHERE r.time >= ev.occurred_at) AS silt_after,
+            AVG(r.water_level_percent) FILTER (WHERE r.time < ev.occurred_at AND r.water_level_percent BETWEEN 0 AND 100) AS wl_before,
+            AVG(r.water_level_percent) FILTER (WHERE r.time >= ev.occurred_at AND r.water_level_percent BETWEEN 0 AND 100) AS wl_after,
+            AVG(r.silt_depth_mm) FILTER (WHERE r.time < ev.occurred_at AND r.silt_depth_mm >= 0) AS silt_before,
+            AVG(r.silt_depth_mm) FILTER (WHERE r.time >= ev.occurred_at AND r.silt_depth_mm >= 0) AS silt_after,
             COUNT(r.*) FILTER (WHERE r.time <  ev.occurred_at) AS n_before,
             COUNT(r.*) FILTER (WHERE r.time >= ev.occurred_at) AS n_after
        FROM ev
@@ -51,7 +51,7 @@ async function eventEffects({ days = 180, windowDays = 7 } = {}) {
        LEFT JOIN properties pe ON pe.property_id = ev.property_id
        LEFT JOIN properties e2 ON e2.property_id = asset.parent_property_id
       GROUP BY ev.id, ev.event_type, ev.property_id, ev.occurred_at, pe.property_name, e2.property_name`,
-    [INTERVENTION_TYPES, String(days), '1', String(windowDays)]);
+    [INTERVENTION_TYPES, String(days), String(windowDays), String(windowDays)]);
 
   return rows.map(r => {
     const wl_before = r.wl_before != null ? Number(r.wl_before) : null;
@@ -105,11 +105,12 @@ async function computeInterventionEffects(opts = {}) {
     lookback_days: opts.days || 180,
     total_interventions: events.length,
     total_measured: allPrimary.length,
-    avg_primary_delta: round1(mean(allPrimary)),
+    // Primary signals have different units; never average mm with percentage points.
+    avg_primary_delta: null,
     improved_pct: allPrimary.length ? Math.round((allPrimary.filter(v => v < 0).length / allPrimary.length) * 100) : null,
     by_type: summary,
     recent: events.sort((a, b) => new Date(b.occurred_at) - new Date(a.occurred_at)).slice(0, 30),
-    note: 'Before/after = mean of each estate\'s sensor readings in the window on either side of the intervention. A negative delta (level or silt going down) is the improvement.',
+    note: 'Observed before/after means, not proof that the intervention caused a change. Only events with a complete elapsed after-window and sensor records are included. Water-level deltas are percentage points; silt deltas are mm. Sample density and environmental conditions may differ.',
   };
 }
 

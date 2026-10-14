@@ -19,6 +19,7 @@ const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { notify, notifyInternal } = require('../utils/notify');
 const { writeLimiter } = require('../middleware/rate-limit');
+const { requirePermission } = require('../utils/permissions');
 
 const UPLOAD_DIR  = process.env.UPLOAD_DIR || path.join(__dirname, '..', 'uploads');
 const API_PUBLIC  = process.env.PUBLIC_API_BASE || 'https://api.flowguard.ng/api/v1';
@@ -74,6 +75,7 @@ router.use(authenticateToken);
 
 // ── guards ──────────────────────────────────────────────────────────────────
 const requireStaff = [requireRole('admin', 'super_admin', 'operations_manager', 'operations', 'dispatcher'),
+  requirePermission('jobs.manage'),
   (req, res, next) => (req.user.user_type === 'internal'
     ? next()
     : res.status(403).json({ success: false, error: 'Staff only' }))];
@@ -132,8 +134,8 @@ async function ensureAssignment(orgId, propertyId, staffId) {
 
 // Load a job and enforce tenancy. Returns the row or sends a 403/404 and returns null.
 async function loadJob(req, res, id) {
-  const jid = parseInt(id, 10);
-  if (!Number.isInteger(jid)) { res.status(400).json({ success: false, error: 'Invalid id' }); return null; }
+  const jid = Number(id);
+  if (!/^\d+$/.test(String(id)) || !Number.isSafeInteger(jid) || jid <= 0) { res.status(400).json({ success: false, error: 'Invalid id' }); return null; }
   const { rows } = await pool.query('SELECT * FROM jobs WHERE id = $1', [jid]);
   const job = rows[0];
   if (!job) { res.status(404).json({ success: false, error: 'Job not found' }); return null; }
@@ -147,8 +149,16 @@ async function loadJob(req, res, id) {
 // Validate that a completion has all required evidence.
 function missingRequiredEvidence(job, evidenceRows) {
   const req = Array.isArray(job.required_evidence) ? job.required_evidence : [];
-  const haveKeys = new Set((evidenceRows || []).map(e => e.evidence_key).filter(Boolean));
-  return req.filter(r => r && r.required && !haveKeys.has(r.key)).map(r => r.label || r.key);
+  return req.filter(r => r && r.required && !(evidenceRows || []).some(e =>
+    e.evidence_key === r.key && (!r.kind || e.kind === r.kind) && usableEvidence(e)
+  )).map(r => r.label || r.key);
+}
+
+function usableEvidence(e) {
+  if (e.kind === 'note') return typeof e.caption === 'string' && e.caption.trim().length > 0;
+  if (e.kind === 'gps') return typeof e.lat === 'number' && Number.isFinite(e.lat) && Math.abs(e.lat) <= 90 &&
+    typeof e.lng === 'number' && Number.isFinite(e.lng) && Math.abs(e.lng) <= 180;
+  return typeof e.file_url === 'string' && (EV_PATH.test(e.file_url) || /^https?:\/\//i.test(e.file_url));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -168,7 +178,7 @@ router.get('/', async (req, res) => {
       add('j.service_provider_org_id = $?', parseInt(req.query.org, 10));
     }
     if (req.query.status)   add('j.status = $?', req.query.status);
-    if (req.query.property) add('j.property_id = $?', parseInt(req.query.property, 10));
+    if (req.query.property) add('j.property_id = $?', String(req.query.property));
     if (req.query.job_type) add('j.job_type = $?', req.query.job_type);
 
     const sql = `
@@ -243,7 +253,11 @@ router.get('/:id', async (req, res) => {
     const prop = job.property_id
       ? (await pool.query('SELECT property_id, property_name, city, state, country, latitude, longitude FROM properties WHERE property_id = $1', [job.property_id])).rows[0]
       : null;
-    return res.json({ success: true, data: { ...job, property: prop, events, evidence } });
+    const names=(await pool.query(`SELECT o.name AS provider_name, tech.full_name AS technician_name, verifier.full_name AS verified_by_name
+      FROM jobs j LEFT JOIN service_provider_organisations o ON o.id=j.service_provider_org_id
+      LEFT JOIN users tech ON tech.id=j.assigned_technician_id
+      LEFT JOIN users verifier ON verifier.id=j.verified_by WHERE j.id=$1`,[job.id])).rows[0];
+    return res.json({ success: true, data: { ...job, ...names, property_name:prop?.property_name || null, property: prop, events, evidence } });
   } catch (err) { console.error('GET /jobs/:id', err); return res.status(500).json({ success: false, error: 'Failed to load job' }); }
 });
 
@@ -258,6 +272,20 @@ router.post('/', requireStaff, async (req, res) => {
     const jobType = b.job_type;
     if (!JOB_TYPES.includes(jobType)) return res.status(400).json({ success: false, error: 'Valid job_type required' });
     if (!b.title) return res.status(400).json({ success: false, error: 'Title required' });
+    let propertyId=b.property_id || null;
+    if (b.source_ticket_id) {
+      const ticket=(await pool.query('SELECT property_id,work_type,assigned_team FROM tickets WHERE ticket_id=$1',[String(b.source_ticket_id)])).rows[0];
+      if (!ticket) return res.status(404).json({success:false,error:'Source support ticket not found'});
+      if (ticket.work_type || ticket.assigned_team) return res.status(409).json({success:false,error:'Source must be a support request, not internal maintenance'});
+      if (ticket.property_id && propertyId && String(ticket.property_id)!==String(propertyId)) return res.status(409).json({success:false,error:'Work-order estate does not match the source support request'});
+      propertyId=propertyId || ticket.property_id || null;
+    }
+    if (b.source_alert_id) {
+      const alert=(await pool.query('SELECT property_id FROM alerts WHERE alert_id=$1',[String(b.source_alert_id)])).rows[0];
+      if (!alert) return res.status(404).json({success:false,error:'Source incident not found'});
+      if (alert.property_id && propertyId && String(alert.property_id)!==String(propertyId)) return res.status(409).json({success:false,error:'Work-order estate does not match the source incident'});
+      propertyId=propertyId || alert.property_id;
+    }
     const priority = PRIORITIES.includes(b.priority) ? b.priority : 'normal';
 
     // Required-evidence snapshot: explicit override, else the job_type template.
@@ -268,18 +296,24 @@ router.post('/', requireStaff, async (req, res) => {
     }
 
     const ref = await nextReference();
-    const orgId = b.service_provider_org_id ? parseInt(b.service_provider_org_id, 10) : null;
+    const orgId = b.service_provider_org_id ? Number(b.service_provider_org_id) : null;
+    if (b.service_provider_org_id) {
+      if (!Number.isSafeInteger(orgId) || orgId <= 0) return res.status(400).json({success:false,error:'Valid service_provider_org_id required'});
+      const org=(await pool.query('SELECT status FROM service_provider_organisations WHERE id=$1',[orgId])).rows[0];
+      if (!org) return res.status(404).json({success:false,error:'Provider not found'});
+      if (org.status !== 'active') return res.status(409).json({success:false,error:'Provider is not active'});
+    }
     const status = orgId ? 'dispatched' : 'draft';
 
     const { rows } = await pool.query(
       `INSERT INTO jobs
         (reference, property_id, service_provider_org_id, job_type, title, description, priority,
-         status, source_ticket_id, required_evidence, scheduled_for, sla_due_at, created_by, dispatched_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         status, source_ticket_id, required_evidence, scheduled_for, sla_due_at, created_by, dispatched_at, source_alert_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING *`,
-      [ref, b.property_id || null, orgId, jobType, b.title, b.description || null, priority,
+      [ref, propertyId, orgId, jobType, b.title, b.description || null, priority,
        status, b.source_ticket_id || null, JSON.stringify(required),
-       b.scheduled_for || null, b.sla_due_at || null, req.user.id, orgId ? new Date() : null]);
+       b.scheduled_for || null, b.sla_due_at || null, req.user.id, orgId ? new Date() : null, b.source_alert_id || null]);
     const job = rows[0];
 
     await logEvent(job.id, req, { event_type: 'created', to_status: status, note: b.title });
@@ -299,8 +333,8 @@ router.post('/:id/dispatch', requireStaff, async (req, res) => {
   if (!job) return;
   if (!['draft', 'declined'].includes(job.status))
     return res.status(409).json({ success: false, error: `Cannot dispatch a job that is ${job.status}` });
-  const orgId = parseInt((req.body || {}).service_provider_org_id, 10);
-  if (!Number.isInteger(orgId)) return res.status(400).json({ success: false, error: 'service_provider_org_id required' });
+  const orgId = Number((req.body || {}).service_provider_org_id);
+  if (!Number.isSafeInteger(orgId) || orgId <= 0) return res.status(400).json({ success: false, error: 'service_provider_org_id required' });
   try {
     const org = (await pool.query(`SELECT id, status, name FROM service_provider_organisations WHERE id = $1`, [orgId])).rows[0];
     if (!org) return res.status(404).json({ success: false, error: 'Provider not found' });
@@ -328,6 +362,9 @@ router.post('/:id/verify', requireStaff, async (req, res) => {
   if (job.status !== 'completed')
     return res.status(409).json({ success: false, error: 'Only a completed job can be verified' });
   try {
+    const evidence=(await pool.query('SELECT evidence_key,kind,file_url,caption,lat,lng FROM job_evidence WHERE job_id=$1',[job.id])).rows;
+    const missing=missingRequiredEvidence(job,evidence);
+    if (missing.length) return res.status(422).json({success:false,error:'Missing usable required evidence',missing});
     const note = (req.body || {}).note || null;
     const { rows } = await pool.query(
       `UPDATE jobs SET status = 'verified', verified_at = NOW(), verified_by = $2, verify_note = $3, updated_at = NOW()
@@ -452,6 +489,13 @@ router.post('/:id/evidence', writeLimiter, requireServiceProvider, async (req, r
   const b = req.body || {};
   const KINDS = ['photo', 'video', 'document', 'note', 'signature', 'gps'];
   if (!KINDS.includes(b.kind)) return res.status(400).json({ success: false, error: 'Valid evidence kind required' });
+  const required = (Array.isArray(job.required_evidence) ? job.required_evidence : []).find(r=>r && r.key===b.evidence_key);
+  if (required && required.kind && required.kind !== b.kind) return res.status(400).json({success:false,error:'Evidence kind does not match its requirement'});
+  if (b.kind === 'note' && (typeof b.caption !== 'string' || !b.caption.trim())) return res.status(400).json({success:false,error:'A findings note is required'});
+  if (b.kind === 'gps' && !usableEvidence({kind:'gps',lat:b.lat,lng:b.lng})) return res.status(400).json({success:false,error:'Valid numeric latitude and longitude are required'});
+  // Never sign a caller-supplied storage path: it could point at another job.
+  if (b.file_url && (typeof b.file_url !== 'string' || !/^https?:\/\//i.test(b.file_url))) return res.status(400).json({success:false,error:'Only HTTP(S) evidence URLs may be supplied'});
+  if (!['note','gps'].includes(b.kind) && !b.file_data && !usableEvidence({kind:b.kind,file_url:b.file_url})) return res.status(400).json({success:false,error:'An uploaded file or HTTP(S) evidence URL is required'});
   try {
     const count = (await pool.query('SELECT COUNT(*)::int AS n FROM job_evidence WHERE job_id = $1', [job.id])).rows[0].n;
     if (count >= MAX_EVIDENCE_PER_JOB) return res.status(429).json({ success: false, error: 'Evidence limit reached for this job' });
@@ -459,6 +503,9 @@ router.post('/:id/evidence', writeLimiter, requireServiceProvider, async (req, r
     // back to a pasted URL. Uploaded files store a relative path, signed at read.
     let fileUrl = b.file_url || null;
     if (b.file_data) {
+      const mime = /^data:([^;]+);base64,/.exec(String(b.file_data))?.[1]?.toLowerCase();
+      if ((['photo','signature'].includes(b.kind) && !['image/jpeg','image/jpg','image/png','image/webp'].includes(mime)) ||
+          (b.kind === 'document' && mime !== 'application/pdf')) return res.status(400).json({success:false,error:'Uploaded file type does not match the evidence kind'});
       const saved = saveDataUrl(job.id, b.file_data);
       if (!saved) return res.status(400).json({ success: false, error: 'Unsupported or oversized file (JPG, PNG, WEBP or PDF up to 12MB)' });
       fileUrl = saved;
@@ -528,7 +575,7 @@ router.post('/:id/complete', requireServiceProvider, async (req, res) => {
   if (job.status !== 'in_progress')
     return res.status(409).json({ success: false, error: `Cannot complete a job that is ${job.status}` });
   try {
-    const evidence = (await pool.query('SELECT evidence_key FROM job_evidence WHERE job_id = $1', [job.id])).rows;
+    const evidence = (await pool.query('SELECT evidence_key,kind,file_url,caption,lat,lng FROM job_evidence WHERE job_id = $1', [job.id])).rows;
     const missing = missingRequiredEvidence(job, evidence);
     if (missing.length)
       return res.status(422).json({ success: false, error: 'Missing required evidence', missing });

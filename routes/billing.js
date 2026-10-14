@@ -3,11 +3,15 @@ const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
-const { isClient } = require('../utils/scope');
+const { isClient,isSpUser } = require('../utils/scope');
+const { invoiceAmounts } = require('../utils/invoiceAmounts');
+const { randomUUID } = require('node:crypto');
 const { logAction } = require('../utils/audit');
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const router = express.Router();
+router.use(authenticateToken);
+router.use((req,res,next)=>isSpUser(req) ? res.status(403).json({success:false,error:'Not authorised'}) : next());
 
 // GET /billing/summary — company-wide revenue/MRR. Ops only.
 router.get('/summary', authenticateToken, async (req, res) => {
@@ -18,20 +22,27 @@ router.get('/summary', authenticateToken, async (req, res) => {
       `SELECT COUNT(*) c, COALESCE(SUM(balance_due),0) amt FROM invoices
        WHERE payment_status IN ('pending','partial','overdue') AND due_date < CURRENT_DATE`);
     const paid = await pool.query(
-      `SELECT COALESCE(SUM(total_amount),0) v FROM invoices WHERE payment_status='paid'`);
+      `SELECT currency,SUM(amount) amount FROM payments WHERE status='successful' GROUP BY currency ORDER BY currency`);
+    const overdueByCurrency=await pool.query(`SELECT currency,SUM(balance_due) amount FROM invoices WHERE payment_status IN ('pending','partial','overdue') AND due_date < CURRENT_DATE GROUP BY currency ORDER BY currency`);
+    const singleCurrency=rows=>rows.length===1 && /^[A-Z]{3}$/.test(String(rows[0].currency || '')) ? Number(rows[0].amount) : rows.length===0 ? 0 : null;
     const mrrVal = parseFloat(mrr.rows[0].v) || 0;
     // simple 6-month trend from paid invoices
     const trend = await pool.query(`
-      SELECT to_char(date_trunc('month', paid_date), 'Mon') AS label,
-             SUM(total_amount) AS amount
-      FROM invoices WHERE payment_status='paid' AND paid_date > CURRENT_DATE - INTERVAL '6 months'
-      GROUP BY date_trunc('month', paid_date) ORDER BY date_trunc('month', paid_date)`);
+      SELECT to_char(date_trunc('month', payment_date), 'YYYY-MM') AS label,
+             SUM(amount) AS amount, currency
+      FROM payments WHERE status='successful' AND payment_date > CURRENT_DATE - INTERVAL '6 months' AND payment_date<=NOW()
+      GROUP BY date_trunc('month', payment_date),currency ORDER BY date_trunc('month', payment_date),currency`);
     res.json({ success: true, data: {
       mrr: mrrVal,
       arr: mrrVal * 12,
+      mrr_currency:null,
+      revenue_basis:'Recorded client MRR; currency is not supplied. ARR is its annualised value, not recognised revenue.',
       overdue_count: parseInt(overdue.rows[0].c) || 0,
-      overdue_amount: parseFloat(overdue.rows[0].amt) || 0,
-      collected: parseFloat(paid.rows[0].v) || 0,
+      overdue_amount: singleCurrency(overdueByCurrency.rows),
+      overdue_by_currency:overdueByCurrency.rows,
+      collected: singleCurrency(paid.rows),
+      collected_by_currency:paid.rows,
+      collection_basis:'Recorded successful manual ledger entries; not independently verified bank settlement.',
       mrr_trend: trend.rows,
     }});
   } catch (err) { console.error('GET /billing/summary', err); res.status(500).json({ success:false, error:'Failed to load billing summary' }); }
@@ -64,24 +75,22 @@ router.post('/invoices', authenticateToken, requirePermission('billing.manage'),
   try {
     const b = req.body || {};
     if (!b.property_id) return res.status(400).json({ success: false, error: 'property_id is required' });
+    if (b.currency && b.currency!=='NGN') return res.status(400).json({success:false,error:'New invoices currently use NGN; currency conversion is not supported'});
     const pr = await pool.query('SELECT user_id FROM properties WHERE property_id = $1', [b.property_id]);
     if (!pr.rows[0]) return res.status(404).json({ success: false, error: 'Property not found' });
     const userId = pr.rows[0].user_id;
 
-    const items = Array.isArray(b.line_items) ? b.line_items.filter(l => l && (l.description || l.amount)) : [];
-    const subtotal = items.reduce((s, l) => s + (Number(l.amount) || 0), 0);
-    // VAT: default 7.5% (Nigeria), overridable per invoice.
-    const vatRate = b.vat_rate != null ? Math.max(0, Number(b.vat_rate)) : 7.5;
-    const vatAmount = Math.round(subtotal * vatRate) / 100;
-    const total = b.total_amount != null ? Number(b.total_amount) : subtotal + vatAmount;
+    let amounts;
+    try {amounts=invoiceAmounts(b);} catch(err) {return res.status(400).json({success:false,error:err.message});}
+    const {items,subtotal,vatRate,vatAmount,total}=amounts;
     // Normalise the form's status vocab to the values the rest of the app queries.
     let payStatus = String(b.payment_status || 'pending').toLowerCase();
     if (payStatus === 'unpaid') payStatus = 'pending';
+    if (payStatus!=='pending' || (b.balance_due!=null && Number(b.balance_due)!==total)) return res.status(400).json({success:false,error:'Create an unpaid invoice, then record payments through the ledger'});
     const status = String(b.status || 'open').toLowerCase();
     const balanceDue = payStatus === 'paid' ? 0
       : (b.balance_due != null ? Number(b.balance_due) : total);
-    const invoiceId = 'INV-' + new Date().getFullYear() + '-' +
-      String(Math.floor(1000 + Math.random() * 9000));
+    const invoiceId = 'INV-' + randomUUID();
 
     const { rows } = await pool.query(
       `INSERT INTO invoices
@@ -110,16 +119,16 @@ router.put('/invoices/:id', authenticateToken, requirePermission('billing.manage
     const cur = await pool.query('SELECT * FROM invoices WHERE invoice_id = $1', [req.params.id]);
     if (!cur.rows[0]) return res.status(404).json({ success: false, error: 'Invoice not found' });
     const prev = cur.rows[0];
+    if (prev.currency!=='NGN' || (b.currency && b.currency!==prev.currency)) return res.status(409).json({success:false,error:'This invoice currency is not supported by the NGN editing workflow'});
 
-    const items = Array.isArray(b.line_items)
-      ? b.line_items.filter(l => l && (l.description || l.amount))
-      : (Array.isArray(prev.line_items) ? prev.line_items : []);
-    const subtotal = items.reduce((s, l) => s + (Number(l.amount) || 0), 0);
-    const vatRate = b.vat_rate != null ? Math.max(0, Number(b.vat_rate)) : Number(prev.vat_rate ?? 7.5);
-    const vatAmount = Math.round(subtotal * vatRate) / 100;
-    const total = subtotal + vatAmount;
+    const paid=(await pool.query("SELECT COUNT(*)::integer n FROM payments WHERE invoice_id=$1 AND status='successful'",[req.params.id])).rows[0].n;
+    if (paid>0 || Number(prev.amount_paid)>0) return res.status(409).json({success:false,error:'Invoices with recorded payments cannot be rewritten; use a separately reviewed adjustment'});
+    let amounts;
+    try {amounts=invoiceAmounts(b,prev);} catch(err) {return res.status(400).json({success:false,error:err.message});}
+    const {items,subtotal,vatRate,vatAmount,total}=amounts;
     let payStatus = String(b.payment_status || prev.payment_status || 'pending').toLowerCase();
     if (payStatus === 'unpaid') payStatus = 'pending';
+    if (payStatus!=='pending') return res.status(400).json({success:false,error:'Payment status is derived from the payment ledger'});
     const status = String(b.status || prev.status || 'open').toLowerCase();
     const balanceDue = payStatus === 'paid' ? 0 : total;
 
@@ -128,11 +137,13 @@ router.put('/invoices/:id', authenticateToken, requirePermission('billing.manage
          invoice_type = $2, subtotal = $3, vat_rate = $4, vat_amount = $5,
          total_amount = $6, balance_due = $7, amount_paid = $8, payment_status = $9,
          status = $10, issue_date = $11, due_date = $12, line_items = $13, updated_at = NOW()
-       WHERE invoice_id = $1 RETURNING *`,
+       WHERE invoice_id = $1 AND COALESCE(amount_paid,0)=0
+         AND NOT EXISTS(SELECT 1 FROM payments WHERE invoice_id=$1 AND status='successful') RETURNING *`,
       [req.params.id, b.invoice_type || prev.invoice_type, subtotal, vatRate, vatAmount,
        total, balanceDue, total - balanceDue, payStatus, status,
        b.issue_date || prev.issue_date, b.due_date || prev.due_date, JSON.stringify(items)]);
 
+    if (!rows.length) return res.status(409).json({success:false,error:'Invoice changed during editing; refresh before saving'});
     logAction(req.user.id, 'edited an invoice', 'invoice', req.params.id, { total });
     res.json({ success: true, data: rows[0] });
   } catch (err) {
@@ -161,6 +172,12 @@ router.get('/invoices/:id', authenticateToken, async (req, res) => {
     if (isClient(req) && rows[0].user_id !== req.user.id) {
       return res.status(403).json({ success: false, error: 'Not authorised' });
     }
+    const payments=await pool.query('SELECT payment_id,amount,currency,payment_method,transaction_reference,status,payment_date,created_at FROM payments WHERE invoice_id=$1 ORDER BY payment_date DESC',[req.params.id]);
+    rows[0].payments=payments.rows;
+    const successful=payments.rows.filter(p=>p.status==='successful');
+    const currencyMismatch=!/^[A-Z]{3}$/.test(String(rows[0].currency || '')) || successful.some(p=>p.currency!==rows[0].currency);
+    rows[0].paid_total=currencyMismatch ? null : successful.reduce((sum,p)=>sum+Number(p.amount),0);
+    rows[0].reconciliation_required=currencyMismatch || Math.abs(Number(rows[0].amount_paid ?? 0)-rows[0].paid_total)>0.01;
     res.json({ success: true, data: rows[0] });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to load invoice' }); }
 });
@@ -220,7 +237,8 @@ function renderInvoicePdf(inv) {
       }
     } catch (_) { /* fall back to Helvetica + NGN */ }
 
-    const money = n => NG + Number(n || 0).toLocaleString('en-US');
+    if (inv.currency!=='NGN') NG=/^[A-Z]{3}$/.test(String(inv.currency || '')) ? inv.currency+' ' : 'Currency unknown ';
+    const money = n => n==null || n==='' || !Number.isFinite(Number(n)) ? 'Not supplied' : NG + Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
     const fmtDate = ds => ds ? new Date(ds).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '—';
     const cap = s => s ? String(s).charAt(0).toUpperCase() + String(s).slice(1).replace(/_/g, ' ') : '—';
     const L = 45, R = 550, W = R - L;
@@ -237,11 +255,14 @@ function renderInvoicePdf(inv) {
     doc.text('020 1700 3062', tx, 96);
 
     doc.font(F.b).fontSize(20).fillColor(BLACK).text('INVOICE', L, 48, { width: W, align: 'right' });
-    let my = 78;
+    let my = 115;
     [['Invoice No.', inv.invoice_id], ['Issue date', fmtDate(inv.issue_date || inv.created_at)], ['Due date', fmtDate(inv.due_date)]].forEach(([k, v]) => {
-      doc.font(F.r).fontSize(9).fillColor(GREY).text(k, R - 300, my, { width: 180, align: 'right' });
-      doc.font(F.b).fontSize(9).fillColor(BLACK).text(String(v || '—'), R - 110, my, { width: 110, align: 'right' });
-      my += 15;
+      doc.font(F.r).fontSize(9).fillColor(GREY).text(k, R - 245, my, { width: 95, align: 'right' });
+      doc.font(F.b).fontSize(9).fillColor(BLACK);
+      const value=String(v || '—');
+      const valueHeight=doc.heightOfString(value,{width:140});
+      doc.text(value, R - 140, my, { width: 140, align: 'right' });
+      my += Math.max(15,valueHeight+5);
     });
     // status badge
     const ps = String(inv.payment_status || 'pending').toLowerCase();
@@ -253,15 +274,15 @@ function renderInvoicePdf(inv) {
     doc.fillColor('#ffffff').font(F.b).fontSize(9).text(badge.l, R - bw, my + 7, { width: bw, align: 'center' });
 
     // divider (black rule + short green brand accent)
-    const hy = 150;
+    const hy = Math.max(150,my+32);
     doc.moveTo(L, hy).lineTo(R, hy).lineWidth(1).strokeColor(BLACK).stroke();
     doc.moveTo(L, hy).lineTo(L + 90, hy).lineWidth(2.5).strokeColor(GREEN).stroke();
 
     const sectionLabel = (t, x, yy) => doc.font(F.b).fontSize(8.5).fillColor(GREEN).text(t.toUpperCase(), x, yy, { characterSpacing: 0.6 });
 
     // ── BILL TO ──
-    sectionLabel('Bill to', L, 170);
-    doc.font(F.b).fontSize(11).fillColor(BLACK).text(inv.property_name || '—', L, 186, { width: 245 });
+    sectionLabel('Bill to', L, hy+20);
+    doc.font(F.b).fontSize(11).fillColor(BLACK).text(inv.property_name || '—', L, hy+36, { width: 245 });
     const addr = [inv.address_line1, [inv.city, inv.state].filter(Boolean).join(', '), 'Nigeria'].filter(Boolean).join('\n');
     doc.font(F.r).fontSize(9).fillColor(GREY).text(addr || '—', L, doc.y + 2, { width: 245 });
     if (!inv.client_name)
@@ -270,8 +291,9 @@ function renderInvoicePdf(inv) {
       doc.font(F.r).fontSize(9).fillColor(GREY).text(inv.client_name + (inv.client_email ? '  ·  ' + inv.client_email : ''), L, doc.y + 4, { width: 245 });
 
     // ── INVOICE DETAILS ──
-    sectionLabel('Invoice details', 315, 170);
-    let dy = 188;
+    const billBottom=doc.y;
+    sectionLabel('Invoice details', 315, hy+20);
+    let dy = hy+38;
     const sensors = Array.isArray(inv.sensor_ids) ? inv.sensor_ids : [];
     [['Invoice type', cap(inv.invoice_type)], ['Property ref', inv.property_ref], ['Sentinel coverage', sensors.length ? sensors.join(', ') : 'None']].forEach(([k, v]) => {
       doc.font(F.r).fontSize(9).fillColor(GREY).text(k, 315, dy, { width: 95 });
@@ -282,7 +304,7 @@ function renderInvoicePdf(inv) {
 
     // ── line items table ──
     const items = Array.isArray(inv.line_items) ? inv.line_items : (() => { try { return JSON.parse(inv.line_items || '[]'); } catch { return []; } })();
-    let ty = Math.max(275, dy + 14, doc.y + 14);
+    let ty = Math.max(hy+125, dy + 14, billBottom + 14);
     doc.rect(L, ty, W, 22).fill(BLACK);
     doc.fillColor('#ffffff').font(F.b).fontSize(8.5);
     doc.text('DESCRIPTION', L + 8, ty + 7, { width: 250 });
@@ -294,6 +316,7 @@ function renderInvoicePdf(inv) {
       doc.font(F.r).fontSize(9).fillColor(BLACK);
       const dh = doc.heightOfString(String(it.description || '—'), { width: 250 });
       const rh = Math.max(24, dh + 14);
+      if (ry+rh>doc.page.height-150) {doc.addPage();ry=45;}
       doc.text(String(it.description || '—'), L + 8, ry + 7, { width: 250 });
       doc.fillColor(BLACK).text(it.qty != null ? String(it.qty) : '—', 305, ry + 7, { width: 50, align: 'right' });
       doc.text(it.unit_price != null ? money(it.unit_price) : '—', 365, ry + 7, { width: 90, align: 'right' });
@@ -304,28 +327,29 @@ function renderInvoicePdf(inv) {
 
     // ── totals ──
     let tvy = ry + 14;
-    const balance = inv.balance_due != null ? Number(inv.balance_due) : Number(inv.total_amount);
+    if (tvy+150>doc.page.height-60) {doc.addPage();tvy=45;}
+    const balance = inv.balance_due != null ? Number(inv.balance_due) : null;
     const totRow = (label, val, bold) => {
       doc.font(bold ? F.b : F.r).fontSize(9.5).fillColor(bold ? BLACK : GREY).text(label, 320, tvy, { width: 130, align: 'right' });
       doc.font(bold ? F.b : F.r).fillColor(BLACK).text(val, 460, tvy, { width: 82, align: 'right' });
       tvy += 17;
     };
     totRow('Subtotal', money(inv.subtotal != null ? inv.subtotal : inv.total_amount));
-    if (Number(inv.vat_amount) > 0 || inv.vat_rate != null) totRow(`VAT (${inv.vat_rate != null ? inv.vat_rate : 7.5}%)`, money(inv.vat_amount || 0));
+    if (Number(inv.vat_amount) > 0 || inv.vat_rate != null) totRow(`VAT (${inv.vat_rate != null ? inv.vat_rate : 'unknown'}%)`, money(inv.vat_amount));
     totRow('Total', money(inv.total_amount), true);
     if (Number(inv.amount_paid) > 0) totRow('Amount paid', money(inv.amount_paid));
     // balance-due highlight box
-    const bcol = balance > 0 ? RED : GREEN;
-    doc.rect(320, tvy + 2, 222, 26).fill(balance > 0 ? RED_T : GREEN_T);
+    const bcol = balance==null ? BLACK : balance > 0 ? RED : GREEN;
+    doc.rect(320, tvy + 2, 222, 26).fill(balance==null ? '#eeeeee' : balance > 0 ? RED_T : GREEN_T);
     doc.fillColor(bcol).font(F.b).fontSize(10).text('BALANCE DUE', 328, tvy + 10, { width: 120 });
     doc.text(money(balance), 440, tvy + 10, { width: 96, align: 'right' });
     tvy += 40;
 
     // ── footer notes ──
     let fy = Math.max(tvy + 16, 690);
-    doc.font(F.r).fontSize(8.5).fillColor(GREY).text('Balance due within 30 days of the issue date. For payment queries or to confirm receipt, contact support@flowguard.ng or call 020 1700 3062.', L, fy, { width: W });
+    doc.font(F.r).fontSize(8.5).fillColor(GREY).text('For the payment due date, refer to the invoice record. For payment queries or to confirm receipt, contact support@flowguard.ng or call 020 1700 3062.', L, fy, { width: W });
     if (ps === 'partial') doc.text('This invoice reflects a partial payment already received against the total above. A full itemized payment history is available on request.', L, doc.y + 6, { width: W });
-    doc.font(F.r).fontSize(8).fillColor(LGREY).text('FlowGuard Solutions Limited  ·  Lagos, Nigeria  ·  support@flowguard.ng  ·  @theflowguards', L, 805, { width: W, align: 'center' });
+    doc.font(F.r).fontSize(8).fillColor(LGREY).text('FlowGuard Solutions Limited  ·  Lagos, Nigeria  ·  support@flowguard.ng  ·  @theflowguards', L, doc.page.height-60, { width: W, align: 'center', lineBreak:false });
 
     doc.end();
   });
@@ -378,6 +402,8 @@ router.post('/invoices/:id/send', authenticateToken, requirePermission('billing.
 // POST /billing/invoices/:id/mark-paid — this waives a real balance; restrict
 // to roles that actually handle money.
 router.post('/invoices/:id/mark-paid', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
+  return res.status(409).json({success:false,error:'Record a payment through the ledger; invoice status alone is not evidence of collection'});
+  /* Legacy shortcut retained for migration context, never executed.
   try {
     const { rows } = await pool.query(
       `UPDATE invoices SET payment_status='paid', status='paid', paid_date=CURRENT_DATE,
@@ -386,6 +412,7 @@ router.post('/invoices/:id/mark-paid', authenticateToken, requirePermission('bil
     if (!rows[0]) return res.status(404).json({ success:false, error:'Invoice not found' });
     res.json({ success: true, data: rows[0] });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to mark paid' }); }
+  */
 });
 
 // POST /billing/invoices/:id/payments — record a real payment against the
@@ -395,23 +422,29 @@ router.post('/invoices/:id/mark-paid', authenticateToken, requirePermission('bil
 router.post('/invoices/:id/payments', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
   const client = await pool.connect();
   try {
+    await client.query('BEGIN');
     const inv = (await client.query(
-      'SELECT invoice_id, user_id, total_amount FROM invoices WHERE invoice_id=$1', [req.params.id])).rows[0];
-    if (!inv) { client.release(); return res.status(404).json({ success: false, error: 'Invoice not found' }); }
+      'SELECT invoice_id, user_id, total_amount,amount_paid,currency FROM invoices WHERE invoice_id=$1 FOR UPDATE', [req.params.id])).rows[0];
+    if (!inv) {await client.query('ROLLBACK');return res.status(404).json({ success: false, error: 'Invoice not found' }); }
+    if (!/^[A-Z]{3}$/.test(String(inv.currency || '')) || (req.body.currency && req.body.currency!==inv.currency)) {await client.query('ROLLBACK');return res.status(409).json({success:false,error:'Payment currency must match a known invoice currency'});}
+    const currencyMismatch=await client.query("SELECT COUNT(*)::int n FROM payments WHERE invoice_id=$1 AND status='successful' AND currency IS DISTINCT FROM $2",[inv.invoice_id,inv.currency]);
+    if (currencyMismatch.rows[0].n>0) {await client.query('ROLLBACK');return res.status(409).json({success:false,error:'Mixed-currency ledger requires reconciliation'});}
 
     const amount = Number(req.body && req.body.amount);
-    if (!(amount > 0)) { client.release(); return res.status(400).json({ success: false, error: 'A positive amount is required' }); }
+    if (!Number.isFinite(amount) || !(amount > 0) || typeof req.body.amount==='boolean') {await client.query('ROLLBACK');return res.status(400).json({ success: false, error: 'A positive finite amount is required' }); }
     const method = String((req.body && req.body.payment_method) || '').trim() || 'bank_transfer';
     const ref = String((req.body && req.body.transaction_reference) || '').trim() || null;
     const when = (req.body && req.body.payment_date) ? new Date(req.body.payment_date) : new Date();
-    if (isNaN(when.getTime())) { client.release(); return res.status(400).json({ success: false, error: 'Invalid payment date' }); }
-    const payId = 'PAY-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
-
-    await client.query('BEGIN');
+    if (!Number.isFinite(when.getTime()) || when.getTime()>Date.now()) {await client.query('ROLLBACK');return res.status(400).json({ success: false, error: 'Valid non-future payment date required' }); }
+    const recorded=Number((await client.query("SELECT COALESCE(SUM(amount),0) s FROM payments WHERE invoice_id=$1 AND status='successful'",[inv.invoice_id])).rows[0].s);
+    if (!Number.isFinite(Number(inv.total_amount)) || inv.total_amount==null || Math.abs(Number(inv.amount_paid ?? 0)-recorded)>0.01) {await client.query('ROLLBACK');return res.status(409).json({success:false,error:'Invoice requires ledger reconciliation before recording another payment'});}
+    if (amount>Number(inv.total_amount)-recorded+0.001) {await client.query('ROLLBACK');return res.status(409).json({success:false,error:'Payment exceeds the recorded remaining balance'});}
+    if (ref && (await client.query("SELECT payment_id FROM payments WHERE invoice_id=$1 AND transaction_reference=$2 AND status='successful'",[inv.invoice_id,ref])).rows.length) {await client.query('ROLLBACK');return res.status(409).json({success:false,error:'Payment reference is already recorded for this invoice'});}
+    const payId = 'PAY-' + randomUUID();
     await client.query(
       `INSERT INTO payments (payment_id, invoice_id, user_id, amount, currency, payment_method, transaction_reference, status, payment_date)
-       VALUES ($1,$2,$3,$4,'NGN',$5,$6,'successful',$7)`,
-      [payId, inv.invoice_id, inv.user_id, amount, method, ref, when]);
+       VALUES ($1,$2,$3,$4,$8,$5,$6,'successful',$7)`,
+      [payId, inv.invoice_id, inv.user_id, amount, method, ref, when,inv.currency]);
 
     const paid = Number((await client.query(
       `SELECT COALESCE(SUM(amount),0) s FROM payments WHERE invoice_id=$1 AND status='successful'`,
@@ -422,9 +455,9 @@ router.post('/invoices/:id/payments', authenticateToken, requirePermission('bill
     await client.query(
       `UPDATE invoices SET amount_paid=$1, balance_due=$2, payment_status=$3,
          status=CASE WHEN $3='paid' THEN 'paid' ELSE status END,
-         paid_date=CASE WHEN $3='paid' THEN CURRENT_DATE ELSE paid_date END,
+         paid_date=CASE WHEN $3='paid' THEN $5::timestamptz::date ELSE paid_date END,
          updated_at=NOW() WHERE invoice_id=$4`,
-      [paid, bal, pstatus, inv.invoice_id]);
+      [paid, bal, pstatus, inv.invoice_id,when]);
     await client.query('COMMIT');
 
     logAction(req.user.id, 'recorded a payment', 'invoice', inv.invoice_id, { payment_id: payId, amount, method });
@@ -470,6 +503,8 @@ router.post('/invoices/:id/notify-payment', authenticateToken, async (req, res) 
 
 // POST /billing/invoices/:id/send-reminder
 router.post('/invoices/:id/send-reminder', authenticateToken, async (req, res) => {
+  return res.status(503).json({success:false,error:'Reminder delivery is not implemented; no reminder was sent'});
+  /* Never claim sent-counter increments as delivery.
   try {
     const { rows } = await pool.query(
       `UPDATE invoices SET reminder_sent_count = COALESCE(reminder_sent_count,0)+1,
@@ -479,6 +514,7 @@ router.post('/invoices/:id/send-reminder', authenticateToken, async (req, res) =
     // (email integration would fire here)
     res.json({ success: true, data: { reminded: true, count: rows[0].reminder_sent_count } });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to send reminder' }); }
+  */
 });
 
 // GET /billing/:propertyId — per-property billing (CLIENT PORTAL)
@@ -516,7 +552,7 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
     const subscription = {
       plan: client ? (client.tier ? client.tier[0].toUpperCase() + client.tier.slice(1) : 'Standard') : 'Pending',
       status: property.status === 'active' ? 'active' : property.status,
-      amount: monthly || 0,
+      amount: monthly != null && Number.isFinite(monthly) ? monthly : null,
       currency: 'NGN',
       billing_cycle: 'monthly',
       next_billing_date: null,
@@ -524,12 +560,13 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
     };
 
     const sla = {
-      uptime_guarantee: 98.0,
-      current_uptime: client ? 99.0 : 0,
-      response_time_hours: 2,
-      avg_response_hours: 1.5,
-      incidents_resolved: 0,
-      incidents_total: 0,
+      uptime_guarantee: null,
+      current_uptime: null,
+      response_time_hours: null,
+      avg_response_hours: null,
+      incidents_resolved: null,
+      incidents_total: null,
+      basis: 'Contractual targets and measured SLA performance are not supplied by this billing feed.',
     };
 
     res.json({ success: true, data: {

@@ -3,9 +3,11 @@ const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
-const { isClient } = require('../utils/scope');
+const { isClient,isSpUser,propertyIdsForUser } = require('../utils/scope');
 const router = express.Router();
 const { logAction } = require('../utils/audit');
+router.use(authenticateToken);
+router.use((req,res,next)=>isSpUser(req) ? res.status(403).json({success:false,error:'Not authorised'}) : next());
 
 // Shared ownership guard: a client may only reach their own ticket; ops may
 // reach any. Returns the ticket row, or null after writing the response.
@@ -33,6 +35,10 @@ function shape(r) {
     priority: r.priority || 'normal',
     status: r.status,
     property_id: r.property_id,
+    user_id:r.user_id,
+    client_name:r.creator_name,
+    client_email:r.creator_email,
+    property_name:r.property_name,
     created_at: r.created_at,
   };
 }
@@ -53,6 +59,7 @@ router.get('/', authenticateToken, async (req, res) => {
 router.post('/', authenticateToken, async (req, res) => {
   try {
     const b = req.body || {};
+    if (isClient(req) && b.property_id && !(await propertyIdsForUser(req.user.id)).includes(b.property_id)) return res.status(403).json({success:false,error:'Not authorised for this property'});
     if (!b.subject || !b.description) {
       return res.status(400).json({ success: false, error: 'Subject and description are required' });
     }
@@ -92,7 +99,7 @@ router.get('/planner', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT t.ticket_id, t.title, t.priority, t.status, t.work_type,
-             t.scheduled_date, t.estimated_hours, t.created_at, t.completed_at,
+             t.scheduled_date, t.estimated_hours, t.created_at, t.completed_at,t.description,t.resolution_notes,
              t.property_id, COALESCE(p.asset_code, p.property_name) AS property_name,
              t.assigned_team, ft.team_name, ft.members
         FROM tickets t
@@ -105,7 +112,7 @@ router.get('/planner', authenticateToken, async (req, res) => {
       ticket_id: r.ticket_id, title: r.title, priority: r.priority || 'normal',
       status: r.status, work_type: r.work_type,
       scheduled_date: r.scheduled_date, estimated_hours: r.estimated_hours != null ? parseFloat(r.estimated_hours) : null,
-      created_at: r.created_at, completed_at: r.completed_at,
+      created_at: r.created_at, completed_at: r.completed_at,description:r.description,resolution_notes:r.resolution_notes,
       property_id: r.property_id, property_name: r.property_name,
       assigned_team: r.assigned_team, team_name: r.team_name,
       crew_size: Array.isArray(r.members) ? r.members.length : null,
@@ -124,13 +131,17 @@ router.post('/planner', authenticateToken, requirePermission('maintenance.manage
     const b = req.body || {};
     if (!b.work_type) return res.status(400).json({ success: false, error: 'work_type is required' });
     if (!b.scheduled_date) return res.status(400).json({ success: false, error: 'scheduled_date is required' });
+    if (!Number.isFinite(new Date(b.scheduled_date).getTime())) return res.status(400).json({success:false,error:'Valid scheduled date required'});
+    if (b.estimated_hours!=null && (!Number.isFinite(Number(b.estimated_hours)) || Number(b.estimated_hours)<0)) return res.status(400).json({success:false,error:'Estimated hours must be nonnegative'});
 
     let propertyName = null;
     if (b.property_id) {
       const { rows } = await pool.query(
         `SELECT COALESCE(asset_code, property_name) AS name FROM properties WHERE property_id = $1`, [b.property_id]);
       propertyName = rows[0] ? rows[0].name : null;
+      if (!rows.length) return res.status(404).json({success:false,error:'Property not found'});
     }
+    if (b.assigned_team && !(await pool.query('SELECT team_id FROM field_teams WHERE team_id=$1',[b.assigned_team])).rows.length) return res.status(404).json({success:false,error:'Team not found'});
     const title = b.title || `${String(b.work_type).replace(/_/g, ' ')}${propertyName ? ' — ' + propertyName : ''}`;
     const ticketId = 'WO-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
 
@@ -141,7 +152,7 @@ router.post('/planner', authenticateToken, requirePermission('maintenance.manage
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'scheduled',$10,$11) RETURNING *`,
       [ticketId, title, b.description || null, b.priority || 'normal', b.work_type,
        b.property_id || null, b.assigned_team || null, b.scheduled_date,
-       b.estimated_hours || null, req.user.id, req.user.email]);
+       b.estimated_hours ?? null, req.user.id, req.user.email]);
 
     logAction(req.user.id, 'scheduled a maintenance job', 'ticket', ticketId, { work_type: b.work_type, scheduled_date: b.scheduled_date });
     res.status(201).json({ success: true, data: shape(rows[0]) });
@@ -163,7 +174,10 @@ router.get('/support', authenticateToken, requirePermission('support.view'), asy
              p.property_name,
              (SELECT COUNT(*) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id) AS message_count,
              (SELECT MAX(created_at) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id) AS last_message_at,
-             (SELECT author_type FROM ticket_messages m WHERE m.ticket_id = t.ticket_id ORDER BY created_at DESC LIMIT 1) AS last_author
+             (SELECT author_type FROM ticket_messages m WHERE m.ticket_id = t.ticket_id ORDER BY created_at DESC,id DESC LIMIT 1) AS last_author,
+             (SELECT MAX(created_at) FROM ticket_messages m WHERE m.ticket_id=t.ticket_id AND m.author_type='support') AS last_staff_reply_at,
+             (SELECT MIN(created_at) FROM ticket_messages m WHERE m.ticket_id=t.ticket_id AND m.author_type='client'
+               AND m.created_at>COALESCE((SELECT MAX(sm.created_at) FROM ticket_messages sm WHERE sm.ticket_id=t.ticket_id AND sm.author_type='support'),'-infinity'::timestamptz)) AS waiting_client_since
         FROM tickets t
         LEFT JOIN users u ON u.id = t.user_id
         LEFT JOIN properties p ON p.property_id = t.property_id
@@ -176,6 +190,7 @@ router.get('/support', authenticateToken, requirePermission('support.view'), asy
     const data = rows.map(r => ({
       ...r,
       needs_response: !['resolved', 'closed'].includes(r.status) && (r.last_author == null || r.last_author === 'client'),
+      response_wait_since: !['resolved','closed'].includes(r.status) && (r.last_author==null || r.last_author==='client') ? (r.last_staff_reply_at==null ? r.created_at : r.waiting_client_since) : null,
     }));
     res.json({ success: true, data });
   } catch (err) {
@@ -191,7 +206,7 @@ router.put('/:ticketId/support-status', authenticateToken, requirePermission('su
   const status = ['resolved', 'in_progress', 'closed'].includes(req.body && req.body.status) ? req.body.status : null;
   if (!status) return res.status(400).json({ success: false, error: 'Invalid status' });
   try {
-    const { rows } = await pool.query('UPDATE tickets SET status=$2, updated_at=NOW() WHERE ticket_id=$1 RETURNING ticket_id, status', [req.params.ticketId, status]);
+    const { rows } = await pool.query('UPDATE tickets SET status=$2, updated_at=NOW() WHERE ticket_id=$1 AND work_type IS NULL AND assigned_team IS NULL RETURNING ticket_id, status', [req.params.ticketId, status]);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'Ticket not found' });
     res.json({ success: true, data: rows[0] });
   } catch (err) { res.status(500).json({ success: false, error: 'Failed to update ticket' }); }
@@ -202,8 +217,9 @@ router.get('/:ticketId', authenticateToken, async (req, res) => {
   try {
     if (!(await assertTicketAccess(req, res, req.params.ticketId))) return;
     const { rows } = await pool.query(
-      `SELECT t.*, u.email AS creator_email, u.full_name AS creator_name
+      `SELECT t.*, u.email AS creator_email, u.full_name AS creator_name,p.property_name
          FROM tickets t LEFT JOIN users u ON u.id = t.user_id
+         LEFT JOIN properties p ON p.property_id=t.property_id
         WHERE t.ticket_id = $1`, [req.params.ticketId]);
     if (!rows[0]) return res.status(404).json({ success: false, error: 'Ticket not found' });
     const t = rows[0];
@@ -224,7 +240,9 @@ router.get('/:ticketId', authenticateToken, async (req, res) => {
         created_at: t.created_at,
       }, ...messages];
     }
-    res.json({ success: true, data: { ...shape(t), messages } });
+    const data={...shape(t),messages};
+    if (!isClient(req) && !t.work_type) data.linked_work_orders=(await pool.query('SELECT id,title,status,property_id FROM jobs WHERE source_ticket_id=$1 ORDER BY created_at DESC',[t.ticket_id])).rows;
+    res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to load ticket' });
   }
@@ -235,8 +253,14 @@ router.post('/:ticketId/reply', authenticateToken, async (req, res) => {
   try {
     const t = await assertTicketAccess(req, res, req.params.ticketId);
     if (!t) return;
+    if (!isClient(req)) {
+      const {hasPermission}=require('../utils/permissions');
+      const crew=t.assigned_team && (await require('../utils/scope').teamIdsForUser(req.user.id)).includes(String(t.assigned_team));
+      const allowed=await hasPermission(req.user.role,t.work_type ? 'maintenance.manage' : 'support.manage');
+      if (!allowed && !crew) return res.status(403).json({success:false,error:'Reply permission required'});
+    }
     const { message } = req.body;
-    if (!message || !message.trim()) return res.status(400).json({ success: false, error: 'Message is required' });
+    if (typeof message!=='string' || !message.trim()) return res.status(400).json({ success: false, error: 'Message is required' });
     const name = req.user.full_name || req.user.email || 'You';
     const { rows } = await pool.query(
       `INSERT INTO ticket_messages (ticket_id, author_type, author_name, message)
@@ -278,12 +302,20 @@ router.post('/:ticketId/complete', authenticateToken, requirePermission('mainten
          FROM tickets WHERE ticket_id = $1 FOR UPDATE`, [req.params.ticketId]);
     if (!rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, error: 'Work order not found' }); }
     const t = rows[0];
+    if (!t.work_type || t.status!=='in_progress') {
+      await client.query('ROLLBACK');return res.status(409).json({success:false,error:'Only in-progress internal maintenance can be completed'});
+    }
+    if (typeof req.body.resolution_notes!=='string' || !req.body.resolution_notes.trim()) {
+      await client.query('ROLLBACK');return res.status(400).json({success:false,error:'Completion findings are required'});
+    }
     if (['resolved', 'closed'].includes(t.status)) {
       await client.query('ROLLBACK');
       return res.status(409).json({ success: false, error: 'Work order already completed' });
     }
 
     const workType = req.body.work_type || t.work_type || 'maintenance';
+    if (workType!==t.work_type) {await client.query('ROLLBACK');return res.status(409).json({success:false,error:'Completion cannot change the recorded work type'});}
+    if (workType==='enzyme_refill' && req.app.locals.disallowDeviceMutations) {await client.query('ROLLBACK');return res.status(503).json({success:false,error:'Device-affecting refill updates are disabled in the local sandbox'});}
 
     await client.query(
       `UPDATE tickets SET status='resolved', completed_at=NOW(), resolved_at=NOW(),
@@ -360,7 +392,8 @@ router.put('/:ticketId/status', authenticateToken, requirePermission('maintenanc
       return res.status(400).json({ success: false, error: `status must be one of: ${VALID.join(', ')}. Use POST /tickets/:id/complete to mark work done.` });
     }
     const { rows } = await pool.query(
-      `UPDATE tickets SET status = $2, updated_at = NOW() WHERE ticket_id = $1 RETURNING *`,
+      `UPDATE tickets SET status = $2, updated_at = NOW() WHERE ticket_id = $1
+       AND work_type IS NOT NULL AND status IN ('scheduled','in_progress') RETURNING *`,
       [req.params.ticketId, req.body.status]);
     if (!rows.length) return res.status(404).json({ success: false, error: 'Work order not found' });
     res.json({ success: true, data: shape(rows[0]) });

@@ -14,7 +14,7 @@
 
 const pool = require('../config/database');
 
-function num(v) { return v == null || v === '' || isNaN(Number(v)) ? null : Number(v); }
+function num(v) { return v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v); }
 
 // Returns a Map<property_id, features>. One grouped scan of the last 30 days
 // of readings, using FILTER windows so it's a single query, not N.
@@ -35,7 +35,8 @@ async function computeFeatures() {
       FROM sensor_readings r
       JOIN sensors s     ON s.sensor_id = r.sensor_id
       JOIN properties asset ON asset.property_id = s.property_id
-     WHERE r.time > NOW() - INTERVAL '31 days'
+     WHERE r.time > NOW() - INTERVAL '31 days' AND r.time <= NOW()
+       AND (r.water_level_percent IS NULL OR r.water_level_percent BETWEEN 0 AND 100)
        AND s.status = 'active' AND s.property_id IS NOT NULL
      GROUP BY COALESCE(asset.parent_property_id, asset.property_id)`);
 
@@ -59,7 +60,10 @@ async function computeFeatures() {
       silt_change_30d: (silt_now != null && silt_30d_ago != null) ? +(silt_now - silt_30d_ago).toFixed(1) : null,
       inflow_now, outflow_now,
       net_flow: (inflow_now != null && outflow_now != null) ? +(inflow_now - outflow_now).toFixed(1) : null,
-      rain_onsite_1h: num(r.rain_onsite_1h),
+      // Ingest does not yet identify interval-mm versus cumulative counters.
+      // AVG(rainfall_mm) cannot be called a one-hour accumulation safely.
+      rain_onsite_1h: null,
+      rainfall_semantics: 'unverified',
       readings_6h: parseInt(r.n_6h) || 0,
       latest: r.latest || null,
     });

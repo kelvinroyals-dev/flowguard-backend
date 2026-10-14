@@ -54,7 +54,8 @@ function generateReportPdf(report) {
       doc.on('error', reject);
 
       const L = 36, R = doc.page.width - 36, W = R - L;
-      const score = r.drainage_condition_score != null ? Math.round(Number(r.drainage_condition_score)) : null;
+      const rawScore=r.drainage_condition_score != null ? Number(r.drainage_condition_score) : NaN;
+      const score=Number.isFinite(rawScore) && rawScore>=0 && rawScore<=100 ? Math.round(rawScore) : null;
       const cond = condition(score);
       const [title, subtitle] = TITLES[String(r.report_type || 'inspection').toLowerCase()] || TITLES.inspection;
 
@@ -95,13 +96,14 @@ function generateReportPdf(report) {
 
       doc.font('Helvetica-Bold').fontSize(22).fillColor(INK).text(title, L, 104, { width: W * 0.52 - 6 });
       const subY = doc.y + 2;
-      doc.font('Helvetica-Bold').fontSize(10).fillColor(TEAL).text(subtitle.toUpperCase(), L, subY, { characterSpacing: 1.5 });
+      const published=['approved','sent_to_client'].includes(r.status);
+      doc.font('Helvetica-Bold').fontSize(10).fillColor(published ? TEAL : AMBER).text(published ? 'RECORDED FIELD REPORT' : 'DRAFT - NOT APPROVED', L, subY, { characterSpacing: 1.5 });
       const plY = doc.y + 9;
       doc.save().lineWidth(2.4).strokeColor(INK).moveTo(L, plY).lineTo(L + 150, plY).stroke();
       [TEAL, TEAL, RED].forEach((c, i) => doc.lineWidth(2.4).strokeColor(c).moveTo(L + 40 + i * 45, plY - 4).lineTo(L + 40 + i * 45, plY + 4).stroke());
       doc.restore();
       doc.font('Helvetica').fontSize(9.5).fillColor(INK2).text(
-        'This report summarises the drainage assessment carried out at the property listed below.',
+        'This document presents recorded field findings. Publication status and supporting evidence should be checked before action.',
         L, plY + 14, { width: W * 0.52 - 6, lineGap: 2 });
 
       // summary card
@@ -112,7 +114,7 @@ function generateReportPdf(report) {
       doc.font('Helvetica-Bold').fontSize(6).fillColor(INK3).text('HEALTH SCORE', dcx - 32, dcy + 8, { width: 64, align: 'center', characterSpacing: 0.5 });
       label('Overall Condition', cardX + 100, cardY + 44, INK3);
       doc.font('Helvetica-Bold').fontSize(16).fillColor(cond.color).text(cond.word, cardX + 100, cardY + 56);
-      const desc = (r.summary || r.executive_summary || 'Assessment completed. See findings and recommendations below.').slice(0, 140);
+      const desc = (r.summary || r.executive_summary || 'Recorded findings and recommendations appear below.').slice(0, 140);
       doc.font('Helvetica').fontSize(8).fillColor(INK2).text(desc, cardX + 100, cardY + 78, { width: cardW - 116, lineGap: 1.5 });
       const lgY = cardY + cardH - 22;
       [['Good 80–100', GREEN], ['Fair 50–79', AMBER], ['Poor 0–49', RED]].forEach((g, i) => {
@@ -151,12 +153,12 @@ function generateReportPdf(report) {
 
       // ══ CONDITION STRIP (real metrics only) ══
       const riskColor = r.flood_risk_level && /high|critical/i.test(r.flood_risk_level) ? RED
-        : r.flood_risk_level && /mod|medium/i.test(r.flood_risk_level) ? AMBER : GREEN;
+        : r.flood_risk_level && /mod|medium/i.test(r.flood_risk_level) ? AMBER : r.flood_risk_level ? GREEN : INK3;
       const metrics = [
         ['Drainage Health', score != null ? `${score}%` : '—', cond.color],
         ['Overall Condition', cond.word, cond.color],
         ['Flood Risk', r.flood_risk_level ? cap(r.flood_risk_level) : '—', riskColor],
-        ['Time on Site', r.work_duration_min ? `${r.work_duration_min} min` : '—', INK],
+        ['Time on Site', r.work_duration_min != null ? `${r.work_duration_min} min` : '—', INK],
       ];
       label('Drainage System Condition', L, y, INK); y += 15;
       const mW = (W - 3 * 10) / 4, mH = 46;
