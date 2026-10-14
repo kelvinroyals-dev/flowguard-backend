@@ -44,7 +44,7 @@ function templatePortfolio(p, estates) {
 //  -> { ai:true, provider, model, briefing, structured }
 //   | { ai:false, reason, status, detail, briefing, structured }
 //   | { notFound:true }   (property_id given but not in this (scoped) forecast)
-async function generateBrief({ forecast, property_id, scope }) {
+async function generateBrief({ forecast, property_id, scope, audience }) {
   const wantPortfolio = scope === 'portfolio' || !property_id;
 
   let structured, fallback, userPrompt, maxTokens;
@@ -66,7 +66,24 @@ async function generateBrief({ forecast, property_id, scope }) {
     maxTokens = 400;
   }
 
-  const ai = await askLLM({ system: SYSTEM, user: userPrompt, maxTokens });
+  const clientRules = audience === 'client' ? [
+    'Write for a non-technical property owner or estate manager in Nigeria, not an engineer.',
+    'Use simple everyday English, short sentences and these headings: What is happening; What this means; What to do next.',
+    'Explain risk scores as warning indicators, never as the percentage chance of flooding. Do not lead with scores or formulas.',
+    'Explain unfamiliar terms such as silt as mud and debris. Do not use telemetry, horizon, anomaly, dispatch or SLA without explanation.',
+    'FlowGuard monitors and coordinates. Service providers perform inspections, cleaning, repairs and visits. An alert or support conversation does not confirm a visit.',
+    'Never claim a drain is clear, flooding is confirmed, or a provider is on the way unless the supplied data explicitly supports that claim.',
+    'Give a specific next step using only the supplied recommendation. Never tell a client to enter a drain, open a manhole, or touch equipment in floodwater.',
+  ].join('\n') : '';
+  if(audience==='client'){
+    const records=wantPortfolio?(structured.estates||[]):[structured];
+    fallback=records.map(est=>{
+      const known=est.current_risk!=null&&Number.isFinite(Number(est.current_risk));
+      const condition=known?`${riskLevel(est.current_risk).toLowerCase()} warning level`:'an unavailable warning level';
+      return `What is happening\n${est.name||'This property'} has ${condition} in the available forecast.\n\nWhat this means\nThis is a warning indicator, not the chance of a flood. It does not confirm flooding or that every drain is clear.\n\nWhat to do next\n${est.recommendation||'Check the latest device updates and ask your estate or facility manager for help if conditions are unclear.'} A provider must confirm any visit. Stay away from moving water and open drains.`;
+    }).join('\n\n');
+  }
+  const ai = await askLLM({ system: SYSTEM+'\n'+clientRules, user: userPrompt, maxTokens });
   if (ai.ok) {
     return { ai: true, provider: ai.provider, model: ai.model, briefing: ai.text, structured };
   }

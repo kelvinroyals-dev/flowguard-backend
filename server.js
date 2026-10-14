@@ -129,6 +129,12 @@ app.use(`${API_PREFIX}/network`, require('./routes/network'));
 app.use(`${API_PREFIX}/service-providers`, require('./routes/serviceProviders'));
 app.use(`${API_PREFIX}/jobs`, require('./routes/jobs'));
 app.use(`${API_PREFIX}/service-requests`, require('./routes/serviceRequests'));
+app.use(`${API_PREFIX}/service-plans`, require('./routes/servicePlans'));
+// Opt-in only after the service-plan migration is applied to the target DB.
+// Generates reviewable, unassigned drafts; never dispatches a provider.
+if (process.env.ENABLE_SERVICE_PLAN_DRAFTS === 'true') {
+  require('./utils/servicePlans').startServicePlanDrafts(require('./config/database'));
+}
 app.use(`${API_PREFIX}/firmware`, require('./routes/firmware'));
 app.use(`${API_PREFIX}/device-profiles`, require('./routes/deviceProfiles'));
 app.use(`${API_PREFIX}/device-drivers`, require('./routes/deviceDrivers'));
@@ -148,6 +154,7 @@ app.use((err, _req, res, _next) => {
 require('./utils/health').startDailySnapshots();
 require('./utils/incidents').startIncidentWatch();
 require('./utils/dailyBrief').startDailyBriefings();
+require('./utils/weatherRefresh').start();
 
 server.listen(PORT, () => {
   console.log(`✅ FlowGuard API listening on port ${PORT}`);

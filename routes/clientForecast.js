@@ -40,7 +40,7 @@ async function myPropertyIds(req) {
 // GET /client-forecast/horizons — scoped now/+1h/+3h/+6h trajectory + triage.
 router.get('/horizons', async (req, res) => {
   try {
-    const [forecast, ids] = await Promise.all([buildHorizonForecast(), myPropertyIds(req)]);
+    const ids=await myPropertyIds(req),forecast=await buildHorizonForecast({propertyIds:ids});
     const scoped = scopeHorizonsToProperties(forecast, ids);
     res.json({ success: true, data: scoped });
   } catch (err) {
@@ -54,10 +54,11 @@ router.get('/horizons', async (req, res) => {
 // forecast is scoped BEFORE the estate lookup, so a foreign id returns 404.
 router.post('/brief', async (req, res) => {
   try {
-    const [forecast, ids] = await Promise.all([buildHorizonForecast(), myPropertyIds(req)]);
+    const ids=await myPropertyIds(req),forecast=await buildHorizonForecast({propertyIds:ids});
     const scoped = scopeHorizonsToProperties(forecast, ids);
     const out = await generateBrief({
       forecast: scoped,
+      audience: 'client',
       property_id: req.body && req.body.property_id,
       scope: req.body && req.body.scope,
     });

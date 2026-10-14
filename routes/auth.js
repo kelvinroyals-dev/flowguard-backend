@@ -239,7 +239,7 @@ router.post('/register', async (req, res) => {
   try {
     const { firstName, lastName, fullName: fullNameIn, email, phone, password,
             company, jobTitle, location, plan, marketing, emailVerifyToken,
-            accountType, contactPerson, coverageArea, serviceTypes, property } = req.body || {};
+            accountType, contactPerson, coverageArea, coverageStates, serviceTypes, property, locationSchema } = req.body || {};
     const fullName = (fullNameIn && fullNameIn.trim())
       || [firstName, lastName].filter(Boolean).join(' ').trim();
     if (!email || !password || !fullName) {
@@ -274,13 +274,20 @@ router.post('/register', async (req, res) => {
       const types = Array.isArray(serviceTypes)
         ? serviceTypes
         : (serviceTypes ? String(serviceTypes).split(',').map(s => s.trim()).filter(Boolean) : null);
+      let canonicalCoverage=null;
+      if(coverageStates!==undefined||locationSchema==='ng-states-v1'){
+        if(!Array.isArray(coverageStates)||!coverageStates.length||coverageStates.length>37)return res.status(400).json({success:false,error:'Select at least one valid coverage state'});
+        const states=coverageStates.map(require('../utils/nigeriaStates').canonical);
+        if(states.some(s=>!s))return res.status(400).json({success:false,error:'Invalid provider coverage state'});
+        canonicalCoverage=[...new Set(states)].sort().join(', ');
+      }
       await client.query('BEGIN');
       const orgRes = await client.query(
         `INSERT INTO service_provider_organisations
            (name, contact_person, email, phone, coverage_area, service_types, status)
          VALUES ($1,$2,$3,$4,$5,$6,'pending') RETURNING *`,
         [orgName, (contactPerson && contactPerson.trim()) || fullName, cleanEmail, phone || null,
-         (coverageArea && String(coverageArea).trim()) || location || null, types]
+         canonicalCoverage || (coverageArea && String(coverageArea).trim()) || location || null, types]
       );
       const org = orgRes.rows[0];
       const spRes = await client.query(
@@ -329,7 +336,7 @@ router.post('/register', async (req, res) => {
       if (!property || typeof property !== 'object' || Array.isArray(property)) {
         return res.status(400).json({ success: false, error: 'Valid property details are required' });
       }
-      const limits = { name: 255, location: 500, type: 100, size: 255, primaryConcern: 10000 };
+      const limits = { name: 255, location: 500, state: 120, type: 100, size: 255, primaryConcern: 10000 };
       for (const [field, max] of Object.entries(limits)) {
         if (property[field] != null && (typeof property[field] !== 'string' || property[field].length > max)) {
           return res.status(400).json({ success: false, error: `Invalid property ${field}` });
@@ -339,6 +346,8 @@ router.post('/register', async (req, res) => {
       if (name.length < 2 || address.length < 2) {
         return res.status(400).json({ success: false, error: 'Property name and location are required' });
       }
+      const state=require('../utils/nigeriaStates').canonical(property.state);
+      if((property.state!==undefined||locationSchema==='ng-states-v1')&&!state)return res.status(400).json({success:false,error:'Select a valid property state'});
       const typeLabel = (property.type || '').trim();
       const typeKey = typeLabel.toLowerCase().replace(/[\s&-]+/g, '_');
       const types = {
@@ -350,7 +359,7 @@ router.post('/register', async (req, res) => {
       };
       submittedProperty = {
         name, address, type: Object.prototype.hasOwnProperty.call(types, typeKey) ? types[typeKey] : (typeLabel ? 'mixed_use' : 'residential_estate'),
-        city: 'Unspecified', state: 'Unspecified',
+        city: 'Unspecified', state: state || 'Unspecified',
         meta: { property_type_label: typeLabel || null, approximate_size: (property.size || '').trim() || null,
           primary_concern: (property.primaryConcern || '').trim() || null }
       };

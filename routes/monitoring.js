@@ -53,9 +53,10 @@ async function clientIdsForUser(userId) {
 // aren't attached to any of their properties (ops, which scopes by property,
 // correctly showed none) — so a property still at "submitted" appeared to have
 // live nodes. This is the single source of truth for "this client's sensors".
-async function clientSensorIds(userId) {
+async function clientSensorIds(userId, propertyId) {
   const { propertyIdsForUser } = require('../utils/scope');
-  const pids = await propertyIdsForUser(userId);
+  const owned = await propertyIdsForUser(userId);
+  const pids = propertyId ? owned.filter(id=>String(id)===String(propertyId)) : owned;
   if (!pids.length) return [];
   const { rows } = await pool.query(
     `SELECT s.sensor_id
@@ -68,9 +69,10 @@ async function clientSensorIds(userId) {
 // GET /monitoring/flood-risk  -> { has_data, risk_index, level, sensors_online, sensors_total, peak_level }
 router.get('/flood-risk', authenticateToken, sensorScope, async (req, res) => {
   try {
-    const sids = await clientSensorIds(req.user.id);
+    const propertyId=req.query.property_id||null;
+    const sids = await clientSensorIds(req.user.id,propertyId);
     if (!sids.length) {
-      return res.json({ success: true, data: { has_data: false, reason: 'no_sensors', sensors_total: 0, sensors_online: 0 } });
+      return res.json({ success: true, data: { property_id:propertyId, has_data: false, reason: 'no_sensors', sensors_total: 0, sensors_online: 0 } });
     }
 
     // "online" = active status AND telemetry within the last 6h, not status
@@ -92,7 +94,7 @@ router.get('/flood-risk', authenticateToken, sensorScope, async (req, res) => {
     if (!latest.rows.length) {
       // Sensors may exist but none have reported yet — be honest
       return res.json({ success: true, data: {
-        has_data: false, reason: total ? 'awaiting_readings' : 'no_sensors',
+        property_id:propertyId, has_data: false, reason: total ? 'awaiting_readings' : 'no_sensors',
         sensors_total: total, sensors_online: online
       }});
     }
@@ -105,7 +107,7 @@ router.get('/flood-risk', authenticateToken, sensorScope, async (req, res) => {
     const level = riskIndex >= 70 ? 'high' : riskIndex >= 45 ? 'moderate' : 'low';
 
     res.json({ success: true, data: {
-      has_data: true, risk_index: riskIndex, level,
+      property_id:propertyId, has_data: true, risk_index: riskIndex, level,
       peak_level: Math.round(peak), avg_level: Math.round(avg),
       sensors_online: online, sensors_total: total,
       reading_count: latest.rows.length
@@ -193,8 +195,9 @@ router.get('/sensors', authenticateToken, sensorScope, async (req, res) => {
 // GET /monitoring/history?hours=24 -> time-series readings for charts + log
 router.get('/history', authenticateToken, sensorScope, async (req, res) => {
   try {
-    const sids = await clientSensorIds(req.user.id);
-    if (!sids.length) return res.json({ success: true, data: { series: [], log: [] } });
+    const propertyId=req.query.property_id||null;
+    const sids = await clientSensorIds(req.user.id,propertyId);
+    if (!sids.length) return res.json({ success: true, data: { property_id:propertyId,series: [], log: [],has_data:false } });
     const hours = Math.min(720, Math.max(1, parseInt(req.query.hours) || 24));
 
     // Raw log: recent readings across the client's sensors (newest first)
@@ -211,13 +214,16 @@ router.get('/history', authenticateToken, sensorScope, async (req, res) => {
     const series = await pool.query(
       `SELECT date_trunc('hour', r.time) AS bucket,
               ROUND(AVG(r.water_level_percent)::numeric, 1) AS avg_level,
-              ROUND(MAX(r.water_level_percent)::numeric, 1) AS peak_level
+              ROUND(MAX(r.water_level_percent)::numeric, 1) AS peak_level,
+              ROUND(AVG(r.inflow_rate)::numeric, 1) AS avg_flow,
+              ROUND(AVG(r.temperature)::numeric, 1) AS avg_temperature
          FROM sensor_readings r
         WHERE r.sensor_id = ANY($1) AND r.time > NOW() - ($2 || ' hours')::interval
         GROUP BY bucket ORDER BY bucket ASC`, [sids, hours]);
 
     res.json({ success: true, data: {
-      series: series.rows.map(r => ({ t: r.bucket, avg: parseFloat(r.avg_level), peak: parseFloat(r.peak_level) })),
+      property_id:propertyId,
+      series: series.rows.map(r => ({ t: r.bucket, avg:r.avg_level==null?null:parseFloat(r.avg_level), peak:r.peak_level==null?null:parseFloat(r.peak_level),flow:r.avg_flow==null?null:parseFloat(r.avg_flow),temperature:r.avg_temperature==null?null:parseFloat(r.avg_temperature) })),
       log: log.rows.map(r => ({
         time: r.time, sensor: r.sensor_name || r.sensor_id,
         level: r.water_level_percent != null ? parseFloat(r.water_level_percent) : null,
@@ -248,17 +254,25 @@ router.get('/sensor/:sensorId', authenticateToken, sensorScope, async (req, res)
     if (!sres.rows.length) return res.status(404).json({ success: false, error: 'Sensor not found' });
     const s = sres.rows[0];
 
+    const latest=await pool.query('SELECT time,water_level_percent,inflow_rate,temperature FROM sensor_readings WHERE sensor_id=$1 ORDER BY time DESC LIMIT 1',[req.params.sensorId]);
+    const reading=latest.rows[0];
+    const recent=s.status==='active'&&reading&&Date.now()-new Date(reading.time).getTime()<=6*3600e3;
+
     const series = await pool.query(
       `SELECT date_trunc('hour', time) AS bucket,
               ROUND(AVG(water_level_percent)::numeric,1) AS avg_level,
               ROUND(MAX(water_level_percent)::numeric,1) AS peak_level,
-              ROUND(AVG(inflow_rate)::numeric,1) AS avg_flow
+              ROUND(AVG(inflow_rate)::numeric,1) AS avg_flow,
+              ROUND(AVG(temperature)::numeric,1) AS avg_temperature
          FROM sensor_readings
         WHERE sensor_id = $1 AND time > NOW() - ($2 || ' hours')::interval
         GROUP BY bucket ORDER BY bucket ASC`, [req.params.sensorId, hours]);
 
     res.json({ success: true, data: {
       sensor_id: s.sensor_id, name: s.name, zone: s.zone, status: s.status,
+      has_data:!!recent,level:recent&&reading.water_level_percent!=null?parseFloat(reading.water_level_percent):null,
+      flow_rate:recent&&reading.inflow_rate!=null?parseFloat(reading.inflow_rate):null,
+      temperature:recent&&reading.temperature!=null?parseFloat(reading.temperature):null,
       device_variant: s.device_variant || 'basic',
       battery_percent: s.battery_voltage != null
         ? Math.max(0, Math.min(100, Math.round(((parseFloat(s.battery_voltage) - 3.3) / 0.9) * 100))) : null,
@@ -267,7 +281,7 @@ router.get('/sensor/:sensorId', authenticateToken, sensorScope, async (req, res)
         level_percent: s.enzyme_level_percent != null ? parseFloat(s.enzyme_level_percent) : null,
         status: s.cartridge_status, depletion_date: s.estimated_depletion_date
       } : null,
-      series: series.rows.map(r => ({ t: r.bucket, avg: parseFloat(r.avg_level), peak: parseFloat(r.peak_level), flow: parseFloat(r.avg_flow) })),
+      series: series.rows.map(r => ({ t: r.bucket, avg:r.avg_level==null?null:parseFloat(r.avg_level), peak:r.peak_level==null?null:parseFloat(r.peak_level), flow:r.avg_flow==null?null:parseFloat(r.avg_flow),temperature:r.avg_temperature==null?null:parseFloat(r.avg_temperature) })),
       hours
     }});
   } catch (err) {
@@ -284,11 +298,12 @@ router.get('/sensor/:sensorId', authenticateToken, sensorScope, async (req, res)
 //   INFRA   — what's actually happening in the drain (normal…critical) OR
 //             UNKNOWN when the sensor isn't trustworthy. Missing/stale/frozen
 //             telemetry must NEVER be read as "the drain is fine".
-const STALE_MIN = 90, OFFLINE_H = 6, FROZEN_READS = 10, FROZEN_SPAN_MIN = 120;
+const STALE_MIN = 30, OFFLINE_H = 6, FROZEN_READS = 10, FROZEN_SPAN_MIN = 120;
 function computeStates(x, win) {
   const now = Date.now();
-  const readAge = x.reading_time ? (now - new Date(x.reading_time).getTime()) / 60000 : null; // minutes
-  const pingAge = x.last_ping ? (now - new Date(x.last_ping).getTime()) / 60000 : null;
+  const age = value => {const ms=value ? new Date(value).getTime() : NaN;return Number.isFinite(ms) && ms <= now ? (now-ms)/60000 : null;};
+  const readAge = age(x.reading_time); // minutes; invalid/future timestamps are not fresh
+  const pingAge = age(x.last_ping);
   const lvl = x.level;
 
   // DEVICE
@@ -308,7 +323,7 @@ function computeStates(x, win) {
   // SENSOR (data trust)
   let sensor_state = 'ok', sensor_reason = null;
   if (device_state === 'offline' || device_state === 'maintenance') { sensor_state = 'unknown'; sensor_reason = 'device ' + device_state; }
-  else if (lvl == null && readAge == null) { sensor_state = 'unknown'; sensor_reason = 'no readings received'; }
+  else if (lvl == null || !Number.isFinite(lvl) || readAge == null) { sensor_state = 'unknown'; sensor_reason = 'valid level and timestamp not supplied'; }
   else if (lvl != null && (lvl < 0 || lvl > 100)) { sensor_state = 'implausible'; sensor_reason = 'reading out of range'; }
   else if (readAge != null && readAge > STALE_MIN) { sensor_state = 'stale'; sensor_reason = `last reading ${Math.round(readAge)}m ago`; }
   else if (win && Number(win.n) >= FROZEN_READS && Number(win.span_min) >= FROZEN_SPAN_MIN
@@ -364,7 +379,7 @@ router.get('/sensors/all', authenticateToken, sensorScope, async (req, res) => {
              r.water_level_percent, r.water_level_liters, r.inflow_rate, r.outflow_rate,
              r.temperature, r.debris_detected, r.silt_depth_mm, r.rainfall_mm,
              r.water_quality_ph, r.turbidity_ntu, r.time AS reading_time,
-             cov.assets, cmd.pending_commands
+             cov.assets, cmd.pending_commands, win.n, win.sd, win.rng, win.span_min
         FROM sensors s
         LEFT JOIN device_profiles pf ON pf.id = s.profile_id
         LEFT JOIN device_drivers dd ON dd.id = s.driver_id
@@ -406,7 +421,8 @@ router.get('/sensors/all', authenticateToken, sensorScope, async (req, res) => {
                  COALESCE(MAX(water_level_percent) - MIN(water_level_percent), 0) AS rng,
                  COALESCE(EXTRACT(EPOCH FROM (MAX(time) - MIN(time))) / 60, 0) AS span_min
             FROM sensor_readings
-           WHERE sensor_id = s.sensor_id AND time > NOW() - INTERVAL '6 hours'
+           WHERE sensor_id = s.sensor_id AND time > NOW() - INTERVAL '6 hours' AND time <= NOW()
+             AND water_level_percent BETWEEN 0 AND 100
         ) win ON true
        ORDER BY
          CASE s.status WHEN 'active' THEN 0 WHEN 'maintenance' THEN 1 ELSE 2 END,
@@ -986,7 +1002,7 @@ function integrityOf(s) {
     reasons.push(`clock skew ${Math.round(s.last_clock_skew_seconds / 60)} min`);
   const state = s.tamper_flagged ? 'critical'
     : reasons.length ? 'warning'
-    : (s.geofence_state === 'unknown' && s.clock_synced_at == null) ? 'unknown' : 'ok';
+    : ((!s.geofence_state || s.geofence_state === 'unknown') && s.clock_synced_at == null) ? 'unknown' : 'ok';
   return { integrity_state: state, integrity_reasons: reasons };
 }
 // Called inside the readings txn: fold optional device-clock, GPS and tamper

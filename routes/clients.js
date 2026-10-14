@@ -4,14 +4,14 @@ const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 const { requirePermission } = require('../utils/permissions');
 const { requireIntParam } = require('../middleware/validate-id');
-const { isClient } = require('../utils/scope');
+const { isClient, isSpUser } = require('../utils/scope');
 const router = express.Router();
 
 // This is the customer directory — a client account has no business
 // browsing or editing every other customer's record.
 router.use(authenticateToken);
 router.use((req, res, next) => {
-  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  if (isClient(req) || isSpUser(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   next();
 });
 
@@ -22,11 +22,11 @@ router.get('/', authenticateToken, async (req, res) => {
       SELECT u.id AS client_id, u.id, u.full_name, u.email, u.phone,
              CASE WHEN u.is_active THEN 'active' ELSE 'inactive' END AS status,
              u.is_active, u.created_at,
-             COUNT(p.id)                                              AS submitted_areas,
-             COUNT(p.id) FILTER (WHERE p.status IN
+             COUNT(p.property_id)                                              AS submitted_areas,
+             COUNT(p.property_id) FILTER (WHERE p.status IN
                ('submitted','inspection_scheduled','inspection_ongoing',
                 'report_ready','quote_sent','payment_pending'))       AS pending_areas,
-             COUNT(p.id) FILTER (WHERE p.status = 'active')           AS active_areas
+             COUNT(p.property_id) FILTER (WHERE p.status = 'active')           AS active_areas
       FROM users u
       LEFT JOIN properties p ON p.user_id = u.id
       WHERE u.user_type = 'client'

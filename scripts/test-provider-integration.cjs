@@ -29,7 +29,7 @@ async function harness(key) {
     CREATE TABLE jobs(id SERIAL PRIMARY KEY,reference TEXT UNIQUE,property_id VARCHAR(50),service_provider_org_id INT,
       job_type TEXT,title TEXT,description TEXT,priority TEXT,status TEXT,source_ticket_id INT,required_evidence JSONB,
       scheduled_for TIMESTAMPTZ,sla_due_at TIMESTAMPTZ,created_by INT,dispatched_at TIMESTAMPTZ,
-      assigned_technician_id INT,decline_reason TEXT,updated_at TIMESTAMPTZ);
+      assigned_technician_id INT,decline_reason TEXT,updated_at TIMESTAMPTZ,source_alert_id TEXT);
     CREATE TABLE job_events(id SERIAL PRIMARY KEY,job_id INT REFERENCES jobs(id),event_type TEXT,
       from_status TEXT,to_status TEXT,actor_id INT,actor_type TEXT,note TEXT,meta JSONB);
   `);

@@ -4,8 +4,8 @@
    There is no forecasting model in this system. What's real: (1) each
    estate's current sensor-derived risk (same peak/avg-weighted formula
    already used by the client portal's GET /monitoring/flood-risk), and
-   (2) a Lagos-wide rainfall forecast from Open-Meteo (same source and
-   coordinates already used by the ops dashboard's rainfall chart).
+   (2) estate-coordinate rainfall estimates from the shared weather adapter.
+   Missing locations or weather remain unavailable, never a Lagos fallback.
 
    "Predicted" risk is those two blended with a fixed, documented weight
    — 55% current sensor trend, 45% forecast rainfall intensity — not a
@@ -17,7 +17,7 @@
 const pool = require('../config/database');
 const { computeFeatures } = require('./features');
 
-const LAGOS = { lat: 6.45, lon: 3.47 };   // same point the dashboard's rainfall chart already uses
+const estateWeather = require('./estateWeather');
 const CURRENT_WEIGHT = 0.55;
 const RAIN_WEIGHT = 0.45;
 const RAIN_TO_SCORE = 3;   // mm of forecast rain -> risk-score points, capped at 100
@@ -50,7 +50,7 @@ function envScore(p) {
   const health = p.health_score != null ? Number(p.health_score) : null;
   if (health != null) {
     if (health < 60) { const a = Math.round((60 - health) * 0.4); s += a; c.push({ label: `Low drain health (${health}/100)`, delta: a, dir: 'up' }); }
-    else if (health >= 80) { const a = Math.round((health - 80) * 0.3); s -= a; c.push({ label: `Good drain capacity (${health}/100)`, delta: a, dir: 'down' }); }
+    else if (health >= 80) { const a = Math.round((health - 80) * 0.3); s -= a; c.push({ label: `Recorded asset health (${health}/100)`, delta: a, dir: 'down' }); }
   }
 
   const clean = p.last_cleaning || p.last_inspection;
@@ -86,14 +86,14 @@ function envScore(p) {
   return { score: Math.max(0, Math.min(100, Math.round(s))), contributors: c };
 }
 
-async function scoreProperties() {
+async function scoreProperties(scope={}) {
   const { rows } = await pool.query(`
-    SELECT p.property_id, COALESCE(p.asset_code, p.property_name) AS name, p.property_name,
-           p.latitude, p.longitude, p.location_verified, p.geocode_source,
+    SELECT p.property_id, COALESCE(p.property_name, p.asset_code) AS name, p.property_name,
+           p.latitude, p.longitude, p.location_verified, p.geocode_source,p.state,p.city,
            p.elevation_m, p.distance_to_water_m,
            p.health_score, p.risk_level, p.user_id, p.last_inspected_at,
            u.full_name AS client_name,
-           live.peak_level, live.avg_level, live.sensor_count, live.latest_reading,
+           live.peak_level, live.avg_level, live.sensor_count, live.latest_reading, live.reporting_count,
            (SELECT COUNT(*) FROM alerts a WHERE a.property_id = p.property_id AND a.status = 'active') AS open_alerts,
            (SELECT COUNT(*) FROM property_events e WHERE e.property_id = p.property_id AND e.event_type = 'flood_incident') AS flood_events,
            (SELECT MAX(e.occurred_at) FROM property_events e WHERE e.property_id = p.property_id AND e.event_type IN ('silt_clearing','maintenance')) AS last_cleaning,
@@ -101,13 +101,15 @@ async function scoreProperties() {
       FROM properties p
       LEFT JOIN users u ON u.id = p.user_id
       LEFT JOIN LATERAL (
-        SELECT MAX(r.water_level_percent) AS peak_level, AVG(r.water_level_percent) AS avg_level,
-               COUNT(DISTINCT s.sensor_id) AS sensor_count, MAX(r.time) AS latest_reading
+        SELECT MAX(r.water_level_percent) FILTER (WHERE r.time > NOW() - INTERVAL '30 minutes' AND r.time <= NOW() AND r.water_level_percent BETWEEN 0 AND 100) AS peak_level,
+               AVG(r.water_level_percent) FILTER (WHERE r.time > NOW() - INTERVAL '30 minutes' AND r.time <= NOW() AND r.water_level_percent BETWEEN 0 AND 100) AS avg_level,
+               COUNT(DISTINCT s.sensor_id) AS sensor_count, MAX(r.time) AS latest_reading,
+               COUNT(DISTINCT s.sensor_id) FILTER (WHERE r.time > NOW() - INTERVAL '30 minutes' AND r.time <= NOW() AND r.water_level_percent BETWEEN 0 AND 100)::int AS reporting_count
           FROM sensors s
           JOIN properties asset ON asset.property_id = s.property_id
           LEFT JOIN LATERAL (
             SELECT water_level_percent, time FROM sensor_readings
-             WHERE sensor_id = s.sensor_id AND time > NOW() - INTERVAL '6 hours'
+             WHERE sensor_id = s.sensor_id
              ORDER BY time DESC LIMIT 1
           ) r ON true
          WHERE s.status = 'active' AND s.property_id IS NOT NULL
@@ -115,23 +117,26 @@ async function scoreProperties() {
       ) live ON true
      WHERE (p.asset_class = 'customer_property' OR p.asset_class IS NULL)
        AND p.parent_property_id IS NULL
-     ORDER BY p.property_name`);
+       AND ($1::text IS NULL OR LOWER(TRIM(p.state))=LOWER($1) OR ($1='Federal Capital Territory' AND LOWER(TRIM(p.state)) IN ('abuja','fct','abuja fct','fct abuja')))
+       AND ($2::text IS NULL OR LOWER(p.city)=LOWER($2))
+       AND ($3::text IS NULL OR p.property_id=$3)
+       AND ($4::text[] IS NULL OR p.property_id=ANY($4))
+     ORDER BY p.property_name`,[scope.state||null,scope.city||null,scope.property_id||null,scope.propertyIds||null]);
 
   return rows.map(r => {
     const env = envScore(r);
     const peak = parseFloat(r.peak_level);
     const avg = parseFloat(r.avg_level);
     const sensorCount = parseInt(r.sensor_count) || 0;
-    const fresh = r.latest_reading && (Date.now() - new Date(r.latest_reading).getTime()) < 6 * 3600 * 1000;
-    const hasLive = sensorCount > 0 && !isNaN(peak) && fresh;
+    const hasLive = Number(r.reporting_count) > 0 && Number.isFinite(peak) && Number.isFinite(avg);
     const sensorRisk = hasLive ? Math.round(Math.min(100, peak * 0.7 + avg * 0.3)) : null;
     let lat = r.latitude != null ? Number(r.latitude) : null;
     let lon = r.longitude != null ? Number(r.longitude) : null;
-    if (lat == null || lon == null || isNaN(lat) || isNaN(lon)) { lat = null; lon = null; }
+    if (lat == null || lon == null || !Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat)>90 || Math.abs(lon)>180) { lat = null; lon = null; }
     const located = lat != null && lon != null;
     const verified = r.location_verified === true;
     return {
-      property_id: r.property_id, name: r.name, client_name: r.client_name,
+      property_id: r.property_id, name: r.name, client_name: r.client_name,state:r.state,city:r.city,
       latitude: lat, longitude: lon,
       located, location_verified: verified,
       geo_approx: located && !verified,
@@ -141,7 +146,10 @@ async function scoreProperties() {
       env_score: env.score,
       env_contributors: env.contributors,
       sensor_count: sensorCount,
-      data_coverage: hasLive ? Math.min(100, sensorCount * 25) : 0,
+      reporting_count: Number(r.reporting_count) || 0,
+      data_coverage: null, // Physical estate coverage cannot be inferred from device count.
+      assessment_basis: hasLive ? 'recent_telemetry' : 'environmental_baseline',
+      telemetry_state: hasLive ? (Number(r.reporting_count) < sensorCount ? 'partial' : 'recent') : r.latest_reading ? 'stale_or_invalid' : 'missing',
       latest_reading: r.latest_reading || null,
       open_incidents: parseInt(r.open_alerts) || 0,
       flood_events: parseInt(r.flood_events) || 0,
@@ -155,25 +163,10 @@ async function scoreProperties() {
 // Hourly rainfall for a window. `startHour`/`endHour` are offsets from now
 // (e.g. 0-24 = "today", 24-48 = "tomorrow"). Returns null on fetch failure
 // — callers must handle "no forecast available" rather than fake data.
-async function rainfallWindow(startHour, endHour) {
-  try {
-    const hours = Math.min(168, endHour);
-    const r = await fetch(
-      `https://api.open-meteo.com/v1/forecast?latitude=${LAGOS.lat}&longitude=${LAGOS.lon}` +
-      `&hourly=precipitation,precipitation_probability&timezone=Africa%2FLagos&forecast_hours=${hours}`);
-    if (!r.ok) return null;
-    const j = await r.json();
-    const all = j.hourly.time.map((t, i) => ({
-      t, mm: j.hourly.precipitation[i] || 0, prob: j.hourly.precipitation_probability[i] || 0,
-    }));
-    return all.slice(startHour, endHour);
-  } catch (err) {
-    console.error('[riskForecast] rainfall fetch failed:', err.message);
-    return null;
-  }
-}
+async function rainfallWindow(startHour,endHour,estate,snapshot) { return estateWeather.window(estate,startHour,endHour,snapshot); }
 
 function recommendationFor(predicted, delta) {
+  if (predicted == null) return { text: 'Forecast unavailable — review current conditions and restore weather input', level: 'unavailable' };
   if (predicted >= 85) return { text: 'Dispatch emergency crew NOW', level: 'critical' };
   if (predicted >= 60 && delta > 0) return { text: 'Pre-clean drain network', level: 'warning' };
   if (delta < -5) return { text: 'Improving — routine monitoring', level: 'ok' };
@@ -187,7 +180,8 @@ function confidenceFor(e, hasRain) {
   const sources = [];
   let conf = 50;
   if (hasRain) { conf += 12; sources.push('Weather forecast'); }
-  sources.push('Historical data');
+  sources.push('Environmental baseline');
+  if (e.flood_events > 0 || e.last_cleaning || e.last_inspection) sources.push('Recorded history');
   if (e.has_live) { conf += 26; sources.push('Live Sentinels'); }
   const insp = e.last_inspection && (Date.now() - new Date(e.last_inspection).getTime()) < 90 * 864e5;
   if (insp) { conf += 8; sources.push('Recent inspection'); }
@@ -197,20 +191,18 @@ function confidenceFor(e, hasRain) {
 }
 
 // Full forecast for a horizon window (in hours from now).
-async function buildForecast(startHour, endHour) {
-  const [properties, rain] = await Promise.all([
-    scoreProperties(),
-    rainfallWindow(startHour, endHour),
-  ]);
+async function buildForecast(startHour, endHour,scope={}) {
+  const properties=await scoreProperties(scope);
+  const weatherSnapshots=estateWeather.forEstates?await estateWeather.forEstates(properties):new Map();
 
-  const cumulativeRain = rain ? rain.reduce((sum, h) => sum + h.mm, 0) : 0;
-  const rainScore = Math.min(100, cumulativeRain * RAIN_TO_SCORE);
-  const rainAdd = Math.round(rainScore * RAIN_WEIGHT);
-
-  const forecastEstates = properties.map(e => {
-    const predicted = Math.round(Math.min(100, Math.max(0,
-      e.current_risk * CURRENT_WEIGHT + rainScore * RAIN_WEIGHT)));
-    const delta = predicted - e.current_risk;
+  const forecastEstates = await Promise.all(properties.map(async e => {
+    const rain=await rainfallWindow(startHour,endHour,e,weatherSnapshots.get(String(e.property_id)));
+    const cumulativeRain=rain?rain.reduce((sum,h)=>sum+h.mm,0):null;
+    const rainScore=rain?Math.min(100,cumulativeRain*RAIN_TO_SCORE):null;
+    const rainAdd=rain?Math.round(rainScore*RAIN_WEIGHT):0;
+    const predicted = rain ? Math.round(Math.min(100, Math.max(0,
+      e.current_risk * CURRENT_WEIGHT + rainScore * RAIN_WEIGHT))) : null;
+    const delta = predicted == null ? null : predicted - e.current_risk;
     const rec = recommendationFor(predicted, delta);
     const { confidence, sources } = confidenceFor(e, !!rain);
 
@@ -222,38 +214,45 @@ async function buildForecast(startHour, endHour) {
     contributors.sort((a, b) => (b.delta || 0) - (a.delta || 0));
     contributors.push(e.has_live
       ? { label: 'Live Sentinel data', delta: 0, dir: 'down', note: 'raises confidence' }
-      : { label: 'No live Sentinel installed', delta: 0, dir: 'down', note: 'forecast from environment only' });
+      : { label: 'Recent telemetry unavailable', delta: 0, dir: 'down', note: 'current assessment uses environmental baseline; installation is not inferred' });
 
     return {
       ...e, predicted_risk: predicted, delta,
+      forecast_status:rain?'available':'weather_unavailable',cumulative_rain_mm:cumulativeRain,
+      weather_series:(rain||[]).map(h=>({t:h.t,rainfall:h.mm,risk:Math.round(Math.min(100,e.current_risk*CURRENT_WEIGHT+Math.min(100,h.mm*RAIN_TO_SCORE*4)*RAIN_WEIGHT))})),
+      confidence_kind:'evidence_completeness_not_probability',
       recommendation: rec.text, recommendation_level: rec.level,
-      confidence, confidence_sources: sources,
+      confidence: rain ? confidence : null, confidence_sources: sources,
       contributors: contributors.slice(0, 7),
     };
-  }).sort((a, b) => b.predicted_risk - a.predicted_risk);
+  }));
+  forecastEstates.sort((a,b)=>(b.predicted_risk??-1)-(a.predicted_risk??-1));
 
-  // network-wide hourly series for the chart
-  const avgCurrent = properties.length
-    ? properties.reduce((s, e) => s + e.current_risk, 0) / properties.length : 0;
-  const series = (rain || []).map(h => {
-    const hourScore = Math.min(100, h.mm * RAIN_TO_SCORE * 4);
-    const risk = Math.round(Math.min(100, Math.max(0, avgCurrent * CURRENT_WEIGHT + hourScore * RAIN_WEIGHT)));
-    return { t: h.t, risk, rainfall: h.mm };
-  });
-
+  // Charts show one explicitly named estate, never a fictitious national rain sum.
+  const reference=forecastEstates.find(e=>e.forecast_status==='available');
+  const series=reference?.weather_series||[];
+  const available=forecastEstates.filter(e=>e.forecast_status==='available').length;
   const liveCount = forecastEstates.filter(e => e.has_live).length;
   const locatedCount = forecastEstates.filter(e => e.located).length;
   const unverifiedCount = forecastEstates.filter(e => e.geo_approx).length;
-  const portfolioConfidence = forecastEstates.length
-    ? Math.round(forecastEstates.reduce((s, e) => s + e.confidence, 0) / forecastEstates.length) : (rain ? 60 : 50);
+  const suppliedConfidence=forecastEstates.filter(e=>e.confidence!=null);
+  const portfolioConfidence = suppliedConfidence.length
+    ? Math.round(suppliedConfidence.reduce((s,e)=>s+e.confidence,0)/suppliedConfidence.length) : null;
 
   return {
     method: `Rule-based projection: ${Math.round(CURRENT_WEIGHT * 100)}% current risk (live sensors where installed, else environmental/historical baseline) + ${Math.round(RAIN_WEIGHT * 100)}% forecast rainfall — not a trained model.`,
-    has_rainfall_data: !!rain,
-    cumulative_rain_mm: Math.round(cumulativeRain * 10) / 10,
+    has_rainfall_data: available>0,
+    cumulative_rain_mm: reference?.cumulative_rain_mm??null,
+    weather_scope:'estate',weather_reference:reference?{property_id:reference.property_id,name:reference.name}:null,
+    geography:scope,
+    weather_coverage:{available,total:forecastEstates.length,unavailable:forecastEstates.length-available},
+    forecast_status:available===forecastEstates.length&&available?'available':available?'partial':'weather_unavailable',
+    generated_at: new Date().toISOString(),
+    telemetry_freshness_minutes: 30,
     live_count: liveCount,
     total_count: forecastEstates.length,
-    portfolio_confidence: portfolioConfidence,
+    portfolio_confidence: available ? portfolioConfidence : null,
+    confidence_kind:'evidence_completeness_not_probability',
     estates: forecastEstates,
     series,
   };
@@ -263,25 +262,27 @@ async function buildForecast(startHour, endHour) {
 // Additive model so "now" ≈ current risk and future horizons rise with
 // forecast rainfall and water-level momentum (rate of rise). Still rule-based
 // and explainable — every horizon and driver is derived from real figures.
-async function rainfallWindows() {
-  const rain = await rainfallWindow(0, 6);   // hourly precipitation for the next 6h
+async function rainfallWindows(estate,snapshot) {
+  const rain = await rainfallWindow(0, 6, estate,snapshot);
   if (!rain) return null;
   const cum = h => rain.slice(0, h).reduce((s, x) => s + (x.mm || 0), 0);
   return { h1: cum(1), h3: cum(3), h6: cum(6), series: rain };
 }
 
-async function buildHorizonForecast() {
-  const [properties, feats, rain] = await Promise.all([
-    scoreProperties(), computeFeatures(), rainfallWindows(),
+async function buildHorizonForecast(scope={}) {
+  const [properties, feats] = await Promise.all([
+    scoreProperties(scope), computeFeatures(),
   ]);
-  const cum = h => rain ? (h === 1 ? rain.h1 : h === 3 ? rain.h3 : rain.h6) : 0;
-
-  const estates = properties.map(e => {
+  const weatherSnapshots=estateWeather.forEstates?await estateWeather.forEstates(properties):new Map();
+  const estates = await Promise.all(properties.map(async e => {
+    const rain=await rainfallWindows(e,weatherSnapshots.get(String(e.property_id)));
+    const cum=h=>rain?(h===1?rain.h1:h===3?rain.h3:rain.h6):0;
     const f = feats.get(e.property_id) || {};
     const base = e.current_risk;
     const rise = f.rise_rate_pph != null ? f.rise_rate_pph : 0;
 
     function predict(h) {
+      if (!rain) return null;
       const rainAdd = Math.round(Math.min(100, cum(h) * RAIN_TO_SCORE) * RAIN_WEIGHT);
       const momentum = Math.round(Math.max(0, rise) * h * 0.6);              // rising water keeps pushing risk up
       const relief = (rise < 0 && cum(h) < 3) ? Math.round(Math.min(-rise * h * 0.4, 8)) : 0;  // falling + dry = improving
@@ -289,10 +290,11 @@ async function buildHorizonForecast() {
     }
     const horizons = { now: Math.round(base), h1: predict(1), h3: predict(3), h6: predict(6) };
     const peak = Math.max(horizons.now, horizons.h1, horizons.h3, horizons.h6);
-    const delta = horizons.h3 - horizons.now;
+    const delta = horizons.h3 == null ? null : horizons.h3 - horizons.now;
 
     let critical = null;
-    for (const h of [1, 3, 6]) {
+    if (horizons.now >= 80) critical = { in_hours: 0, at: new Date().toISOString(), label: 'now' };
+    for (const h of critical ? [] : [1, 3, 6]) {
       if (predict(h) >= 80) {
         const at = new Date(Date.now() + h * 3600e3);
         critical = { in_hours: h, at: at.toISOString(), label: at.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Lagos' }) };
@@ -302,8 +304,8 @@ async function buildHorizonForecast() {
     if (!critical && horizons.now >= 80) critical = { in_hours: 0, at: new Date().toISOString(), label: 'now' };
 
     // Blockage anomaly: water rising fast with little/no rain -> downstream restriction.
-    const onsiteRain = f.rain_onsite_1h != null ? f.rain_onsite_1h : 0;
-    const anomaly = (rise >= 6 && onsiteRain < 2 && cum(1) < 2)
+    const onsiteRain = f.rain_onsite_1h;
+    const anomaly = (rain && onsiteRain != null && rise >= 6 && onsiteRain < 2 && cum(1) < 2)
       ? { type: 'blockage_suspected', note: `Water rising ${rise}%/hr with little rain — possible blockage or downstream restriction.` }
       : null;
 
@@ -326,23 +328,29 @@ async function buildHorizonForecast() {
       property_id: e.property_id, name: e.name, client_name: e.client_name,
       latitude: e.latitude, longitude: e.longitude, located: e.located, has_live: e.has_live,
       current_risk: horizons.now, horizons, peak_risk: peak, delta,
+      assessment_basis: e.assessment_basis, telemetry_state: e.telemetry_state,
+      latest_reading: e.latest_reading, sensor_count: e.sensor_count, reporting_count: e.reporting_count,
+      forecast_status: rain ? 'available' : 'weather_unavailable',
+      rain_next_3h_mm:rain?rain.h3:null,confidence_kind:'evidence_completeness_not_probability',
       critical_window: critical, anomaly,
       drivers: drivers.slice(0, 6),
       recommendation: rec.text, recommendation_level: rec.level,
-      confidence, confidence_sources: sources,
+      confidence: rain ? confidence : null, confidence_sources: sources,
       features: {
         level_now: f.level_now, rise_rate_pph: f.rise_rate_pph,
         silt_now: f.silt_now, net_flow: f.net_flow, rain_onsite_1h: f.rain_onsite_1h,
       },
     };
-  }).sort((a, b) => b.peak_risk - a.peak_risk);
-
-  return summarizeHorizons(estates, rain);
+  }));
+  estates.sort((a,b)=>b.peak_risk-a.peak_risk);
+  return {...summarizeHorizons(estates),geography:scope};
 }
 
 // Build the portfolio-triage envelope from an estates array. Shared so a
 // client-scoped subset gets the SAME triage maths as the full ops portfolio.
-function summarizeHorizons(estates, rain) {
+function summarizeHorizons(estates) {
+  const available=estates.filter(e=>e.forecast_status==='available').length;
+  const rain=available>0;
   const critical_now = estates.filter(e => e.horizons.now >= 80);
   const entering_high = estates.filter(e => e.horizons.now < 70 && e.horizons.h3 >= 70);
   const preventive = estates.filter(e => e.horizons.now < 60 && e.horizons.h6 >= 60 && e.horizons.h6 < 80);
@@ -351,15 +359,18 @@ function summarizeHorizons(estates, rain) {
   return {
     method: `Horizon projection (now / +1h / +3h / +6h): current risk + forecast rainfall (${Math.round(RAIN_WEIGHT * 100)}% weight) + water-level momentum. Rule-based, not a trained model.`,
     has_rainfall_data: !!rain,
-    rain_next_3h_mm: rain ? Math.round(rain.h3 * 10) / 10 : null,
+    forecast_status:available===estates.length&&available?'available':available?'partial':'weather_unavailable',
+    rain_next_3h_mm: null,weather_scope:'estate',
+    weather_coverage:{available,total:estates.length,unavailable:estates.length-available},
+    confidence_kind:'evidence_completeness_not_probability',
     generated_at: new Date().toISOString(),
     portfolio: {
       total: estates.length,
       critical_now: critical_now.length,
-      entering_high_3h: entering_high.length,
-      preventive_recommended: preventive.length,
-      anomalies: anomalies.length,
-      needs_action_today: critical_now.length + entering_high.length,
+      entering_high_3h: rain ? entering_high.length : null,
+      preventive_recommended: rain ? preventive.length : null,
+      anomalies: rain ? anomalies.length : null,
+      needs_action_today: rain ? critical_now.length + entering_high.length : null,
     },
     estates,
   };
@@ -370,11 +381,10 @@ function summarizeHorizons(estates, rain) {
 function scopeHorizonsToProperties(forecast, propertyIds) {
   const allow = new Set((propertyIds || []).map(String));
   const estates = (forecast.estates || []).filter(e => allow.has(String(e.property_id)));
-  const rain = forecast.rain_next_3h_mm != null ? { h3: forecast.rain_next_3h_mm } : null;
-  return { ...summarizeHorizons(estates, rain), has_rainfall_data: forecast.has_rainfall_data };
+  return summarizeHorizons(estates);
 }
 
 module.exports = {
   scoreProperties, rainfallWindow, buildForecast, buildHorizonForecast,
-  summarizeHorizons, scopeHorizonsToProperties, rainfallWindows, LAGOS,
+  summarizeHorizons, scopeHorizonsToProperties, rainfallWindows,
 };

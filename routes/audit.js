@@ -2,6 +2,8 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { isClient,isSpUser } = require('../utils/scope');
+const { requirePermission } = require('../utils/permissions');
 const router = express.Router();
 
 // GET /audit-logs/mine — the client's own activity stream:
@@ -22,11 +24,11 @@ router.get('/mine', authenticateToken, async (req, res) => {
 });
 
 // GET /audit-logs?page=&limit=&action=&actor=&from=&to=  (ops only)
-router.get('/', authenticateToken, async (req, res) => {
+router.get('/', authenticateToken, requirePermission('audit.view'), async (req, res) => {
   try {
     const { isClient } = require('../utils/scope');
-    if (isClient(req)) return res.status(403).json({ success:false, error:'Not authorised' });
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    if (isClient(req) || isSpUser(req)) return res.status(403).json({ success:false, error:'Not authorised' });
+    const limit = Math.max(1,Math.min(parseInt(req.query.limit) || 50, 200));
     const { rows } = await pool.query(`
       SELECT a.id, a.action, a.entity_type, a.entity_id, a.changes,
              a.ip_address, a.created_at,

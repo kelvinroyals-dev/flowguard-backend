@@ -50,8 +50,7 @@ async function teamIdsForUser(userId) {
 // their organisation (service_provider_property_assignments). FlowGuard staff
 // (no service_provider_org_id) see the whole fleet.
 function isSpUser(req) {
-  return !!(req && req.user && (req.user.user_type === 'service_provider'
-    || req.user.spo || req.user.service_provider_org_id));
+  return !!(req && req.user && (req.user.service_provider_org_id || req.user.spo || req.user.user_type === 'service_provider' || req.user.role === 'service_provider'));
 }
 
 // The sensor_ids an SP user may see/act on: sensors on the org's ACTIVE

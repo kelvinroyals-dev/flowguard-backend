@@ -2,14 +2,14 @@
 const express = require('express');
 const pool = require('../config/database');
 const { authenticateToken, requireRole } = require('../middleware/auth');
-const { isClient } = require('../utils/scope');
+const { isClient, isSpUser } = require('../utils/scope');
 const router = express.Router();
 
 // This is the ops-center settings page — a client account has no reason to
 // read or write it.
 router.use(authenticateToken);
 router.use((req, res, next) => {
-  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  if (isClient(req) || isSpUser(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   next();
 });
 

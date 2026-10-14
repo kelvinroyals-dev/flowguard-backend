@@ -9,8 +9,8 @@ const router = express.Router();
 
 router.use(authenticateToken);
 router.use((req, res, next) => {
-  if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
-  next();
+  if (isClient(req) || req.user.user_type === 'service_provider' || !require('../utils/roles').INTERNAL_ROLES.includes(req.user.role)) return res.status(403).json({ success: false, error: 'Not authorised' });
+  require('../utils/permissions').requirePermission('forecast.view')(req,res,next);
 });
 
 const WINDOWS = {
@@ -23,7 +23,8 @@ router.get('/', async (req, res) => {
   try {
     const horizon = WINDOWS[req.query.horizon] ? req.query.horizon : 'tomorrow';
     const [start, end] = WINDOWS[horizon];
-    const data = await buildForecast(start, end);
+    let scope;try{scope=require('../utils/geography').scope(req.query);}catch(_){return res.status(400).json({success:false,error:'Invalid geography filter'});}
+    const data = await buildForecast(start, end,scope);
     res.json({ success: true, data: { horizon, ...data } });
   } catch (err) {
     console.error('GET /forecast', err);
@@ -35,7 +36,8 @@ router.get('/', async (req, res) => {
 // window, rise-rate/silt drivers, blockage anomalies, and portfolio triage.
 router.get('/horizons', async (req, res) => {
   try {
-    const data = await buildHorizonForecast();
+    let scope;try{scope=require('../utils/geography').scope(req.query);}catch(_){return res.status(400).json({success:false,error:'Invalid geography filter'});}
+    const data = await buildHorizonForecast(scope);
     res.json({ success: true, data });
   } catch (err) {
     console.error('GET /forecast/horizons', err);
