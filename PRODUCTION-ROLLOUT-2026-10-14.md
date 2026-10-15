@@ -6,7 +6,7 @@ Release merged on top of d574326 (the provider FK/isolation and atomic-dispatch 
 
 The new portals depend on the new backend API and schema. Do not deploy them until this backend has been pulled, its migrations applied, restarted and checked. The local client source is updated, but its production deployment is deliberately pending this step.
 
-Estate weather in production requires an existing licensed Open-Meteo customer key in OPEN_METEO_API_KEY. Configure it privately on the server and explicitly approve worker quota/cost before setting WEATHER_REFRESH_ENABLED=true. Without that configuration weather is unavailable, never a fabricated zero or fixed Lagos fallback. No subscription or key has been provisioned. Automatic service-plan drafting stays off unless ENABLE_SERVICE_PLAN_DRAFTS=true is explicitly configured after its migration.
+Weather follow-up (15 October, local only): the user selected WeatherAPI.com Free. See deployment/WEATHERAPI-FREE.md for the prepared adapter, key setup, free-plan horizons, quota and retention limits. Deploy the reviewed adapter before selecting WEATHER_PROVIDER=weatherapi. Older Open-Meteo deployments still require their licensed customer key; there is no automatic free-endpoint production bypass. Enable WEATHER_REFRESH_ENABLED=true only after key/provider readiness and quota review. Without configuration weather is unavailable, never a fabricated zero or fixed Lagos fallback. No subscription or key has been provisioned here. Automatic service-plan drafting stays off unless ENABLE_SERVICE_PLAN_DRAFTS=true is explicitly configured after its migration.
 
 ## Run on the Ubuntu backend server
 
@@ -19,15 +19,19 @@ git rev-parse HEAD
 set -a
 . ./.env
 set +a
-umask 077
-mkdir -p /home/ubuntu/flowguard-release-backups
-release_backup=$(mktemp /home/ubuntu/flowguard-release-backups/pre-2026-10-14-XXXXXX.dump)
-PGPASSWORD="$DB_PASSWORD" pg_dump -h "$DB_HOST" -p "${DB_PORT:-5432}" -U "$DB_USER" -d "$DB_NAME" -Fc -f "$release_backup"
+(
+  umask 077
+  mkdir -p /home/ubuntu/flowguard-release-backups
+  release_backup=$(mktemp /home/ubuntu/flowguard-release-backups/pre-2026-10-14-XXXXXX.dump)
+  PGPASSWORD="$DB_PASSWORD" pg_dump -h "$DB_HOST" -p "${DB_PORT:-5432}" -U "$DB_USER" -d "$DB_NAME" -Fc -f "$release_backup"
+)
+umask 022
 ```
 
 Stop if the working tree has unexpected changes or the backup fails. Then:
 
 ```bash
+umask 022
 git pull --ff-only origin main
 npm ci --omit=dev
 node scripts/bootcheck.js

@@ -219,6 +219,7 @@ async function buildForecast(startHour, endHour,scope={}) {
     return {
       ...e, predicted_risk: predicted, delta,
       forecast_status:rain?'available':'weather_unavailable',cumulative_rain_mm:cumulativeRain,
+      weather_source:weatherSnapshots.get(String(e.property_id))?.source||null,
       weather_series:(rain||[]).map(h=>({t:h.t,rainfall:h.mm,risk:Math.round(Math.min(100,e.current_risk*CURRENT_WEIGHT+Math.min(100,h.mm*RAIN_TO_SCORE*4)*RAIN_WEIGHT))})),
       confidence_kind:'evidence_completeness_not_probability',
       recommendation: rec.text, recommendation_level: rec.level,
@@ -243,7 +244,7 @@ async function buildForecast(startHour, endHour,scope={}) {
     method: `Rule-based projection: ${Math.round(CURRENT_WEIGHT * 100)}% current risk (live sensors where installed, else environmental/historical baseline) + ${Math.round(RAIN_WEIGHT * 100)}% forecast rainfall — not a trained model.`,
     has_rainfall_data: available>0,
     cumulative_rain_mm: reference?.cumulative_rain_mm??null,
-    weather_scope:'estate',weather_reference:reference?{property_id:reference.property_id,name:reference.name}:null,
+    weather_scope:'estate',weather_reference:reference?{property_id:reference.property_id,name:reference.name,source:reference.weather_source}:null,
     geography:scope,
     weather_coverage:{available,total:forecastEstates.length,unavailable:forecastEstates.length-available},
     forecast_status:available===forecastEstates.length&&available?'available':available?'partial':'weather_unavailable',

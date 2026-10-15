@@ -32,7 +32,7 @@ const {PGlite}=require('@electric-sql/pglite'),express=require('express'),reques
    if(name==='../config/database')return pool;
    if(name==='../middleware/auth')return auth;
    if(name==='../utils/permissions'||name==='./permissions')return {hasPermission:async role=>role==='admin',requirePermission:()=> (req,res,next)=>next()};
-   if(name==='../utils/estateWeather')return {load:async record=>({property_id:record.property_id,last24:.5,latest:.1,next6:1.3}),location:r=>({lat:Number(r.latitude),lon:Number(r.longitude)})};
+   if(name==='../utils/estateWeather')return {provider:()=> 'open-meteo',load:async record=>({property_id:record.property_id,last24:.5,latest:.1,next6:1.3}),location:r=>({lat:Number(r.latitude),lon:Number(r.longitude)})};
    if(name==='../utils/riskForecast')return {scoreProperties:async()=>[],buildHorizonForecast:async scope=>({estates:(await pg.query('SELECT property_id,property_name AS name,latitude,longitude,state,city FROM properties WHERE parent_property_id IS NULL AND ($1::text IS NULL OR state=$1) AND ($2::text IS NULL OR city=$2) AND ($3::text IS NULL OR property_id=$3)',[scope.state||null,scope.city||null,scope.property_id||null])).rows})};
    return original.call(this,name,parent,...rest);
   };

@@ -18,24 +18,37 @@ function parse(j,point,now){
 }
 function createService({fetcher=(...args)=>fetch(...args),clock=Date.now,store=null,env=process.env}={}){
  const cache=new Map(),pending=new Map(),waiters=[];let active=0;
+ const provider=()=>env.WEATHER_PROVIDER||'open-meteo';
  async function acquire(){if(active>=4)await new Promise(resolve=>waiters.push(resolve));else active++;}
  function release(){const next=waiters.shift();if(next)next();else active--;}
  async function load(record){
   const point=location(record);if(!point)throw Error('Estate coordinates unavailable');
-  if(env.NODE_ENV==='production'&&!env.OPEN_METEO_API_KEY)throw Error('Commercial weather provider is not configured');
+  const selected=provider();
+  if(!['open-meteo','weatherapi'].includes(selected))throw Error('Weather provider is not configured');
+  if(selected==='weatherapi'&&!env.WEATHERAPI_API_KEY)throw Error('WeatherAPI.com key is not configured');
+  if(selected==='open-meteo'&&env.NODE_ENV==='production'&&!env.OPEN_METEO_API_KEY)throw Error('Commercial weather provider is not configured');
   const key=point.lat+','+point.lon,cached=cache.get(key);
-  if(cached&&clock()-cached.saved>=0&&clock()-cached.saved<300000&&clock()-Date.parse(cached.value.windowEnd)>=0&&clock()-Date.parse(cached.value.windowEnd)<3600000)return cached.value;
+  if(cached&&clock()-cached.saved>=0&&clock()-cached.saved<(selected==='weatherapi'?900000:300000)&&clock()-Date.parse(cached.value.windowEnd)>=0&&clock()-Date.parse(cached.value.windowEnd)<3600000)return cached.value;
   if(pending.has(key))return pending.get(key);
   if(waiters.length>=1000)throw Error('Weather service busy');
   const task=(async()=>{
    await acquire();const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),12000);
    try{
+    let value;
+    if(selected==='weatherapi'){
+     value=await require('./weatherApi').request({fetcher,key:env.WEATHERAPI_API_KEY,point,now:clock(),signal:controller.signal});
+    }else{
     const host=env.OPEN_METEO_API_KEY?'https://customer-api.open-meteo.com':'https://api.open-meteo.com';
     const url=new URL(host+'/v1/forecast');url.search=new URLSearchParams({latitude:point.lat,longitude:point.lon,hourly:'precipitation',precipitation_unit:'mm',past_hours:'48',forecast_hours:'73',timezone:'Africa/Lagos',cell_selection:'nearest',...(env.OPEN_METEO_API_KEY?{apikey:env.OPEN_METEO_API_KEY}:{})}).toString();
     const r=await fetcher(url.href,{signal:controller.signal});if(!r.ok)throw Error('Weather provider unavailable');
-    const value=parse(await r.json(),point,clock());value.historyAvailable=false;
-    if(store){try{await store(key,value);value.historyAvailable=true;}catch(_){/* Explicit historyAvailable=false, no false persistence claim. */}}
-    cache.set(key,{saved:clock(),value});if(cache.size>500)cache.delete(cache.keys().next().value);return value;
+    value=parse(await r.json(),point,clock());value.historyAvailable=false;
+    }
+    // WeatherAPI forecast retention is restricted. Keep its response only in
+    // bounded short-lived RAM; do not persist mixed forecast/history payloads.
+    if(store&&selected!=='weatherapi'){try{await store(key,value);value.historyAvailable=true;}catch(_){/* Explicit historyAvailable=false, no false persistence claim. */}}
+    cache.set(key,{saved:clock(),value});if(cache.size>500)cache.delete(cache.keys().next().value);
+    if(selected==='weatherapi'){const expiry=setTimeout(()=>{if(cache.get(key)?.value===value)cache.delete(key);},900000);expiry.unref?.();}
+    return value;
    }finally{clearTimeout(timer);release();pending.delete(key);}
   })();pending.set(key,task);return task;
  }
@@ -45,14 +58,14 @@ function createService({fetcher=(...args)=>fetch(...args),clock=Date.now,store=n
   if(hit&&fresh(hit.value))return hit.value;
   return null;
  }
- return {load,peek};
+ return {load,peek,provider};
 }
 const service=createService({store:async(key,value)=>{
  await pool.query('INSERT INTO weather_snapshots (coordinate_key,fetched_at,window_end,payload) VALUES ($1,$2,$3,$4::jsonb) ON CONFLICT (coordinate_key,fetched_at) DO NOTHING',[key,value.fetchedAt,value.windowEnd,JSON.stringify({...value,historyAvailable:true})]);
 }});
 async function forEstates(records){
  const keys=records.map(r=>{const p=location(r);return p?p.lat+','+p.lon:null;}).filter(Boolean),byKey=new Map();
- try{const {rows}=await pool.query('SELECT DISTINCT ON (coordinate_key) coordinate_key,payload FROM weather_snapshots WHERE coordinate_key=ANY($1::text[]) AND fetched_at<=NOW() AND fetched_at>NOW()-INTERVAL \'15 minutes\' AND window_end<=NOW() AND window_end>NOW()-INTERVAL \'1 hour\' ORDER BY coordinate_key,fetched_at DESC',[keys]);for(const r of rows)byKey.set(r.coordinate_key,r.payload);}catch(_){/* Migration/history unavailable: cached values only; no network fan-out. */}
+ if(service.provider()!=='weatherapi')try{const {rows}=await pool.query('SELECT DISTINCT ON (coordinate_key) coordinate_key,payload FROM weather_snapshots WHERE coordinate_key=ANY($1::text[]) AND fetched_at<=NOW() AND fetched_at>NOW()-INTERVAL \'15 minutes\' AND window_end<=NOW() AND window_end>NOW()-INTERVAL \'1 hour\' ORDER BY coordinate_key,fetched_at DESC',[keys]);for(const r of rows)byKey.set(r.coordinate_key,r.payload);}catch(_){/* Migration/history unavailable: cached values only; no network fan-out. */}
  const result=new Map();
  for(const r of records){const p=location(r),cached=await service.peek(r);result.set(String(r.property_id),cached||(p?byKey.get(p.lat+','+p.lon):null)||null);}
  return result;

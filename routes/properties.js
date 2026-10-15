@@ -359,7 +359,9 @@ router.get('/:propertyId/weather-history', async(req,res)=>{
  res.set('Cache-Control','private, no-store');
  try{
   const record=await require('../utils/propertyReadAccess').readProperty(req,res);if(!record)return;
-  const point=require('../utils/estateWeather').location(record);if(!point)return res.status(409).json({success:false,error:'Estate location unavailable'});
+  const adapter=require('../utils/estateWeather');
+  const point=adapter.location(record);if(!point)return res.status(409).json({success:false,error:'Estate location unavailable'});
+  if(adapter.provider()==='weatherapi')return res.json({success:true,data:[],historyAvailable:false,reason:'WeatherAPI.com uses short-lived memory caching; archived portal snapshots are not stored.'});
   const {rows}=await pool.query('SELECT fetched_at,window_end,payload FROM weather_snapshots WHERE coordinate_key=$1 ORDER BY fetched_at DESC LIMIT 24',[point.lat+','+point.lon]);
   res.json({success:true,data:rows});
  }catch(_){res.status(503).json({success:false,error:'Weather history unavailable'});}
