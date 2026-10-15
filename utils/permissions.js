@@ -76,17 +76,28 @@ function defaultAllowed(role, key) {
 }
 
 // ── override cache (in-memory, invalidated on save) ──
-let _cache = null;   // Map "role|key" -> boolean
+let _cache = null;   // Publish only a completely loaded Map.
+let _loading = null, _loadedAt = 0, _generation = 0;
+const CACHE_MS = 30000;
 async function ensureLoaded() {
-  if (_cache) return _cache;
-  _cache = new Map();
-  try {
+  if (_cache && Date.now() >= _loadedAt && Date.now() - _loadedAt < CACHE_MS) return _cache;
+  if (_loading) return _loading;
+  const generation = _generation;
+  const task = (async () => {
     const { rows } = await pool.query('SELECT role, permission_key, allowed FROM role_permissions');
-    rows.forEach(r => _cache.set(`${r.role}|${r.permission_key}`, r.allowed));
-  } catch (e) { /* table may not exist yet — defaults still apply */ }
-  return _cache;
+    // A save/invalidation during the query must not republish stale grants.
+    if (generation !== _generation) return ensureLoaded();
+    const loaded = new Map();
+    rows.forEach(r => loaded.set(`${r.role}|${r.permission_key}`, r.allowed));
+    _cache = loaded;
+    _loadedAt = Date.now();
+    return loaded;
+  })();
+  _loading = task;
+  try { return await task; }
+  finally { if (_loading === task) _loading = null; }
 }
-function invalidate() { _cache = null; }
+function invalidate() { _cache = null; _loadedAt = 0; _loading = null; _generation++; }
 
 async function hasPermission(role, key) {
   if (ADMIN_ROLES.includes(role)) return true;
@@ -144,7 +155,7 @@ function requirePermission(key) {
       return res.status(403).json({ success: false, error: 'You do not have permission for this action.' });
     } catch (e) {
       console.error('[permissions] check failed:', e.message);
-      return res.status(500).json({ success: false, error: 'Permission check failed' });
+      return res.status(503).json({ success: false, error: 'Permission verification is temporarily unavailable. Please retry.' });
     }
   };
 }

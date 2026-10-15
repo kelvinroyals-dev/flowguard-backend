@@ -25,6 +25,7 @@ test('realtime fails closed, scopes subscriptions and strips event contents',asy
  await assert.rejects(connect(10,{}),/Authentication required/);
  await assert.rejects(connect(10,{token:'invalid'}),/Authentication required/);
  await assert.rejects(connect(2,{token:token(2,{exp:1})}),/Authentication required/);
+ for(const purpose of ['email_verify','evidence','report-snapshot'])await assert.rejects(connect(1,{token:token(1,{purpose})}),/Authentication required/);
  await assert.rejects(connect(999),/Authentication required/);
  const admin=await connect(1),a=await connect(2),b=await connect(3),sp=await connect(4),finance=await connect(5);
  users.set(6,{role:'client',user_type:'client',account_owner_id:2,client_role:'member'});

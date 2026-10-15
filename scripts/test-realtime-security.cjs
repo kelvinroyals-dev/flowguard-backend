@@ -26,6 +26,7 @@ test('realtime authentication, authorization, tenant isolation and safe delivery
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));base='http://127.0.0.1:'+server.address().port;
   await assert.rejects(connect(),/Authentication required/);
   await assert.rejects(connect({token:'invalid'}),/Authentication required/);
+  for(const purpose of ['email_verify','evidence','report-snapshot'])await assert.rejects(connect({token:token(1,{purpose})}),/Authentication required/);
   await assert.rejects(connect({token:jwt.sign({id:2,tv:0,exp:1},process.env.JWT_SECRET,{algorithm:'HS256'})}),/Authentication required/);
   await assert.rejects(connect({}, {query:{token:token(2)}}),/Authentication required/);
   const admin=await connect({token:token(1)}),a=await connect({token:token(2)}),b=await connect({token:token(3)}),sp=await connect({token:token(4)}),finance=await connect({token:token(5)});

@@ -14,6 +14,14 @@ async function authenticateToken(req, res, next) {
   } catch (err) {
     return res.status(401).json({ success: false, error: 'Invalid or expired token' });
   }
+  // Verification/evidence/report-link tokens share the signer but are NOT
+  // login sessions. Never upgrade one into a session by reading its account.
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+      Object.prototype.hasOwnProperty.call(payload, 'purpose') ||
+      !['number','string'].includes(typeof payload.id) ||
+      !/^\d+$/.test(String(payload.id)) || !Number.isSafeInteger(Number(payload.id)) || Number(payload.id) <= 0) {
+    return res.status(401).json({ success: false, error: 'A valid sign-in session is required.' });
+  }
   // Canonicalise the role so exact-match guards (requireRole) and scope checks
   // never fail just because an account stored its role in a different shape.
   payload.role = normalizeRole(payload.role);
@@ -22,15 +30,23 @@ async function authenticateToken(req, res, next) {
   // Live session check: reject a token whose account has since been deactivated,
   // or whose sessions were invalidated (password reset / "sign out everywhere")
   // after this token was issued — stateless JWTs cannot otherwise be revoked.
-  // FAIL OPEN on any DB/setup error (including before the token_version column
-  // migration is applied) so an infra hiccup can never lock every user out.
+  // Authorization cannot be established during a DB/schema failure. Return a
+  // retryable 503 instead of silently accepting a possibly revoked session.
   try {
-    const { rows } = await pool.query('SELECT is_active, token_version FROM users WHERE id = $1', [payload.id]);
+    const { rows } = await pool.query('SELECT id, email, role, user_type, is_active, token_version, service_provider_org_id, sp_role FROM users WHERE id = $1', [payload.id]);
     const u = rows[0];
     if (!u || u.is_active === false || (u.token_version || 0) !== (payload.tv || 0)) {
       return res.status(401).json({ success: false, error: 'Session expired. Please sign in again.' });
     }
-  } catch (_) { /* fail open — never lock everyone out on a DB/migration hiccup */ }
+    // A signed token is proof of identity, not a permanent role grant. Staff
+    // demotion/account-type changes apply on the very next REST request.
+    req.user = { ...payload, id: u.id, email: u.email, role: normalizeRole(u.role), user_type: u.user_type,
+      spo: u.service_provider_org_id || null, service_provider_org_id: u.service_provider_org_id || null,
+      sp_role: u.sp_role || null };
+  } catch (_) {
+    console.error('[auth] Live session validation unavailable');
+    return res.status(503).json({ success: false, error: 'Authentication is temporarily unavailable. Please retry.' });
+  }
 
   next();
 }

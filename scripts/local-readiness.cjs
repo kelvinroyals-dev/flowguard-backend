@@ -3,7 +3,12 @@ const {spawnSync}=require('node:child_process'),path=require('node:path');
 const cwd=path.resolve(__dirname,'..');
 for(const args of [
  ['scripts/bootcheck.js'],
+ ['--test','scripts/test-auth-session.cjs'],
+ ['--test','scripts/test-permission-loading.cjs'],
+ ['--test','scripts/test-auth-role-matrix.cjs'],
+ ['--test','scripts/test-production-smoke.cjs'],
  ['--test','scripts/test-estate-weather.cjs'],
+ ['--test','scripts/test-weatherapi.cjs'],
  ['--test','scripts/test-weather-refresh.cjs'],
  ['--test','scripts/test-registration-geography.cjs'],
  ['--test','scripts/test-realtime-unit.cjs'],

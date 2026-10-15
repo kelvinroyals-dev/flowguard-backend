@@ -11,7 +11,7 @@ const ESTATE=/^estate:([A-Za-z0-9_.-]{1,100})$/;
 let io=null;
 async function session(socket){
   const p=jwt.verify(socket.realtimeToken,process.env.JWT_SECRET,{algorithms:['HS256']});
-  if(!p.id||!Number.isFinite(p.exp)||p.exp*1000<=Date.now())throw new Error('Invalid session');
+  if(!p||typeof p!=='object'||Object.hasOwn(p,'purpose')||!['number','string'].includes(typeof p.id)||!/^\d+$/.test(String(p.id))||!Number.isSafeInteger(Number(p.id))||Number(p.id)<=0||!Number.isFinite(p.exp)||p.exp*1000<=Date.now())throw new Error('Invalid session');
   const {rows}=await pool.query('SELECT id, role, user_type, is_active, token_version, service_provider_org_id, account_owner_id, client_role FROM users WHERE id=$1',[p.id]);
   const u=rows[0];
   if(!u||u.is_active===false||Number(u.token_version||0)!==Number(p.tv||0))throw new Error('Session revoked');
