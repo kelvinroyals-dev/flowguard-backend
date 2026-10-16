@@ -14,6 +14,7 @@ test('WAT completed-hour totals exclude the incomplete current hour',()=>{
   assert.equal(result.windowEnd,'2026-10-15T14:00:00.000Z');assert.equal(result.forecast[0].start,result.windowEnd);
   assert.equal(result.forecast[0].v,8);assert.equal(result.next6,8.5);assert.equal(result.source,'WeatherAPI.com');
   assert.equal(result.daily.length,3);assert.equal(result.persistencePolicy,'memory_only');
+  assert.equal(result.history.available,24);assert.equal(result.history.total,2.4);
 });
 test('missing, negative and truncated hours remain unknown; genuine zero is zero',()=>{
   const {forecast,history}=fixtures();history.forecast.forecastday[0].hour[20].precip_mm=null;
@@ -42,7 +43,25 @@ test('only uses free-plan forecast/history requests; history failure preserves f
   }});
   assert.equal(seen.length,2);assert.equal(seen[1].searchParams.get('dt'),'2026-10-14');
   assert.equal(result.last24,null);assert.equal(result.next6,.6);
+  assert.equal(result.historyFailure.code,'http_403');assert.equal(result.historyFailure.status,403);
   assert.equal(adapter.watDate(Date.parse('2026-10-14T23:30Z')),'2026-10-15');
+});
+test('preserves separate historical location without mixing its rain into the rolling total',()=>{
+  const sampleTime=Date.parse('2026-10-16T00:10Z'),p={lat:6.4524,lon:3.4699};
+  const h=day('2026-10-15',0);h.hour[8].precip_mm=2.84;h.day.totalprecip_mm=2.84;
+  const forecast={location:{lat:6.45,lon:3.433,tz_id:'Africa/Lagos'},forecast:{forecastday:[day('2026-10-16',0),day('2026-10-17',0),day('2026-10-18',0)]}};
+  const history={location:{lat:6.433,lon:3.433,tz_id:'Africa/Lagos'},forecast:{forecastday:[h]}};
+  const result=adapter.parse(forecast,history,p,sampleTime);
+  assert.equal(result.last24,null);assert.equal(result.coverage.past24.available,1);
+  assert.equal(result.historyStatus,'provider_archive');assert.equal(result.history.available,24);assert.equal(result.history.total,2.84);
+  assert.equal(result.history.grid.lat,6.433);assert.equal(result.grid.lat,6.45);
+  assert.equal(result.historyLocationMatchesForecast,false);assert.equal(result.rolling24Reason.code,'different_provider_locations');
+  assert.ok(result.history.hrs.some(h=>h.v===2.84));assert.equal(result.next6,0);
+});
+test('invalid history preserves usable forecast and reports a safe explicit reason',()=>{
+  const {forecast,history}=fixtures();history.forecast.forecastday[0].hour.push(history.forecast.forecastday[0].hour[0]);
+  const result=adapter.parse(forecast,history,point,now);
+  assert.equal(result.history,null);assert.equal(result.historyFailure.code,'invalid_history');assert.equal(result.next6,.6);
 });
 test('never includes keys in errors and does not fetch without configuration',async()=>{
   const key='synthetic-private-key';let calls=0;

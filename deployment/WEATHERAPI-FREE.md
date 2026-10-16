@@ -23,8 +23,14 @@ its noncommercial free endpoint in production.
 - Three provider calendar days, not three complete days from the current time.
   The client shows only supplied days. Complete 48-hour charts are withheld
   if any required hour/probability is absent.
-- Yesterday's archive + today's hourly estimates support a rolling completed
-  24-hour total only when every required hour is supplied. Missing history
+- Yesterday's archive is returned separately with its own matched coordinates,
+  hourly coverage and calendar-day total (only when all 24 hours are valid).
+  The portal labels that total **Yesterday**, never rolling 24 hours.
+  History and forecast can resolve to different provider locations for the same
+  query. They must not be combined: a rolling completed 24-hour total is returned
+  only when every required hour is supplied at the same matched coordinates.
+  Safe history failure and rolling-total coverage reasons accompany the result.
+  Missing history
   does not disable available forecasts. The preceding 24-hour comparison is
   deliberately unavailable under this plan. Current unfinished hours are
   excluded from completed-hour totals.
