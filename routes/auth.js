@@ -527,7 +527,7 @@ router.post('/reset-password', async (req, res) => {
     (async () => {
       try {
         const mailer = require('../utils/mailer');
-        await mailer.sendPasswordChanged(rows[0].email, rows[0].full_name);
+        if(process.env.LIFECYCLE_EMAILS_ENABLED!=='true')await mailer.sendPasswordChanged(rows[0].email, rows[0].full_name);
       } catch (e) { console.error('[reset-password] email error:', e.message); }
     })();
 

@@ -6,12 +6,26 @@ const { requirePermission } = require('../utils/permissions');
 const { isClient,isSpUser } = require('../utils/scope');
 const { invoiceAmounts } = require('../utils/invoiceAmounts');
 const { randomUUID } = require('node:crypto');
+const { clientCan } = require('../utils/clientPermissions');
 const { logAction } = require('../utils/audit');
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const router = express.Router();
 router.use(authenticateToken);
 router.use((req,res,next)=>isSpUser(req) ? res.status(403).json({success:false,error:'Not authorised'}) : next());
+router.use(async(req,res,next)=>{
+  try{
+    if(isClient(req)){
+      const u=(await pool.query('SELECT * FROM users WHERE id=$1 AND is_active=TRUE',[req.user.id])).rows[0];
+      if(!u||u.role!=='client'||u.service_provider_org_id||!clientCan(u,'view_billing'))return res.status(403).json({success:false,error:'Not authorised'});
+      if(req.method!=='GET'&&(req.path.endsWith('/notify-payment')?!clientCan(u,'manage_billing'):true))return res.status(403).json({success:false,error:'Not authorised'});
+      req.billingOwnerId=u.account_owner_id||u.id;
+      return next();
+    }
+    if(req.user.user_type!=='internal'||req.user.service_provider_org_id)return res.status(403).json({success:false,error:'Not authorised'});
+    return requirePermission(req.method==='GET'?'billing.view':'billing.manage')(req,res,next);
+  }catch(_){return res.status(503).json({success:false,error:'Billing access could not be verified'});}
+});
 
 // GET /billing/summary — company-wide revenue/MRR. Ops only.
 router.get('/summary', authenticateToken, async (req, res) => {
@@ -54,7 +68,7 @@ router.get('/invoices', authenticateToken, async (req, res) => {
     // Client-role users only see their own invoices; ops see all.
     const { isClient } = require('../utils/scope');
     const clientFilter = isClient(req) ? ' WHERE i.user_id = $1' : '';
-    const params = isClient(req) ? [req.user.id] : [];
+    const params = isClient(req) ? [req.billingOwnerId] : [];
     const { rows } = await pool.query(`
       SELECT i.*, u.full_name AS client_name, u.email AS client_email,
              p.property_name,
@@ -169,7 +183,7 @@ router.get('/invoices/:id', authenticateToken, async (req, res) => {
       LEFT JOIN properties p ON i.property_id=p.property_id
       WHERE i.invoice_id = $1`, [req.params.id]);
     if (!rows[0]) return res.status(404).json({ success:false, error:'Invoice not found' });
-    if (isClient(req) && rows[0].user_id !== req.user.id) {
+    if (isClient(req) && String(rows[0].user_id) !== String(req.billingOwnerId)) {
       return res.status(403).json({ success: false, error: 'Not authorised' });
     }
     const payments=await pool.query('SELECT payment_id,amount,currency,payment_method,transaction_reference,status,payment_date,created_at FROM payments WHERE invoice_id=$1 ORDER BY payment_date DESC',[req.params.id]);
@@ -360,7 +374,7 @@ router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
   try {
     const inv = await fetchInvoiceFull(req.params.id);
     if (!inv) return res.status(404).json({ success: false, error: 'Invoice not found' });
-    if (isClient(req) && inv.user_id !== req.user.id) return res.status(403).json({ success: false, error: 'Not authorised' });
+    if (isClient(req) && String(inv.user_id) !== String(req.billingOwnerId)) return res.status(403).json({ success: false, error: 'Not authorised' });
     const pdf = await renderInvoicePdf(inv);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Length', pdf.length);
@@ -376,18 +390,27 @@ router.get('/invoices/:id/pdf', authenticateToken, async (req, res) => {
 // "log in to pay" CTA) to the client, and record that it was sent. Ops-only.
 router.post('/invoices/:id/send', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
   try {
+    const deliveryKey=req.body?.request_id||randomUUID();
+    if(typeof deliveryKey!=='string'||! /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deliveryKey))return res.status(400).json({success:false,error:'Valid email request id required'});
     const inv = await fetchInvoiceFull(req.params.id);
     if (!inv) return res.status(404).json({ success: false, error: 'Invoice not found' });
     if (!inv.client_email) return res.status(400).json({ success: false, error: 'No client email on file — link a client to this property first.' });
     const pdf = await renderInvoicePdf(inv).catch(() => null);
-    const emailed = await require('../utils/mailer').sendInvoice(
+    const delivery = await require('../utils/mailer').sendInvoice(
       inv.client_email, inv.client_name,
-      { invoiceId: inv.invoice_id, propertyName: inv.property_name, total: inv.total_amount, balanceDue: inv.balance_due, dueDate: inv.due_date, currency: '₦' },
+      { invoiceId: inv.invoice_id, propertyName: inv.property_name, total: inv.total_amount, balanceDue: inv.balance_due, dueDate: inv.due_date, currency: '₦',deliveryKey,userId:inv.user_id },
       pdf);
-    const { rows } = await pool.query(
+    if(!delivery.accepted){
+      return res.status(delivery.queued?202:503).json({success:!!delivery.queued,data:{emailed:false,queued:!!delivery.queued,delivery_ids:delivery.ids||[]},...(!delivery.queued?{error:'Invoice email was not accepted; invoice was not marked sent'}:{})});
+    }
+    const emailed=true;
+    if(!delivery.durable){
+    await pool.query(
       `UPDATE invoices SET sent_at = NOW(), sent_count = COALESCE(sent_count,0)+1,
          status = CASE WHEN status IN ('draft','open') THEN 'sent' ELSE status END, updated_at = NOW()
        WHERE invoice_id = $1 RETURNING sent_at, sent_count`, [req.params.id]);
+    }
+    const {rows}=await pool.query('SELECT sent_at,sent_count FROM invoices WHERE invoice_id=$1',[req.params.id]);
     logAction(req.user.id, 'sent an invoice to the client', 'invoice', req.params.id, { to: inv.client_email });
     if (inv.user_id) require('../utils/notify').notify(inv.user_id, {
       type: 'invoice', title: 'New invoice ' + inv.invoice_id, message: 'A new invoice is ready to view and pay.', link: '#billing',
@@ -481,7 +504,7 @@ router.post('/invoices/:id/notify-payment', authenticateToken, async (req, res) 
       'SELECT invoice_id, user_id, property_id, total_amount, balance_due FROM invoices WHERE invoice_id=$1',
       [req.params.id])).rows[0];
     if (!inv) return res.status(404).json({ success: false, error: 'Invoice not found' });
-    if (isClient(req) && inv.user_id !== req.user.id) return res.status(403).json({ success: false, error: 'Not authorised' });
+    if (isClient(req) && String(inv.user_id) !== String(req.billingOwnerId)) return res.status(403).json({ success: false, error: 'Not authorised' });
     const note = String((req.body && req.body.note) || '').slice(0, 1000);
     const ticketId = 'TKT-' + Date.now() + '-' + Math.floor(Math.random() * 900 + 100);
     const desc = `Client reports payment for ${inv.invoice_id} (balance ₦${Number(inv.balance_due || 0).toLocaleString()}). Finance to confirm receipt and mark the invoice paid.${note ? ' Client note: ' + note : ''}`;
@@ -502,19 +525,20 @@ router.post('/invoices/:id/notify-payment', authenticateToken, async (req, res) 
 });
 
 // POST /billing/invoices/:id/send-reminder
-router.post('/invoices/:id/send-reminder', authenticateToken, async (req, res) => {
-  return res.status(503).json({success:false,error:'Reminder delivery is not implemented; no reminder was sent'});
-  /* Never claim sent-counter increments as delivery.
-  try {
-    const { rows } = await pool.query(
-      `UPDATE invoices SET reminder_sent_count = COALESCE(reminder_sent_count,0)+1,
-         last_reminder_sent=NOW(), updated_at=NOW()
-       WHERE invoice_id=$1 RETURNING reminder_sent_count`, [req.params.id]);
-    if (!rows[0]) return res.status(404).json({ success:false, error:'Invoice not found' });
-    // (email integration would fire here)
-    res.json({ success: true, data: { reminded: true, count: rows[0].reminder_sent_count } });
-  } catch (err) { res.status(500).json({ success:false, error:'Failed to send reminder' }); }
-  */
+router.post('/invoices/:id/send-reminder', authenticateToken, requirePermission('billing.manage'), async (req, res) => {
+  if(process.env.LIFECYCLE_EMAILS_ENABLED!=='true'||process.env.MAIL_OUTBOX_ENABLED!=='true'||!process.env.RESEND_API_KEY||!process.env.MAIL_FROM||/@resend\.dev\b/i.test(process.env.MAIL_FROM))return res.status(503).json({success:false,error:'Reminder delivery is not enabled; no reminder was sent'});
+  const requestId=req.body?.request_id||randomUUID();
+  if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId))return res.status(400).json({success:false,error:'Invalid request_id'});
+  let db;
+  try{
+    db=await pool.connect();
+    await db.query('BEGIN');
+    const inv=(await db.query('SELECT invoice_id,balance_due FROM invoices WHERE invoice_id=$1 FOR UPDATE',[req.params.id])).rows[0];
+    if(!inv||!(Number(inv.balance_due)>0)){await db.query('ROLLBACK');return res.status(inv?409:404).json({success:false,error:inv?'Invoice has no outstanding balance':'Invoice not found'});}
+    await require('../utils/emailSchedules').createSchedules({pool}).record(db,'invoices',inv.invoice_id,'invoice_reminder',requestId);
+    await db.query('COMMIT');
+    return res.status(202).json({success:true,data:{queued:true,sent:false,request_id:requestId}});
+  }catch(_){if(db)await db.query('ROLLBACK').catch(()=>{});return res.status(503).json({success:false,error:'Reminder could not be queued'});}finally{db?.release();}
 });
 
 // GET /billing/:propertyId — per-property billing (CLIENT PORTAL)
@@ -525,7 +549,7 @@ router.get('/:propertyId', authenticateToken, async (req, res) => {
     const prop = await pool.query('SELECT * FROM properties WHERE property_id = $1', [pid]);
     if (!prop.rows[0]) return res.status(404).json({ success: false, error: 'Property not found' });
     const property = prop.rows[0];
-    if (isClient(req) && property.user_id !== req.user.id) {
+    if (isClient(req) && String(property.user_id) !== String(req.billingOwnerId)) {
       return res.status(403).json({ success: false, error: 'Not authorised' });
     }
 

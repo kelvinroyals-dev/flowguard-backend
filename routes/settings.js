@@ -21,6 +21,8 @@ const DEFAULTS = {
   escalation_minutes: 15, sla_response_minutes: 30,
   email_alerts: true, sms_alerts: false, weekly_digest: true,
   alert_email: null, alert_phone: null,
+  // Explicit hardware calibration, never guessed from a generic battery type.
+  email_battery_voltage_by_driver: {},
 };
 
 // GET /settings
@@ -43,6 +45,10 @@ router.put('/', authenticateToken, requireRole('admin', 'super_admin'), async (r
     const clean = {};
     for (const k of Object.keys(DEFAULTS)) {
       if (k in incoming) clean[k] = incoming[k];
+    }
+    if('email_battery_voltage_by_driver' in clean){
+      const map=clean.email_battery_voltage_by_driver;
+      if(!map||typeof map!=='object'||Array.isArray(map)||Object.keys(map).length>100||Object.entries(map).some(([key,value])=>!/^[-\w.]{1,80}$/.test(key)||typeof value!=='number'||!Number.isFinite(value)||value<=0||value>100))return res.status(400).json({success:false,error:'Battery thresholds must map hardware driver identifiers to calibrated positive voltages (maximum 100V)'});
     }
     const { rows } = await pool.query(
       `INSERT INTO app_settings (id, settings, updated_at, updated_by)

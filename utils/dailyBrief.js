@@ -20,7 +20,7 @@ const OPS_RECIPIENTS = (process.env.BRIEF_EMAIL_TO || '').split(',').map(s => s.
 const EMAIL_CLIENTS = String(process.env.BRIEF_EMAIL_CLIENTS || '').toLowerCase() === 'true';
 
 // Render a stored briefing as a branded HTML email and send it.
-async function emailBrief(to, subject, out, portfolio) {
+async function emailBrief(to, subject, out, portfolio,scope) {
   if (!to || (Array.isArray(to) && !to.length)) return;
   const p = portfolio || {};
   const triage = `${p.total ?? 0} estates · ${p.critical_now ?? 0} critical now · ${p.entering_high_3h ?? 0} entering high (3h) · ${p.anomalies ?? 0} anomalies`;
@@ -28,7 +28,7 @@ async function emailBrief(to, subject, out, portfolio) {
   const paras = String(out.briefing || '').split('\n').filter(Boolean)
     .map(line => `<p style="margin:0 0 12px;font-size:14px;color:#4a626d;line-height:1.6;">${esc(line)}</p>`).join('');
   const body = `<p style="margin:0 0 14px;font-size:13px;color:#8399a4;">${esc(triage)}</p>${paras}`;
-  try { await mailer.sendEmail({ to, subject, html: mailer.shell(subject, body) }); }
+  try { await mailer.sendEmail({ to, subject, html: mailer.shell(subject, body),category:'briefing',scope,eventKey:'briefing:'+new Date().toLocaleDateString('en-CA',{timeZone:'Africa/Lagos'})+':'+subject }); }
   catch (e) { console.error('[dailyBrief] email failed:', e.message); }
 }
 
@@ -53,7 +53,7 @@ async function runOnce() {
   try {
     const out = await generateBrief({ forecast, scope: 'portfolio' });
     await persist({ scope: 'ops_portfolio', ownerId: null, out, portfolio: forecast.portfolio });
-    if (OPS_RECIPIENTS.length) await emailBrief(OPS_RECIPIENTS, 'FlowGuard — morning risk briefing', out, forecast.portfolio);
+    if (OPS_RECIPIENTS.length) await emailBrief(OPS_RECIPIENTS, 'FlowGuard — morning risk briefing', out, forecast.portfolio,{kind:'ops'});
   } catch (err) { console.error('[dailyBrief] ops portfolio failed:', err.message); }
 
   // 2) Per client account owner, scoped to their own estates.
@@ -74,7 +74,7 @@ async function runOnce() {
       if (!scoped.estates.length) continue;
       const out = await generateBrief({ forecast: scoped, scope: 'portfolio' });
       await persist({ scope: 'client', ownerId: o.id, out, portfolio: scoped.portfolio });
-      if (EMAIL_CLIENTS && o.email) await emailBrief(o.email, 'Your FlowGuard morning risk briefing', out, scoped.portfolio);
+      if (EMAIL_CLIENTS && o.email) await emailBrief(o.email, 'Your FlowGuard morning risk briefing', out, scoped.portfolio,{kind:'client',ownerId:o.id,propertyIds:ids});
       clientCount++;
     } catch (err) { console.error(`[dailyBrief] client ${o.id} failed:`, err.message); }
   }

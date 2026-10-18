@@ -58,6 +58,7 @@ app.use((req, res, next) => {
   if (req.method === 'POST' && /\/jobs\/\d+\/evidence$/.test(req.path)) return _bigJson(req, res, next);
   next();
 });
+app.post('/api/v1/email-webhooks/resend',globalLimiter,express.raw({type:'application/json',limit:'256kb'}),require('./utils/emailWebhooks').createHandler({pool,secret:process.env.RESEND_WEBHOOK_SECRET}));
 app.use(express.json({ limit: '1mb' }));   // telemetry payloads are tiny; 5mb was an invitation
 app.use(express.urlencoded({ extended: true }));
 
@@ -112,6 +113,7 @@ app.use(`${API_PREFIX}/analytics`, require('./routes/analytics'));
 app.use(`${API_PREFIX}/billing`, require('./routes/billing'));
 app.use(`${API_PREFIX}/sla`, require('./routes/sla'));
 app.use(`${API_PREFIX}/notifications`, require('./routes/notifications'));
+app.use(`${API_PREFIX}/email-deliveries`, require('./routes/emailDeliveries'));
 app.use(`${API_PREFIX}/audit-logs`, require('./routes/audit'));
 app.use(`${API_PREFIX}/reports`, require('./routes/reports'));
 app.use(`${API_PREFIX}/field-reports`, require('./routes/fieldReports'));
@@ -155,6 +157,10 @@ require('./utils/health').startDailySnapshots();
 require('./utils/incidents').startIncidentWatch();
 require('./utils/dailyBrief').startDailyBriefings();
 require('./utils/weatherRefresh').start();
+require('./utils/mailer').startEmailWorker();
+require('./utils/operationalEmails').start();
+require('./utils/emailLifecycle').start();
+require('./utils/emailSchedules').start();
 
 server.listen(PORT, () => {
   console.log(`✅ FlowGuard API listening on port ${PORT}`);

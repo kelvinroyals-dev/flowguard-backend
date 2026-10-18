@@ -164,8 +164,9 @@ router.post('/me/members', requireServiceProvider, async (req, res) => {
         const url = `https://app.flowguard.ng/reset-password.html?token=${token}`;
         await mailer.sendEmail({ to: email,
           subject: `You've been added to ${(org && org.name) || 'a FlowGuard provider'} on FlowGuard`,
-          html: `<p>Hi ${fullName.split(' ')[0]},</p><p>${req.user.email} added you to <b>${(org && org.name) || 'their team'}</b> as a ${spRole.replace('_',' ')} on FlowGuard.</p>`
-              + `<p><a href="${url}">Set your password</a> to sign in to the provider portal. This link is valid for 7 days.</p>` });
+          category:'security',expiresAt:new Date(Date.now()+23*3600000),
+          html: mailer.shell('Join your provider team',`<p>Hi ${mailer.escape(fullName.split(' ')[0])},</p><p>${mailer.escape(req.user.email)} added you to <b>${mailer.escape((org && org.name) || 'their team')}</b> as a ${mailer.escape(spRole.replace('_',' '))} on FlowGuard.</p>`
+              + `<p><a href="${mailer.escape(url)}">Set your password</a> to sign in to the provider portal. This link is valid for 7 days.</p>`) });
       } catch (e) { console.error('[member invite] mail', e.message); }
     })();
     return res.status(201).json({ success: true, data: member });
@@ -227,7 +228,7 @@ router.post('/me/members/:id/resend', requireServiceProvider, async (req, res) =
         const url = `https://app.flowguard.ng/reset-password.html?token=${token}`;
         await mailer.sendEmail({ to: m.email,
           subject: `Set up your FlowGuard account for ${(org && org.name) || 'your team'}`,
-          html: `<p>Hi ${(m.full_name || '').split(' ')[0]},</p><p>Here's a fresh link to set your password and sign in to the provider portal. It's valid for 7 days.</p><p><a href="${url}">Set your password</a></p>` });
+          category:'security',html: mailer.shell('Your provider sign-in link',`<p>Hi ${mailer.escape((m.full_name || '').split(' ')[0])},</p><p>Here's a fresh link to set your password and sign in to the provider portal. It's valid for 7 days.</p><p><a href="${mailer.escape(url)}">Set your password</a></p>`) });
       } catch (e) { console.error('[member resend] mail', e.message); }
     })();
     return res.json({ success: true });
@@ -293,8 +294,8 @@ router.post('/:id/approve', requireStaff, async (req, res) => {
         const mailer = require('../utils/mailer');
         if (rows[0].email) await mailer.sendEmail({ to: rows[0].email,
           subject: 'Your FlowGuard provider account is approved',
-          html: `<p>Good news — <b>${rows[0].name}</b> has been approved as a FlowGuard Service Provider.</p>`
-              + `<p>You can now <a href="https://app.flowguard.ng/field">sign in to your provider portal</a> and start receiving jobs.</p>` });
+          html: mailer.shell('Provider account approved',`<p><b>${mailer.escape(rows[0].name)}</b> has been approved as a FlowGuard Service Provider.</p>`
+              + `<p>You can now <a href="https://app.flowguard.ng/field/">sign in to your provider portal</a>. Approval does not guarantee job allocation.</p>`) });
       } catch (e) { console.error('[sp approve] mail', e.message); }
     })();
     return res.json({ success: true, data: rows[0] });
@@ -318,10 +319,9 @@ router.post('/:id/reject', requireStaff, async (req, res) => {
         const mailer = require('../utils/mailer');
         if (rows[0].email) await mailer.sendEmail({ to: rows[0].email,
           subject: 'Update on your FlowGuard provider application',
-          html: `<p>Thank you for applying to join FlowGuard as a Service Provider.</p>`
-              + `<p>We're unable to approve <b>${rows[0].name}</b> at this time. Reason: <b>${REJECT_REASONS[reason]}</b>.</p>`
-              + (note ? `<p>${note}</p>` : '')
-              + `<p>You're welcome to address this and re-apply, or reply to this email with any questions.</p>` });
+          html: mailer.shell('Provider application update',`<p>Thank you for applying to join FlowGuard as a Service Provider.</p>`
+              + `<p>We're unable to approve <b>${mailer.escape(rows[0].name)}</b> at this time. Reason: <b>${mailer.escape(REJECT_REASONS[reason])}</b>.</p>`
+              + `<p>Sign in to review the application details. You're welcome to address this and re-apply, or reply to this email with any questions.</p>`) });
       } catch (e) { console.error('[sp reject] mail', e.message); }
     })();
     return res.json({ success: true, data: rows[0] });

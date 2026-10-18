@@ -7,6 +7,7 @@ async function refresh(){
   const {rows}=await pool.query("SELECT property_id,latitude,longitude FROM properties WHERE parent_property_id IS NULL AND latitude IS NOT NULL AND longitude IS NOT NULL");
   const unique=[...new Map(rows.filter(r=>weather.location(r)).map(r=>{const p=weather.location(r);return [p.lat+','+p.lon,r];})).values()];let index=0,available=0,failed=0;
   await Promise.all(Array.from({length:4},async()=>{while(index<unique.length){const record=unique[index++];try{await weather.load(record);available++;}catch(_){failed++;}}}));
+  if(process.env.LIFECYCLE_EMAILS_ENABLED==='true')await require('./emailHealth').safely(pool,'weather',unique.length>0&&failed===0);
   return {available,failed,total:unique.length};
  }finally{running=false;}
 }

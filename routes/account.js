@@ -12,6 +12,8 @@ function publicUser(u) {
            account_owner_id:u.account_owner_id,
            ...clientRoleInfo(u) };   // client_role, client_role_label, is_account_owner, permissions
 }
+const notificationKeys=['email_alerts','sms_alerts','weekly_digest'];
+function preferenceView(row){const p=row.notification_preferences||{};return {...row,email_alerts:p.email_alerts!==false,sms_alerts:p.sms_alerts===true,weekly_digest:p.weekly_digest!==false};}
 
 // GET /profile
 router.get('/profile', authenticateToken, async (req, res) => {
@@ -41,14 +43,19 @@ router.put('/profile', authenticateToken, async (req, res) => {
 // PUT /password   body: { currentPassword, newPassword }
 router.put('/password', authenticateToken, async (req, res) => {
   try {
-    const { currentPassword, newPassword } = req.body || {};
+    const currentPassword=req.body?.currentPassword??req.body?.current_password;
+    const newPassword=req.body?.newPassword??req.body?.new_password;
     if (!currentPassword || !newPassword) return res.status(400).json({ success:false, error:'Both passwords required' });
     if (newPassword.length < 8) return res.status(400).json({ success:false, error:'New password must be at least 8 characters' });
     const { rows } = await pool.query('SELECT password_hash FROM users WHERE id=$1', [req.user.id]);
     const ok = await bcrypt.compare(currentPassword, rows[0].password_hash);
     if (!ok) return res.status(401).json({ success:false, error:'Current password is incorrect' });
     const hash = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE users SET password_hash=$1, updated_at=NOW() WHERE id=$2', [hash, req.user.id]);
+    await pool.query('UPDATE users SET password_hash=$1, token_version=COALESCE(token_version,0)+1,updated_at=NOW() WHERE id=$2', [hash, req.user.id]);
+    if(process.env.LIFECYCLE_EMAILS_ENABLED!=='true'){
+      const u=(await pool.query('SELECT email,full_name FROM users WHERE id=$1',[req.user.id])).rows[0];
+      if(u)await require('../utils/mailer').sendPasswordChanged(u.email,u.full_name);
+    }
     res.json({ success:true, data:{ changed:true } });
   } catch (err) { console.error('PUT /password', err); res.status(500).json({ success:false, error:'Failed to change password' }); }
 });
@@ -58,29 +65,37 @@ router.get('/preferences', authenticateToken, async (req, res) => {
   try {
     let { rows } = await pool.query('SELECT * FROM user_preferences WHERE user_id=$1', [req.user.id]);
     if (!rows[0]) {
-      const ins = await pool.query('INSERT INTO user_preferences (user_id) VALUES ($1) RETURNING *', [req.user.id]);
+      const ins = await pool.query('INSERT INTO user_preferences (user_id) VALUES ($1) ON CONFLICT(user_id) DO UPDATE SET user_id=EXCLUDED.user_id RETURNING *', [req.user.id]);
       rows = ins.rows;
     }
-    res.json({ success:true, data: rows[0] });
+    res.json({ success:true, data: preferenceView(rows[0]) });
   } catch (err) { res.status(500).json({ success:false, error:'Failed to load preferences' }); }
 });
 
 // PUT /preferences
 router.put('/preferences', authenticateToken, async (req, res) => {
   try {
+    const body={...(req.body||{})};
+    if(body.notification_preferences!==undefined && (!body.notification_preferences||typeof body.notification_preferences!=='object'||Array.isArray(body.notification_preferences)))return res.status(400).json({success:false,error:'Invalid notification preferences'});
+    const notification={...(body.notification_preferences||{})};
+    for(const k of notificationKeys)if(k in body){
+      if(k in notification && notification[k]!==body[k])return res.status(400).json({success:false,error:'Conflicting notification preferences'});
+      notification[k]=body[k];
+    }
+    if(Object.keys(notification).some(k=>!notificationKeys.includes(k)||typeof notification[k]!=='boolean'))return res.status(400).json({success:false,error:'Notification preferences must be supported boolean fields'});
+    if(Object.keys(notification).length)body.notification_preferences=notification;
     const allowed = ['show_demo_data','onboarding_completed','onboarding_step','onboarding_skipped',
                      'preferred_language','timezone','notification_preferences'];
-    const sets = [], vals = []; let i = 1;
-    for (const k of allowed) if (k in (req.body||{})) {
-      sets.push(`${k} = $${i++}`);
-      vals.push(k === 'notification_preferences' ? JSON.stringify(req.body[k]) : req.body[k]);
+    const sets = [], vals = [req.user.id], cols=['user_id'], placeholders=['$1'];
+    for (const k of allowed) if (k in body) {
+      cols.push(k);vals.push(k==='notification_preferences'?JSON.stringify(body[k]):body[k]);placeholders.push('$'+vals.length);
+      sets.push(k==='notification_preferences'?`notification_preferences=COALESCE(user_preferences.notification_preferences::jsonb,'{}'::jsonb)||EXCLUDED.notification_preferences::jsonb`:`${k}=EXCLUDED.${k}`);
     }
     if (!sets.length) return res.status(400).json({ success:false, error:'No valid fields' });
-    vals.push(req.user.id);
     const { rows } = await pool.query(
-      `INSERT INTO user_preferences (user_id) VALUES ($${i})
+      `INSERT INTO user_preferences (${cols.join(',')}) VALUES (${placeholders.join(',')})
        ON CONFLICT (user_id) DO UPDATE SET ${sets.join(', ')}, updated_at=NOW() RETURNING *`, vals);
-    res.json({ success:true, data: rows[0] });
+    res.json({ success:true, data: preferenceView(rows[0]) });
   } catch (err) { console.error('PUT /preferences', err); res.status(500).json({ success:false, error:'Failed to update preferences' }); }
 });
 

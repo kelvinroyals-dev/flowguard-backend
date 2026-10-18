@@ -4,10 +4,11 @@ const pool = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 const { requirePermission, hasPermission } = require('../utils/permissions');
 const { isClient, isSpUser, teamIdsForUser } = require('../utils/scope');
+const {clientCan}=require('../utils/clientPermissions');
 const realtime = require('../realtime/io');
 const router = express.Router();
 router.use(authenticateToken);
-router.use((req,res,next)=>isSpUser(req) ? res.status(403).json({success:false,error:'Not authorised'}) : next());
+router.use((req,res,next)=>(isSpUser(req)||!['client','internal'].includes(req.user.user_type)||req.user.user_type==='client'&&req.user.role!=='client') ? res.status(403).json({success:false,error:'Not authorised'}) : next());
 
 // A field technician may act on an alert ASSIGNED TO THEIR TEAM (resolve it,
 // request backup) without the broad alerts.manage permission.
@@ -27,10 +28,14 @@ router.get('/', authenticateToken, async (req, res) => {
     let clientFilter = '';
     let params = [];
     if (isClient(req)) {
-      const ids = await clientIdsForUser(req.user.id);
-      if (!ids.length) return res.json({ success: true, data: [], summary: { total: 0, critical: 0, active: 0 } });
-      clientFilter = ` AND a.client_id = ANY($1)`;
-      params = [ids];
+      const user=(await pool.query('SELECT id,user_type,is_active,account_owner_id,client_role FROM users WHERE id=$1',[req.user.id])).rows[0];
+      if(!user||user.is_active===false||!clientCan(user,'view_alerts'))return res.status(403).json({success:false,error:'Alert access required'});
+      const ownerId=user.account_owner_id||user.id;
+      const ids = await clientIdsForUser(ownerId);
+      // Canonical estate ownership wins. Legacy account links may only expose
+      // alerts that have no resolvable estate, never override another owner.
+      clientFilter = ` AND (estate.user_id=$1 OR (estate.property_id IS NULL AND p.property_id IS NULL AND a.client_id = ANY($2)))`;
+      params = [ownerId,ids];
     }
     const { rows } = await pool.query(`
       SELECT a.alert_id, a.alert_id AS id, a.sensor_id, a.client_id, a.severity,
@@ -51,8 +56,9 @@ router.get('/', authenticateToken, async (req, res) => {
                ORDER BY t.created_at DESC LIMIT 1) AS ticket_id
       FROM alerts a
       LEFT JOIN clients c ON a.client_id = c.id
-      LEFT JOIN properties p ON p.property_id = a.property_id
       LEFT JOIN sensors s ON s.sensor_id = a.sensor_id
+      LEFT JOIN properties p ON p.property_id = COALESCE(a.property_id,s.property_id)
+      LEFT JOIN properties estate ON estate.property_id=COALESCE(p.parent_property_id,p.property_id)
       LEFT JOIN field_teams ft ON a.assigned_team_id = ft.team_id
       WHERE a.status != 'closed'${clientFilter}
       ORDER BY CASE a.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2
@@ -80,12 +86,28 @@ router.post('/', authenticateToken, requirePermission('alerts.manage'), async (r
   if (isClient(req)) return res.status(403).json({ success: false, error: 'Not authorised' });
   try {
     const b = req.body || {};
+    if(b.severity!=null&&typeof b.severity!=='string')return res.status(400).json({success:false,error:'Valid severity required'});
+    const severity=typeof b.severity==='string'?b.severity.toLowerCase():'moderate';
+    if(!['critical','high','moderate','low','info'].includes(severity))return res.status(400).json({success:false,error:'Valid severity required'});
+    let propertyId=b.property_id||null;
+    let estateId=null;
+    if(propertyId){
+      const prop=(await pool.query('SELECT property_id,COALESCE(parent_property_id,property_id) AS estate_id FROM properties WHERE property_id=$1',[propertyId])).rows[0];
+      if(!prop)return res.status(400).json({success:false,error:'Unknown alert property'});
+      estateId=prop.estate_id;
+    }
+    if(b.sensor_id){
+      const sensor=(await pool.query(`SELECT s.property_id,COALESCE(p.parent_property_id,p.property_id) AS estate_id FROM sensors s LEFT JOIN properties p ON p.property_id=s.property_id WHERE s.sensor_id=$1`,[b.sensor_id])).rows[0];
+      if(!sensor)return res.status(400).json({success:false,error:'Unknown alert sensor'});
+      if(estateId&&sensor.estate_id&&estateId!==sensor.estate_id)return res.status(409).json({success:false,error:'Sensor and alert property belong to different estates'});
+      propertyId=propertyId||sensor.property_id||null;
+    }
     const alertId = 'ALT-' + Date.now() + '-' + Math.floor(Math.random()*900+100);
     const { rows } = await pool.query(
-      `INSERT INTO alerts (alert_id, sensor_id, client_id, severity, alert_type, description, location, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'active') RETURNING *`,
-      [alertId, b.sensor_id||null, b.client_id||null, b.severity||'moderate',
-       b.alert_type||'System Alert', b.description||null, b.location||null]);
+      `INSERT INTO alerts (alert_id, sensor_id, client_id, severity, alert_type, description, location, property_id, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active') RETURNING *`,
+      [alertId, b.sensor_id||null, b.client_id||null, severity,
+       b.alert_type||'System Alert', b.description||null, b.location||null,propertyId]);
     realtime.events.alertNew(rows[0]);
     res.status(201).json({ success: true, data: rows[0] });
   } catch (err) {
@@ -155,7 +177,7 @@ router.post('/:id/backup', authenticateToken, async (req, res) => {
     const who = req.user.email || req.user.id;
     const stamp = `\n[${new Date().toISOString()}] BACKUP REQUESTED by ${who}${notes ? ': ' + notes : ''}`;
     const { rows } = await pool.query(
-      `UPDATE alerts SET description = COALESCE(description,'') || $2, updated_at = NOW()
+      `UPDATE alerts SET description = COALESCE(description,'') || $2, updated_at = NOW(),backup_requested_at=NOW()
        WHERE alert_id=$1 RETURNING *`, [req.params.id, stamp]);
     try { realtime.emit('alert:backup', { alert_id: req.params.id, team_id: found[0].assigned_team_id, notes, by: who }, 'alerts'); } catch (_) {}
     res.json({ success: true, data: rows[0] });
