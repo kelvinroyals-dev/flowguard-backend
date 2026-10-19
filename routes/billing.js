@@ -533,8 +533,9 @@ router.post('/invoices/:id/send-reminder', authenticateToken, requirePermission(
   try{
     db=await pool.connect();
     await db.query('BEGIN');
-    const inv=(await db.query('SELECT invoice_id,balance_due FROM invoices WHERE invoice_id=$1 FOR UPDATE',[req.params.id])).rows[0];
+    const inv=(await db.query('SELECT * FROM invoices WHERE invoice_id=$1 FOR UPDATE',[req.params.id])).rows[0];
     if(!inv||!(Number(inv.balance_due)>0)){await db.query('ROLLBACK');return res.status(inv?409:404).json({success:false,error:inv?'Invoice has no outstanding balance':'Invoice not found'});}
+    if(!await require('../utils/invoiceReminder').eligible(db,inv)){await db.query('ROLLBACK');return res.status(409).json({success:false,error:'Reminder requires an issued invoice, active client owner and reconciled payment ledger'});}
     await require('../utils/emailSchedules').createSchedules({pool}).record(db,'invoices',inv.invoice_id,'invoice_reminder',requestId);
     await db.query('COMMIT');
     return res.status(202).json({success:true,data:{queued:true,sent:false,request_id:requestId}});

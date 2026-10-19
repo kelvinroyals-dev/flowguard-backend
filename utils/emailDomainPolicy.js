@@ -3,7 +3,7 @@ const SOURCES={service_requests:'id',service_request_events:'id',jobs:'id',job_c
 const MODULES={service_requests:'jobs',service_request_events:'jobs',jobs:'jobs',job_comments:'jobs',tickets:'support',ticket_messages:'support',inspection_reports:'field-reports',service_provider_organisations:'providers',users:'team-members',payments:'billing',invoices:'billing',service_plans:'maintenance',device_events:'devices',device_integrity_events:'devices',ingest_errors:'devices',sla_tracking:'sla',alerts:'alerts',sensors:'devices'};
 async function reminderStillApplies(db,e,c,now=Date.now()){
  const r=c.row,t=e.after_values.notification_type,at=v=>v?new Date(v).getTime():NaN,day=new Date(now+3600000).toISOString().slice(0,10);
- if(t.startsWith('invoice_'))return Number(r.balance_due)>0&&(t==='invoice_reminder'||Number.isFinite(at(r.due_date))&&(t==='invoice_overdue'?new Date(r.due_date).toISOString().slice(0,10)<day:at(r.due_date)<=now+3*86400000));
+ if(t.startsWith('invoice_'))return await require('./invoiceReminder').eligible(db,r,now)&&(t==='invoice_reminder'||Number.isFinite(at(r.due_date))&&(t==='invoice_overdue'?new Date(r.due_date).toISOString().slice(0,10)<day:at(r.due_date)<=now+3*86400000));
  if(['visit_due','acceptance_overdue','sla_warning','sla_breach'].includes(t)){
   if(['verified','completed','cancelled','declined','draft'].includes(r.status))return false;
   if(t==='visit_due')return at(r.scheduled_for)>=now&&at(r.scheduled_for)<=now+86400000;

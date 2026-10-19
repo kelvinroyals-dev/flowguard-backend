@@ -13,7 +13,7 @@ async function fixture(){
  CREATE TABLE properties(property_id TEXT PRIMARY KEY,parent_property_id TEXT,user_id INTEGER);
  CREATE TABLE user_preferences(user_id INTEGER PRIMARY KEY,notification_preferences JSONB);
  CREATE TABLE app_settings(id INTEGER PRIMARY KEY,settings JSONB);
- CREATE TABLE invoices(invoice_id VARCHAR(50) PRIMARY KEY,user_id INTEGER,property_id TEXT,balance_due NUMERIC,due_date DATE,status TEXT,sent_at TIMESTAMPTZ,sent_count INTEGER DEFAULT 0,reminder_sent_count INTEGER DEFAULT 0,last_reminder_sent TIMESTAMPTZ,updated_at TIMESTAMPTZ);
+ CREATE TABLE invoices(invoice_id VARCHAR(50) PRIMARY KEY,user_id INTEGER,property_id TEXT,balance_due NUMERIC,due_date DATE,status TEXT,sent_at TIMESTAMPTZ,sent_count INTEGER DEFAULT 0,reminder_sent_count INTEGER DEFAULT 0,last_reminder_sent TIMESTAMPTZ,updated_at TIMESTAMPTZ,total_amount NUMERIC,amount_paid NUMERIC,payment_status TEXT,currency TEXT);
  CREATE TABLE alerts(alert_id TEXT PRIMARY KEY,property_id TEXT,sensor_id TEXT,status TEXT,severity TEXT,assigned_team_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW());
  CREATE TABLE service_requests(id TEXT PRIMARY KEY,property_id TEXT,status TEXT,route TEXT,job_id TEXT,service_provider_org_id INTEGER);
  CREATE TABLE service_request_events(id SERIAL PRIMARY KEY,request_id TEXT,event_type TEXT,note TEXT);
@@ -23,7 +23,7 @@ async function fixture(){
  CREATE TABLE ticket_messages(id SERIAL PRIMARY KEY,ticket_id TEXT,author_type TEXT,message TEXT,created_at TIMESTAMPTZ DEFAULT NOW());
  CREATE TABLE inspection_reports(report_id TEXT PRIMARY KEY,property_id TEXT,status TEXT,updated_at TIMESTAMPTZ DEFAULT NOW());
  CREATE TABLE service_provider_organisations(id INTEGER PRIMARY KEY,status TEXT,email TEXT,verification_submitted_at TIMESTAMPTZ);
- CREATE TABLE payments(payment_id TEXT PRIMARY KEY,invoice_id TEXT,status TEXT,amount NUMERIC);
+ CREATE TABLE payments(payment_id TEXT PRIMARY KEY,invoice_id TEXT,status TEXT,amount NUMERIC,currency TEXT DEFAULT 'NGN');
  CREATE TABLE service_plans(id TEXT PRIMARY KEY,property_id TEXT,active BOOLEAN,next_due DATE);
  CREATE TABLE sensors(sensor_id TEXT PRIMARY KEY,property_id TEXT,status TEXT,lifecycle_state TEXT,driver_id TEXT,battery_voltage NUMERIC,last_ping TIMESTAMPTZ);
  CREATE TABLE device_events(id SERIAL PRIMARY KEY,sensor_id TEXT,kind TEXT);
@@ -62,7 +62,7 @@ test('lifecycle recipient boundaries, optional preferences, overtaken state and 
   await q.sweep();assert.equal(sent.length,0);assert.ok((await f.pg.query('SELECT status FROM email_outbox')).rows.every(r=>r.status==='suppressed'));
   await f.pg.exec("INSERT INTO user_preferences VALUES(1,'{\"email_alerts\":false}');UPDATE users SET password_hash='next-secret' WHERE id=1");
   await life.sweep();await q.sweep();assert.equal(sent.filter(p=>p.subject==='Your password was changed').length,1);
-  await f.pg.exec("INSERT INTO invoices(invoice_id,user_id,property_id,balance_due,status)VALUES('INV',1,'ESTATE',100,'open');INSERT INTO payments VALUES('PAY','INV','successful',10)");
+  await f.pg.exec("INSERT INTO invoices(invoice_id,user_id,property_id,balance_due,status)VALUES('INV',1,'ESTATE',100,'open');INSERT INTO payments(payment_id,invoice_id,status,amount) VALUES('PAY','INV','successful',10)");
   await life.sweep();await q.sweep();
   assert.deepEqual(sent.filter(p=>p.subject==='Payment recorded').map(p=>p.to[0]).sort(),['finance@example.invalid','ops@example.invalid','owner@example.invalid']);
   await f.pg.exec("DELETE FROM users WHERE id=1");await life.sweep();await q.sweep();assert.equal(sent.filter(p=>p.subject==='Account removed').length,1);
@@ -71,13 +71,22 @@ test('lifecycle recipient boundaries, optional preferences, overtaken state and 
 test('scheduler SQL executes, deduplicates reminders and updates counters only after fake provider acceptance',async()=>{
  const f=await fixture();try{
   await f.pg.exec("INSERT INTO invoices(invoice_id,user_id,property_id,balance_due,due_date,status)VALUES('INV',1,'ESTATE',100,CURRENT_DATE-1,'open');INSERT INTO jobs(id,property_id,status,dispatched_at,sla_due_at)VALUES('J1','ESTATE','dispatched',NOW()-INTERVAL '2 hours',NOW()+INTERVAL '30 minutes');INSERT INTO tickets(ticket_id,user_id,status,created_at)VALUES('T1',1,'new',NOW()-INTERVAL '2 days');INSERT INTO inspection_reports VALUES('REP','ESTATE','review',NOW()-INTERVAL '3 days');INSERT INTO service_plans VALUES('PLAN','ESTATE',TRUE,CURRENT_DATE-1)");
-  const schedule=createSchedules({pool:f.pool});await schedule.sweep();
+  await f.pg.exec("UPDATE invoices SET status='sent',sent_at=NOW()-INTERVAL '1 day',sent_count=1,total_amount=100,amount_paid=0,currency='NGN',payment_status='pending'");
+  await f.pg.exec(`INSERT INTO invoices(invoice_id,user_id,balance_due,due_date,status,sent_at,sent_count,total_amount,amount_paid,currency,payment_status) VALUES
+   ('DRAFT',1,100,CURRENT_DATE-1,'draft',NOW()-INTERVAL '1 day',1,100,0,'NGN','pending'),
+   ('UNISSUED',1,100,CURRENT_DATE-1,'open',NULL,0,100,0,'NGN','pending'),
+   ('VOID',1,100,CURRENT_DATE-1,'void',NOW()-INTERVAL '1 day',1,100,0,'NGN','pending'),
+   ('UNRECONCILED',1,80,CURRENT_DATE-1,'sent',NOW()-INTERVAL '1 day',1,100,0,'NGN','pending'),
+   ('UNLINKED',NULL,100,CURRENT_DATE-1,'sent',NOW()-INTERVAL '1 day',1,100,0,'NGN','pending');`);
+  const stampForSchedule=Date.now(),schedule=createSchedules({pool:f.pool,now:()=>stampForSchedule});await schedule.sweep();
   const count=(await f.pg.query("SELECT COUNT(*)::int AS n FROM email_domain_events WHERE action IN ('REMINDER','DIGEST')")).rows[0].n;
-  assert.ok(count>=10);await schedule.sweep();assert.equal((await f.pg.query("SELECT COUNT(*)::int AS n FROM email_domain_events WHERE action IN ('REMINDER','DIGEST')")).rows[0].n,count);
+  assert.deepEqual((await f.pg.query("SELECT entity_key FROM email_domain_events WHERE entity='invoices' AND action='REMINDER'")).rows.map(r=>r.entity_key),['INV']);
+  const watForSchedule=new Date(stampForSchedule+3600000),digestOpen=watForSchedule.getUTCDay()!==1||watForSchedule.getUTCHours()>=6;
+  assert.equal(count,6+(digestOpen?6:0));await schedule.sweep();assert.equal((await f.pg.query("SELECT COUNT(*)::int AS n FROM email_domain_events WHERE action IN ('REMINDER','DIGEST')")).rows[0].n,count);
   const life=createLifecycle({pool:f.pool,canStaff:async()=>true,from:'test@example.invalid'});await life.sweep();
-  assert.equal((await f.pg.query('SELECT reminder_sent_count FROM invoices')).rows[0].reminder_sent_count,0);
+  assert.equal((await f.pg.query("SELECT reminder_sent_count FROM invoices WHERE invoice_id='INV'")).rows[0].reminder_sent_count,0);
   const q=createOutbox({pool:f.pool,canStaff:async()=>true,transport:async()=>({accepted:true,providerId:'fake-reminder'})});await q.sweep();
-  assert.equal((await f.pg.query('SELECT reminder_sent_count FROM invoices')).rows[0].reminder_sent_count,2); // owner and authorised finance member
+  assert.equal((await f.pg.query("SELECT reminder_sent_count FROM invoices WHERE invoice_id='INV'")).rows[0].reminder_sent_count,2); // owner and authorised finance member
   await f.pg.exec("UPDATE invoices SET balance_due=0;UPDATE jobs SET status='cancelled'");
   assert.equal(await reminderStillApplies(f.pool,{after_values:{notification_type:'invoice_reminder'}},{row:{balance_due:0}}),false);
   assert.equal(await reminderStillApplies(f.pool,{after_values:{notification_type:'visit_due'}},{row:{status:'cancelled',scheduled_for:new Date(Date.now()+1000)}}),false);
@@ -136,9 +145,10 @@ test('real authenticated HTTP guards isolate billing, manual reminders and admin
  const f=await fixture();let server;
  try{
   await f.pg.exec(`ALTER TABLE users ADD COLUMN token_version INTEGER DEFAULT 0;ALTER TABLE users ADD COLUMN full_name TEXT;
-   ALTER TABLE properties ADD COLUMN property_name TEXT;ALTER TABLE invoices ADD COLUMN payment_status TEXT;ALTER TABLE invoices ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();
+   ALTER TABLE properties ADD COLUMN property_name TEXT;ALTER TABLE invoices ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();
    CREATE TABLE role_permissions(role TEXT,permission_key TEXT,allowed BOOLEAN,updated_at TIMESTAMPTZ,PRIMARY KEY(role,permission_key));
    INSERT INTO invoices(invoice_id,user_id,property_id,balance_due,status,payment_status)VALUES('INV',1,'ESTATE',100,'open','pending'),('FOREIGN',2,NULL,50,'open','pending');`);
+  await f.pg.exec("UPDATE invoices SET status='sent',sent_at=NOW()-INTERVAL '1 day',sent_count=1,total_amount=balance_due,amount_paid=0,currency='NGN'");
   const vm=require('node:vm'),{createRequire}=require('node:module'),express=require('express'),request=require('supertest'),jwt=require('jsonwebtoken');
   const env={JWT_SECRET:'synthetic-email-http-secret',MAIL_OUTBOX_ENABLED:'true',LIFECYCLE_EMAILS_ENABLED:'true',RESEND_API_KEY:'synthetic-no-network',MAIL_FROM:'test@example.invalid'};
   let auth,permissions;
@@ -160,6 +170,9 @@ test('real authenticated HTTP guards isolate billing, manual reminders and admin
   const own=await call('get','/billing/invoices',5);assert.equal(own.status,200);assert.deepEqual(own.body.data.map(i=>i.invoice_id),['INV']);
   assert.equal((await call('get','/billing/invoices',6)).status,403);
   assert.equal((await call('post','/billing/invoices/INV/send-reminder',1,{})).status,403);
+  await f.pg.exec("UPDATE invoices SET status='draft' WHERE invoice_id='INV'");
+  assert.equal((await call('post','/billing/invoices/INV/send-reminder',3,{})).status,409);
+  await f.pg.exec("UPDATE invoices SET status='sent' WHERE invoice_id='INV'");
   const request_id='00000000-0000-4000-8000-000000000001';
   assert.equal((await call('post','/billing/invoices/INV/send-reminder',3,{request_id})).status,202);
   assert.equal((await call('post','/billing/invoices/INV/send-reminder',3,{request_id})).status,202);

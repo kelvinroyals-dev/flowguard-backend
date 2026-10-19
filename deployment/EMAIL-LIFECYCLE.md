@@ -51,6 +51,7 @@ This queues/attempts exactly one clearly identified test notice. Its outbox over
 - Accepted/terminal outbox payloads are purged. Domain metadata and webhook receipts remain stored for audit; an organisation retention policy and separately authorised purge are required before deleting production audit records. Journal snapshots omit password hashes, reset tokens, rejected ingestion bodies and support/work message text.
 - Hard-bounce/complaint suppressions are not automatically removed. Any reactivation requires confirming the address/consent outside this workflow; a retry must not bypass suppression.
 - Current client and internal notification opt-outs apply at queue time and again before retry. Security and payment-ledger transactional notices are mandatory; device/service/digest notices are optional.
+- Invoice reminders now require recorded issuance (`sent_at` not in the future and positive `sent_count`), an eligible non-draft/non-cancelled status, an active client account owner and a same-currency successful-payment ledger matching the stored paid amount and outstanding balance. Manual reminders and delivery-time retries use the same guard. Older/unissued/imported or unreconciled invoices need finance review; they are not automatically chased merely because they have a past due date. Do not manufacture a sent timestamp to bypass this protection.
 
 ## Verification
 

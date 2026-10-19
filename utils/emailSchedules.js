@@ -10,7 +10,9 @@ function createSchedules({pool,now=()=>Date.now()}){
   const stamp=now(),day=wat(stamp),hour=new Date(stamp+3600000).toISOString().slice(0,13),db=await pool.connect();
   try{
    await db.query('BEGIN');await db.query("SET LOCAL TIME ZONE 'Africa/Lagos'");await db.query('SELECT pg_advisory_xact_lock(7142317)');
-   for(const i of(await db.query("SELECT invoice_id,due_date FROM invoices WHERE balance_due>0 AND due_date IS NOT NULL AND due_date<=CURRENT_DATE+3")).rows)await record(db,'invoices',i.invoice_id,new Date(i.due_date).toISOString().slice(0,10)<day?'invoice_overdue':'invoice_due',day);
+   for(const i of(await db.query("SELECT * FROM invoices WHERE balance_due>0 AND due_date IS NOT NULL AND due_date<=CURRENT_DATE+3 AND status IN ('open','sent','partial','overdue') AND sent_at<=NOW() AND sent_count>0")).rows){
+    if(await require('./invoiceReminder').eligible(db,i,stamp))await record(db,'invoices',i.invoice_id,new Date(i.due_date).toISOString().slice(0,10)<day?'invoice_overdue':'invoice_due',day);
+   }
    for(const j of(await db.query("SELECT id,status,scheduled_for,sla_due_at,dispatched_at FROM jobs WHERE status NOT IN ('verified','completed','cancelled','declined','draft')")).rows){
     if(j.scheduled_for&&new Date(j.scheduled_for).getTime()>=stamp&&new Date(j.scheduled_for).getTime()<=stamp+24*3600000)await record(db,'jobs',j.id,'visit_due',day);
     if(j.status==='dispatched'&&j.dispatched_at&&stamp-new Date(j.dispatched_at).getTime()>=3600000)await record(db,'jobs',j.id,'acceptance_overdue',day);

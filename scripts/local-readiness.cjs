@@ -14,6 +14,7 @@ for(const args of [
  ['--test','scripts/test-operational-emails.cjs'],
  ['--test','scripts/test-email-lifecycle.cjs'],
  ['--test','scripts/test-email-rollout.cjs'],
+ ['--test','scripts/test-invoice-reminders.cjs'],
  ['--test','scripts/test-registration-geography.cjs'],
  ['--test','scripts/test-realtime-unit.cjs'],
  ['--test','scripts/test-realtime-security.cjs'],
